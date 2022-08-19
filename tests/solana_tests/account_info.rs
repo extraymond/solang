@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 use ethabi::{ethereum_types::U256, Token};
 
@@ -5,6 +7,7 @@ use ethabi::{ethereum_types::U256, Token};
 fn lamports() {
     let mut vm = build_solidity(
         r#"
+        import 'solana';
         contract c {
             function test() public payable returns (uint64) {
                 for (uint32 i = 0; i < tx.accounts.length; i++) {
@@ -24,11 +27,11 @@ fn lamports() {
         }"#,
     );
 
-    vm.constructor("c", &[], 0);
+    vm.constructor("c", &[]);
 
     vm.account_data.get_mut(&vm.origin).unwrap().lamports = 17672630920854456917u64;
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns[0], Token::Uint(U256::from(17672630920854456917u64)));
 }
@@ -37,6 +40,7 @@ fn lamports() {
 fn owner() {
     let mut vm = build_solidity(
         r#"
+        import 'solana';
         contract c {
             function test() public payable returns (address) {
                 for (uint32 i = 0; i < tx.accounts.length; i++) {
@@ -52,9 +56,9 @@ fn owner() {
         }"#,
     );
 
-    vm.constructor("c", &[], 0);
+    vm.constructor("c", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     let owner = vm.stack[0].program.to_vec();
 
@@ -65,6 +69,7 @@ fn owner() {
 fn data() {
     let mut vm = build_solidity(
         r#"
+        import 'solana';
         contract c {
             function test(uint32 index) public payable returns (uint8) {
                 for (uint32 i = 0; i < tx.accounts.length; i++) {
@@ -92,10 +97,10 @@ fn data() {
         }"#,
     );
 
-    vm.constructor("c", &[], 0);
+    vm.constructor("c", &[]);
 
     for i in 0..10 {
-        let returns = vm.function("test", &[Token::Uint(U256::from(i))], &[], 0, None);
+        let returns = vm.function("test", &[Token::Uint(U256::from(i))], &[], None);
 
         let this = &vm.stack[0].data;
 
@@ -104,7 +109,7 @@ fn data() {
         assert_eq!(returns[0], Token::Uint(U256::from(val)));
     }
 
-    let returns = vm.function("test2", &[], &[], 0, None);
+    let returns = vm.function("test2", &[], &[], None);
 
     let this = &vm.stack[0].data;
 

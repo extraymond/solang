@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use assert_cmd::Command;
 use std::ffi::OsString;
 use std::fs::File;
@@ -5,9 +7,18 @@ use std::io::{BufRead, BufReader};
 use std::{fs, path::PathBuf};
 
 #[test]
-fn testcases() {
+fn solidity_testcases() {
+    run_test_for_path("./tests/codegen_testcases/solidity/");
+}
+
+#[test]
+fn yul_testcases() {
+    run_test_for_path("./tests/codegen_testcases/yul/")
+}
+
+fn run_test_for_path(path: &str) {
     let ext = OsString::from("sol");
-    for entry in fs::read_dir("./tests/codegen_testcases/").unwrap() {
+    for entry in fs::read_dir(path).unwrap() {
         let path = entry.unwrap().path();
 
         if path.is_file() && path.extension() == Some(&ext) {
@@ -33,6 +44,8 @@ fn testcase(path: PathBuf) {
     let mut command_line: Option<String> = None;
     let mut checks = Vec::new();
     let mut fails = Vec::new();
+    let mut read_from = None;
+
     for line in reader.lines() {
         let mut line = line.unwrap();
         line = line.trim().parse().unwrap();
@@ -40,6 +53,8 @@ fn testcase(path: PathBuf) {
             assert_eq!(command_line, None);
 
             command_line = Some(String::from(args));
+        } else if let Some(check) = line.strip_prefix("// READ:") {
+            read_from = Some(check.trim().to_string());
         } else if let Some(check) = line.strip_prefix("// CHECK:") {
             checks.push(Test::Check(check.trim().to_string()));
         } else if let Some(fail) = line.strip_prefix("// FAIL:") {
@@ -57,6 +72,7 @@ fn testcase(path: PathBuf) {
 
     let mut cmd = Command::cargo_bin("solang").unwrap();
     let assert = cmd
+        .arg("compile")
         .args(args.split_whitespace())
         .arg(format!("{}", path.canonicalize().unwrap().display()))
         .assert();
@@ -69,7 +85,12 @@ fn testcase(path: PathBuf) {
     let mut current_check = 0;
     let mut current_fail = 0;
     let mut current_line = 0;
-    let lines: Vec<&str> = stdout.split('\n').chain(stderr.split('\n')).collect();
+    let contents = if let Some(file) = read_from {
+        fs::read_to_string(file).unwrap()
+    } else {
+        stdout.to_string()
+    };
+    let lines: Vec<&str> = contents.split('\n').chain(stderr.split('\n')).collect();
 
     while current_line < lines.len() {
         let line = lines[current_line];
@@ -83,6 +104,8 @@ fn testcase(path: PathBuf) {
             Some(Test::NotCheck(needle)) => {
                 if !line.contains(needle) {
                     current_check += 1;
+                    // We should not advance line during a not check
+                    current_line -= 1;
                 }
             }
             Some(Test::Rewind) => {

@@ -1,19 +1,22 @@
-use super::ast::{Diagnostic, Namespace, Parameter, Tag};
-use crate::parser::pt;
+// SPDX-License-Identifier: Apache-2.0
 
-/// Resolve the tags for a type
+use super::ast::{Diagnostic, Namespace, Parameter, Tag};
+use solang_parser::{doccomment::DocComment, pt};
+use std::fmt::Write;
+
+/// Resolve the tags for a type from parsed doccomment
 pub fn resolve_tags(
     file_no: usize,
     ty: &str,
-    doc: &[pt::DocComment],
+    tags: &[DocComment],
     params: Option<&[Parameter]>,
     returns: Option<&[Parameter]>,
-    bases: Option<&[&str]>,
+    bases: Option<&[String]>,
     ns: &mut Namespace,
 ) -> Vec<Tag> {
     let mut res: Vec<Tag> = Vec::new();
 
-    for c in doc.iter().flat_map(pt::DocComment::comments) {
+    for c in tags.iter().flat_map(DocComment::comments) {
         match c.tag.as_str() {
             "notice" | "author" | "title" | "dev" => {
                 // fold fields with the same name
@@ -32,8 +35,8 @@ pub fn resolve_tags(
                 let v: Vec<&str> = c.value.splitn(2, char::is_whitespace).collect();
                 if v.is_empty() || v[0].is_empty() {
                     ns.diagnostics.push(Diagnostic::error(
-                        pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                        "tag ‘@param’ missing parameter name".to_string(),
+                        pt::Loc::File(file_no, c.tag_offset, c.tag_offset + c.tag.len()),
+                        "tag '@param' missing parameter name".to_string(),
                     ));
                     continue;
                 }
@@ -43,8 +46,8 @@ pub fn resolve_tags(
                 if let Some(no) = params.unwrap().iter().position(|p| p.name_as_str() == name) {
                     if res.iter().any(|e| e.tag == "param" && e.no == no) {
                         ns.diagnostics.push(Diagnostic::error(
-                            pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                            format!("duplicate tag ‘@param’ for ‘{}’", name),
+                            pt::Loc::File(file_no, c.tag_offset, c.tag_offset + c.tag.len()),
+                            format!("duplicate tag '@param' for '{}'", name),
                         ));
                     } else {
                         res.push(Tag {
@@ -55,8 +58,8 @@ pub fn resolve_tags(
                     }
                 } else {
                     ns.diagnostics.push(Diagnostic::error(
-                        pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                        format!("tag ‘@param’ no field ‘{}’", name),
+                        pt::Loc::File(file_no, c.value_offset, c.value_offset + c.value.len()),
+                        format!("tag '@param' no field '{}'", name),
                     ));
                 }
             }
@@ -65,14 +68,14 @@ pub fn resolve_tags(
 
                 if returns.is_empty() {
                     ns.diagnostics.push(Diagnostic::error(
-                        pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                        "tag ‘@return’ for function with no return values".to_string(),
+                        pt::Loc::File(file_no, c.tag_offset, c.tag_offset + c.tag.len()),
+                        "tag '@return' for function with no return values".to_string(),
                     ));
                 } else if returns.len() == 1 {
                     if res.iter().any(|e| e.tag == "return") {
                         ns.diagnostics.push(Diagnostic::error(
-                            pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                            "duplicate tag ‘@return’".to_string(),
+                            pt::Loc::File(file_no, c.tag_offset, c.tag_offset + c.tag.len()),
+                            "duplicate tag '@return'".to_string(),
                         ));
                     } else {
                         res.push(Tag {
@@ -85,8 +88,8 @@ pub fn resolve_tags(
                     let v: Vec<&str> = c.value.splitn(2, char::is_whitespace).collect();
                     if v.is_empty() || v[0].is_empty() {
                         ns.diagnostics.push(Diagnostic::error(
-                            pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                            "tag ‘@return’ missing parameter name".to_string(),
+                            pt::Loc::File(file_no, c.value_offset, c.value_offset + c.value.len()),
+                            "tag '@return' missing parameter name".to_string(),
                         ));
                         continue;
                     }
@@ -95,12 +98,12 @@ pub fn resolve_tags(
 
                     if let Some(no) = returns
                         .iter()
-                        .position(|p| p.name.as_ref().map(|id| id.name.as_str()) == Some(name))
+                        .position(|p| p.id.as_ref().map(|id| id.name.as_str()) == Some(name))
                     {
                         if res.iter().any(|e| e.tag == "return" && e.no == no) {
                             ns.diagnostics.push(Diagnostic::error(
-                                pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                                format!("duplicate tag ‘@return’ for ‘{}’", name),
+                                pt::Loc::File(file_no, c.tag_offset, c.tag_offset + c.tag.len()),
+                                format!("duplicate tag '@return' for '{}'", name),
                             ));
                         } else {
                             res.push(Tag {
@@ -109,10 +112,19 @@ pub fn resolve_tags(
                                 value,
                             });
                         }
+                    // find next unnamed return parameter without documentation tag
+                    } else if let Some((no, _)) = returns.iter().enumerate().find(|(no, p)| {
+                        p.id.is_none() && !res.iter().any(|e| e.tag == "return" && e.no == *no)
+                    }) {
+                        res.push(Tag {
+                            tag: String::from("return"),
+                            no,
+                            value,
+                        });
                     } else {
                         ns.diagnostics.push(Diagnostic::error(
-                            pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                            format!("tag ‘@return’ no field ‘{}’", name),
+                            pt::Loc::File(file_no, c.value_offset, c.value_offset + c.value.len()),
+                            format!("tag '@return' no matching return value '{}'", c.value),
                         ));
                     }
                 }
@@ -120,8 +132,8 @@ pub fn resolve_tags(
             "inheritdoc" if bases.is_some() => {
                 if c.value.is_empty() {
                     ns.diagnostics.push(Diagnostic::error(
-                        pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                        "missing contract for tag ‘@inheritdoc’".to_string(),
+                        pt::Loc::File(file_no, c.tag_offset, c.tag_offset + c.tag.len()),
+                        "missing contract for tag '@inheritdoc'".to_string(),
                     ));
                 } else if bases.unwrap().iter().any(|s| &c.value == s) {
                     res.push(Tag {
@@ -131,15 +143,15 @@ pub fn resolve_tags(
                     });
                 } else {
                     ns.diagnostics.push(Diagnostic::error(
-                        pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                        format!("base contract ‘{}’ not found in tag ‘@inheritdoc’", c.value),
+                        pt::Loc::File(file_no, c.value_offset, c.value_offset + c.value.len()),
+                        format!("base contract '{}' not found in tag '@inheritdoc'", c.value),
                     ));
                 }
             }
             _ => {
                 ns.diagnostics.push(Diagnostic::error(
-                    pt::Loc::File(file_no, c.offset, c.offset + c.tag.len()),
-                    format!("tag ‘@{}’ is not valid for {}", c.tag, ty),
+                    pt::Loc::File(file_no, c.tag_offset, c.tag_offset + c.tag.len()),
+                    format!("tag '@{}' is not valid for {}", c.tag, ty),
                 ));
             }
         }
@@ -165,7 +177,7 @@ pub fn render(tags: &[Tag]) -> String {
     }
 
     if let Some(tag) = tags.iter().find(|e| e.tag == "author") {
-        s.push_str(&format!("Author: {}", &tag.value));
+        write!(s, "Author: {}", &tag.value).unwrap();
     }
 
     s

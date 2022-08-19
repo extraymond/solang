@@ -12,6 +12,8 @@ jobs:
     steps:
     - name: Checkout sources
       uses: actions/checkout@v2
+      with:
+        submodules: recursive
     - run: git clone --depth 1 --branch solana-rustc/13.0-2021-08-08 https://github.com/solana-labs/llvm-project.git
     - name: Install Ninja
       uses: llvm/actions/install-ninja@main
@@ -34,7 +36,7 @@ jobs:
     - name: Add LLVM to Path
       run: echo "$(pwd)/llvm13.0/bin" >> $GITHUB_PATH
     - name: Rust stable
-      run: rustup default 1.56.1
+      run: rustup default 1.59.0
     - name: Build
       run: cargo build --verbose --release
     - name: Run tests
@@ -54,6 +56,8 @@ jobs:
     steps:
     - name: Checkout sources
       uses: actions/checkout@v2
+      with:
+        submodules: recursive
     - run: git clone --depth 1 --branch solana-rustc/13.0-2021-08-08 https://github.com/solana-labs/llvm-project.git
     - run: cmake -G Ninja -DLLVM_ENABLE_ASSERTIONS=On -DLLVM_ENABLE_TERMINFO=Off
         -DLLVM_ENABLE_LIBXML2=Off -DLLVM_ENABLE_ZLIB=Off
@@ -63,7 +67,8 @@ jobs:
       working-directory: ./llvm-project/
     - run: cmake --build . --target install
       working-directory: ./llvm-project/
-    - run: tar Jcf ./llvm13.0-linux-arm64.tar.xz ./llvm13.0/
+      # compression takes a long time on linux-arm64, use multithreaded compression
+    - run: tar cf ./llvm13.0-linux-arm64.tar.xz -I 'xz -T 0' ./llvm13.0/
     - name: Upload llvm
       uses: svenstaro/upload-release-action@v2
       with:
@@ -74,7 +79,7 @@ jobs:
     - name: Add LLVM to Path
       run: echo "$(pwd)/llvm13.0/bin" >> $GITHUB_PATH
     - name: Rust stable
-      run: rustup default 1.56.1
+      run: rustup default 1.59.0
     - name: Build
       run: cargo build --verbose --release
     - name: Run tests
@@ -93,6 +98,8 @@ jobs:
     steps:
     - name: Checkout sources
       uses: actions/checkout@v2
+      with:
+        submodules: recursive
     - run: git clone --depth 1 --branch solana-rustc/13.0-2021-08-08 https://github.com/solana-labs/llvm-project.git
       # We may not have enough space to compile llvm, see https://github.com/actions/virtual-environments/issues/326
       working-directory: C:\
@@ -137,19 +144,23 @@ jobs:
     if: ${{ github.repository_owner == 'hyperledger-labs' }}
     steps:
     - name: Checkout sources
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
     - run: git clone --depth 1 --branch solana-rustc/13.0-2021-08-08 https://github.com/solana-labs/llvm-project.git
     - name: Install Ninja
       uses: llvm/actions/install-ninja@main
-    - run: arch -arm64 cmake -G Ninja -DLLVM_ENABLE_ASSERTIONS=On -DLLVM_ENABLE_TERMINFO=Off
+    - run: cmake -G Ninja -DLLVM_ENABLE_ASSERTIONS=On -DLLVM_ENABLE_TERMINFO=Off
         -DLLVM_ENABLE_LIBXML2=Off -DLLVM_ENABLE_ZLIB=Off
         -DLLVM_ENABLE_PROJECTS='clang;lld'
         -DLLVM_TARGETS_TO_BUILD='WebAssembly;BPF'
         -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_INSTALL_PREFIX=../llvm13.0 llvm
       working-directory: ./llvm-project/
-    - run: arch -arm64 cmake --build . --target install
+    - run: cmake --build . --target install
       working-directory: ./llvm-project/
     - run: tar Jcf ./llvm13.0-mac-arm.tar.xz ./llvm13.0/
+    - name: Cache LLVM
+      run: ${{ github.workspace }}/.github/workflows/llvm-cache.sh llvm13.0-mac-arm.tar.xz
     - name: Upload llvm
       uses: svenstaro/upload-release-action@v2
       with:
@@ -173,10 +184,15 @@ jobs:
 
   mac-intel:
     name: Mac Intel
-    runs-on: macos-latest
+    # The Hyperledger self-hosted intel macs have the label macos-latest
+    # and run macos 12. We don't want to build llvm on macos 12, because
+    # then it can't be used on macos 11.
+    runs-on: macos-11
     steps:
     - name: Checkout sources
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
     - run: git clone --depth 1 --branch solana-rustc/13.0-2021-08-08 https://github.com/solana-labs/llvm-project.git
     - name: Install Ninja
       uses: llvm/actions/install-ninja@main
@@ -189,6 +205,8 @@ jobs:
     - run: cmake --build . --target install
       working-directory: ./llvm-project/
     - run: tar Jcf ./llvm13.0-mac-intel.tar.xz ./llvm13.0/
+    - name: Cache LLVM
+      run: ${{ github.workspace }}/.github/workflows/llvm-cache.sh llvm13.0-mac-intel.tar.xz
     - name: Upload llvm
       uses: svenstaro/upload-release-action@v2
       with:
@@ -210,9 +228,27 @@ jobs:
         asset_name: solang-mac-intel
         tag: ${{ github.ref }}
 
+  mac-universal:
+    name: Mac Universal Binary
+    runs-on: macos-latest
+    needs: [mac-arm, mac-intel]
+    steps:
+    - run: |
+        curl -L --output solang-mac-intel https://github.com/hyperledger-labs/solang/releases/download/${GITHUB_REF/refs\/tags\//}/solang-mac-intel
+        curl -L --output solang-mac-arm https://github.com/hyperledger-labs/solang/releases/download/${GITHUB_REF/refs\/tags\//}/solang-mac-arm
+        lipo -create -output solang-mac solang-mac-intel solang-mac-arm
+    - name: Upload binary
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: solang-mac
+        asset_name: solang-mac
+        tag: ${{ github.ref }}
+
   container:
-    name: Container
+    name: Container Image
     runs-on: ubuntu-20.04
+    if: ${{ github.repository_owner != 'hyperledger-labs' }}
     steps:
     - name: Checkout sources
       uses: actions/checkout@v2
@@ -222,3 +258,17 @@ jobs:
     - run: |
         echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
         docker push ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF/refs\/tags\//}
+
+  container-multiarch:
+    name: Multiarch Container Image
+    runs-on: linux-arm64
+    if: ${{ github.repository_owner == 'hyperledger-labs' }}
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v3
+    - run: |
+        echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin
+        docker buildx build . --push \
+          -t ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF/refs\/tags\//} \
+          --platform linux/arm64,linux/amd64 \
+          --label org.opencontainers.image.description="Solidity Compiler for Solana, Substrate, and ewasm version $(git describe --tags)"

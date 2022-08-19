@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 use ethabi::{ethereum_types::U256, Token};
 
@@ -15,30 +17,30 @@ fn conditional_destructure() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("f", &[Token::Bool(true), Token::Bool(true)], &[], 0, None);
+    let returns = vm.function("f", &[Token::Bool(true), Token::Bool(true)], &[], None);
 
     assert_eq!(
         returns,
         vec![Token::Int(U256::from(1)), Token::Int(U256::from(2)),]
     );
 
-    let returns = vm.function("f", &[Token::Bool(true), Token::Bool(false)], &[], 0, None);
+    let returns = vm.function("f", &[Token::Bool(true), Token::Bool(false)], &[], None);
 
     assert_eq!(
         returns,
         vec![Token::Int(U256::from(3)), Token::Int(U256::from(4)),]
     );
 
-    let returns = vm.function("f", &[Token::Bool(false), Token::Bool(false)], &[], 0, None);
+    let returns = vm.function("f", &[Token::Bool(false), Token::Bool(false)], &[], None);
 
     assert_eq!(
         returns,
         vec![Token::Int(U256::from(5)), Token::Int(U256::from(6)),]
     );
 
-    let returns = vm.function("f", &[Token::Bool(false), Token::Bool(true)], &[], 0, None);
+    let returns = vm.function("f", &[Token::Bool(false), Token::Bool(true)], &[], None);
 
     assert_eq!(
         returns,
@@ -62,9 +64,9 @@ fn casting_destructure() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("f", &[], &[], 0, None);
+    let returns = vm.function("f", &[], &[], None);
 
     assert_eq!(
         returns,
@@ -81,9 +83,9 @@ fn casting_destructure() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("f", &[], &[], 0, None);
+    let returns = vm.function("f", &[], &[], None);
 
     assert_eq!(returns, vec![Token::String(String::from("Hello")),]);
 }

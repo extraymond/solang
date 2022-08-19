@@ -1,11 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+
+extern crate core;
+
 pub mod abi;
 pub mod codegen;
 #[cfg(feature = "llvm")]
 pub mod emit;
 pub mod file_resolver;
 #[cfg(feature = "llvm")]
-pub mod linker;
-pub use solang_parser as parser;
+mod linker;
+pub mod standard_json;
+
 // In Sema, we use result unit for returning early
 // when code-misparses. The error will be added to the namespace diagnostics, no need to have anything but unit
 // as error.
@@ -13,7 +18,6 @@ pub use solang_parser as parser;
 pub mod sema;
 
 use file_resolver::FileResolver;
-use sema::ast;
 use sema::diagnostics;
 use solang_parser::pt;
 use std::{ffi::OsStr, fmt};
@@ -23,7 +27,7 @@ use std::{ffi::OsStr, fmt};
 pub enum Target {
     /// Solana, see <https://solana.com/>
     Solana,
-    /// Parity Substrate, see <https://substrate.dev/>
+    /// Parity Substrate, see <https://substrate.io/>
     Substrate {
         address_length: usize,
         value_length: usize,
@@ -114,10 +118,10 @@ pub fn compile(
     opt_level: inkwell::OptimizationLevel,
     target: Target,
     math_overflow_check: bool,
-) -> (Vec<(Vec<u8>, String)>, ast::Namespace) {
+) -> (Vec<(Vec<u8>, String)>, sema::ast::Namespace) {
     let mut ns = parse_and_resolve(filename, resolver, target);
 
-    if diagnostics::any_errors(&ns.diagnostics) {
+    if ns.diagnostics.any_errors() {
         return (Vec::new(), ns);
     }
 
@@ -151,12 +155,20 @@ pub fn compile(
 #[cfg(feature = "llvm")]
 pub fn compile_many<'a>(
     context: &'a inkwell::context::Context,
-    namespaces: &'a [ast::Namespace],
+    namespaces: &'a [&sema::ast::Namespace],
     filename: &str,
     opt: inkwell::OptimizationLevel,
     math_overflow_check: bool,
-) -> emit::Binary<'a> {
-    emit::Binary::build_bundle(context, namespaces, filename, opt, math_overflow_check)
+    generate_debug_info: bool,
+) -> emit::binary::Binary<'a> {
+    emit::binary::Binary::build_bundle(
+        context,
+        namespaces,
+        filename,
+        opt,
+        math_overflow_check,
+        generate_debug_info,
+    )
 }
 
 /// Parse and resolve the Solidity source code provided in src, for the target chain as specified in target.
@@ -168,16 +180,16 @@ pub fn parse_and_resolve(
     filename: &OsStr,
     resolver: &mut FileResolver,
     target: Target,
-) -> ast::Namespace {
-    let mut ns = ast::Namespace::new(target);
+) -> sema::ast::Namespace {
+    let mut ns = sema::ast::Namespace::new(target);
 
     match resolver.resolve_file(None, filename) {
         Err(message) => {
-            ns.diagnostics.push(ast::Diagnostic {
-                ty: ast::ErrorType::ParserError,
-                level: ast::Level::Error,
+            ns.diagnostics.push(sema::ast::Diagnostic {
+                ty: sema::ast::ErrorType::ParserError,
+                level: sema::ast::Level::Error,
                 message,
-                pos: pt::Loc::CommandLine,
+                loc: pt::Loc::CommandLine,
                 notes: Vec::new(),
             });
         }
@@ -185,6 +197,8 @@ pub fn parse_and_resolve(
             sema::sema(&file, resolver, &mut ns);
         }
     }
+
+    ns.diagnostics.sort_and_dedup();
 
     ns
 }

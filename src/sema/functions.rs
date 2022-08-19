@@ -1,15 +1,23 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::ast::{
-    BuiltinStruct, Diagnostic, Function, Mutability, Namespace, Parameter, Symbol, Type,
+    Diagnostic, Function, Mutability, Namespace, Parameter, StructType, Symbol, Type,
 };
 use super::contracts::is_base;
+use super::diagnostics::Diagnostics;
 use super::tags::resolve_tags;
-use crate::parser::pt;
 use crate::Target;
+use solang_parser::{
+    doccomment::DocComment,
+    pt,
+    pt::{CodeLocation, OptionalCodeLocation},
+};
 
 /// Resolve function declaration in a contract
 pub fn contract_function(
     contract: &pt::ContractDefinition,
     func: &pt::FunctionDefinition,
+    tags: &[DocComment],
     file_no: usize,
     contract_no: usize,
     ns: &mut Namespace,
@@ -32,7 +40,7 @@ pub fn contract_function(
             } else {
                 ns.diagnostics.push(Diagnostic::error(
                     func.name_loc,
-                    "function is missing a name. did you mean ‘fallback() external {…}’ or ‘receive() external {…}’?".to_string(),
+                    "function is missing a name. A function without a name is syntax for 'fallback() external' or 'receive() external' in older versions of the Solidity language, see https://solang.readthedocs.io/en/latest/language/functions.html#fallback-and-receive-function".to_string(),
                 ));
                 return None;
             }
@@ -90,7 +98,7 @@ pub fn contract_function(
     if let Some(loc) = func.return_not_returns {
         ns.diagnostics.push(Diagnostic::error(
             loc,
-            "‘return’ unexpected. Did you mean ‘returns’?".to_string(),
+            "'return' unexpected. Did you mean 'returns'?".to_string(),
         ));
         success = false;
     }
@@ -102,13 +110,21 @@ pub fn contract_function(
 
     for a in &func.attributes {
         match &a {
+            pt::FunctionAttribute::Immutable(loc) => {
+                ns.diagnostics.push(Diagnostic::error(
+                    *loc,
+                    "function cannot be declared 'immutable'".to_string(),
+                ));
+                success = false;
+                continue;
+            }
             pt::FunctionAttribute::Mutability(m) => {
                 if let Some(e) = &mutability {
                     ns.diagnostics.push(Diagnostic::error_with_note(
                         m.loc(),
-                        format!("function redeclared `{}'", m),
+                        format!("function redeclared '{}'", m),
                         e.loc(),
-                        format!("location of previous declaration of `{}'", e),
+                        format!("location of previous declaration of '{}'", e),
                     ));
                     success = false;
                     continue;
@@ -117,7 +133,7 @@ pub fn contract_function(
                 if let pt::Mutability::Constant(loc) = m {
                     ns.diagnostics.push(Diagnostic::warning(
                         *loc,
-                        "‘constant’ is deprecated. Use ‘view’ instead".to_string(),
+                        "'constant' is deprecated. Use 'view' instead".to_string(),
                     ));
 
                     mutability = Some(pt::Mutability::View(*loc));
@@ -129,9 +145,9 @@ pub fn contract_function(
                 if let Some(e) = &visibility {
                     ns.diagnostics.push(Diagnostic::error_with_note(
                         v.loc().unwrap(),
-                        format!("function redeclared `{}'", v),
+                        format!("function redeclared '{}'", v),
                         e.loc().unwrap(),
-                        format!("location of previous declaration of `{}'", e),
+                        format!("location of previous declaration of '{}'", e),
                     ));
                     success = false;
                     continue;
@@ -143,9 +159,9 @@ pub fn contract_function(
                 if let Some(prev_loc) = &is_virtual {
                     ns.diagnostics.push(Diagnostic::error_with_note(
                         *loc,
-                        "function redeclared ‘virtual’".to_string(),
+                        "function redeclared 'virtual'".to_string(),
                         *prev_loc,
-                        "location of previous declaration of ‘virtual’".to_string(),
+                        "location of previous declaration of 'virtual'".to_string(),
                     ));
                     success = false;
                     continue;
@@ -157,44 +173,41 @@ pub fn contract_function(
                 if let Some((prev_loc, _)) = &is_override {
                     ns.diagnostics.push(Diagnostic::error_with_note(
                         *loc,
-                        "function redeclared ‘override’".to_string(),
+                        "function redeclared 'override'".to_string(),
                         *prev_loc,
-                        "location of previous declaration of ‘override’".to_string(),
+                        "location of previous declaration of 'override'".to_string(),
                     ));
                     success = false;
                     continue;
                 }
 
                 let mut list = Vec::new();
+                let mut diagnostics = Diagnostics::default();
 
                 for name in bases {
-                    match ns.resolve_contract(file_no, name) {
-                        Some(no) => {
-                            if list.contains(&no) {
-                                ns.diagnostics.push(Diagnostic::error(
-                                    name.loc,
-                                    format!("function duplicate override ‘{}’", name.name),
-                                ));
-                            } else if !is_base(no, contract_no, ns) {
-                                ns.diagnostics.push(Diagnostic::error(
-                                    name.loc,
-                                    format!(
-                                        "override ‘{}’ is not a base contract of ‘{}’",
-                                        name.name, ns.contracts[contract_no].name
-                                    ),
-                                ));
-                            } else {
-                                list.push(no);
-                            }
-                        }
-                        None => {
-                            ns.diagnostics.push(Diagnostic::error(
+                    if let Ok(no) =
+                        ns.resolve_contract_with_namespace(file_no, name, &mut diagnostics)
+                    {
+                        if list.contains(&no) {
+                            diagnostics.push(Diagnostic::error(
                                 name.loc,
-                                format!("contract ‘{}’ in override list not found", name.name),
+                                format!("function duplicate override '{}'", name),
                             ));
+                        } else if !is_base(no, contract_no, ns) {
+                            diagnostics.push(Diagnostic::error(
+                                name.loc,
+                                format!(
+                                    "override '{}' is not a base contract of '{}'",
+                                    name, ns.contracts[contract_no].name
+                                ),
+                            ));
+                        } else {
+                            list.push(no);
                         }
                     }
                 }
+
+                ns.diagnostics.extend(diagnostics);
 
                 is_override = Some((*loc, list));
             }
@@ -220,14 +233,14 @@ pub fn contract_function(
             if func.ty == pt::FunctionTy::Modifier {
                 ns.diagnostics.push(Diagnostic::error(
                     v.loc().unwrap(),
-                    format!("‘{}’: modifiers can not have visibility", v),
+                    format!("'{}': modifiers can not have visibility", v),
                 ));
 
                 pt::Visibility::Internal(v.loc())
             } else if func.ty == pt::FunctionTy::Constructor {
                 ns.diagnostics.push(Diagnostic::warning(
                     v.loc().unwrap(),
-                    format!("‘{}’: visibility for constructors is ignored", v),
+                    format!("'{}': visibility for constructors is ignored", v),
                 ));
 
                 pt::Visibility::Public(v.loc())
@@ -283,7 +296,7 @@ pub fn contract_function(
         }
     };
 
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = Diagnostics::default();
 
     let (params, params_success) = resolve_params(
         &func.params,
@@ -323,7 +336,7 @@ pub fn contract_function(
         } else {
             ns.diagnostics.push(Diagnostic::error(
                 func.loc,
-                "functions must be declared ‘external’ in an interface".to_string(),
+                "functions must be declared 'external' in an interface".to_string(),
             ));
             success = false;
         }
@@ -356,7 +369,7 @@ pub fn contract_function(
     } else if func.ty == pt::FunctionTy::Constructor && is_virtual.is_some() {
         ns.diagnostics.push(Diagnostic::error(
             func.loc,
-            "constructors cannot be declared ‘virtual’".to_string(),
+            "constructors cannot be declared 'virtual'".to_string(),
         ));
     }
 
@@ -386,7 +399,7 @@ pub fn contract_function(
     if !is_virtual && func.body.is_none() {
         ns.diagnostics.push(Diagnostic::error(
             func.loc,
-            "function with no body must be marked ‘virtual’".to_string(),
+            "function with no body missing 'virtual'. This was permitted in older versions of the Solidity language, please update.".to_string(),
         ));
         success = false;
     }
@@ -395,7 +408,7 @@ pub fn contract_function(
         if is_virtual {
             ns.diagnostics.push(Diagnostic::error(
                 func.loc,
-                "function marked ‘virtual’ cannot also be ‘private’".to_string(),
+                "function marked 'virtual' cannot also be 'private'".to_string(),
             ));
             success = false;
         }
@@ -410,16 +423,16 @@ pub fn contract_function(
         None => "".to_owned(),
     };
 
-    let bases: Vec<&str> = contract
+    let bases: Vec<String> = contract
         .base
         .iter()
-        .map(|base| -> &str { &base.name.name })
+        .map(|base| format!("{}", base.name))
         .collect();
 
     let doc = resolve_tags(
         func.loc.file_no(),
         "function",
-        &func.doc,
+        tags,
         Some(&params),
         Some(&returns),
         Some(&bases),
@@ -473,7 +486,7 @@ pub fn contract_function(
 
                 ns.diagnostics.push(Diagnostic::error_with_note(
                     func.loc,
-                    "all constructors should be defined ‘payable’ or not".to_string(),
+                    "all constructors should be defined 'payable' or not".to_string(),
                     prev_loc,
                     "location of previous definition".to_string(),
                 ));
@@ -521,46 +534,53 @@ pub fn contract_function(
 
         Some(pos)
     } else if func.ty == pt::FunctionTy::Receive || func.ty == pt::FunctionTy::Fallback {
-        if let Some(prev_func_no) = ns.contracts[contract_no]
-            .functions
-            .iter()
-            .find(|func_no| ns.functions[**func_no].ty == func.ty)
-        {
-            let prev_loc = ns.functions[*prev_func_no].loc;
-
-            ns.diagnostics.push(Diagnostic::error_with_note(
-                func.loc,
-                format!("{} function already defined", func.ty),
-                prev_loc,
-                "location of previous definition".to_string(),
-            ));
-            return None;
-        }
-
-        if let pt::Visibility::External(_) = fdecl.visibility {
-            // ok
-        } else {
+        if func.ty == pt::FunctionTy::Receive && ns.target == Target::Solana {
             ns.diagnostics.push(Diagnostic::error(
                 func.loc,
-                format!("{} function must be declared external", func.ty),
+                format!("target {} does not support receive() functions, see https://solang.readthedocs.io/en/latest/language/functions.html#fallback-and-receive-function", ns.target),
             ));
-            return None;
-        }
+        } else {
+            if let Some(prev_func_no) = ns.contracts[contract_no]
+                .functions
+                .iter()
+                .find(|func_no| ns.functions[**func_no].ty == func.ty)
+            {
+                let prev_loc = ns.functions[*prev_func_no].loc;
 
-        if fdecl.is_payable() {
-            if func.ty == pt::FunctionTy::Fallback {
-                ns.diagnostics.push(Diagnostic::error(
+                ns.diagnostics.push(Diagnostic::error_with_note(
                     func.loc,
-                    format!("{} function must not be declare payable, use ‘receive() external payable’ instead", func.ty),
+                    format!("{} function already defined", func.ty),
+                    prev_loc,
+                    "location of previous definition".to_string(),
                 ));
                 return None;
             }
-        } else if func.ty == pt::FunctionTy::Receive {
-            ns.diagnostics.push(Diagnostic::error(
-                func.loc,
-                format!("{} function must be declared payable", func.ty),
-            ));
-            return None;
+
+            if let pt::Visibility::External(_) = fdecl.visibility {
+                // ok
+            } else {
+                ns.diagnostics.push(Diagnostic::error(
+                    func.loc,
+                    format!("{} function must be declared external", func.ty),
+                ));
+                return None;
+            }
+
+            if fdecl.is_payable() {
+                if func.ty == pt::FunctionTy::Fallback {
+                    ns.diagnostics.push(Diagnostic::error(
+                    func.loc,
+                    format!("{} function must not be declare payable, use 'receive() external payable' instead", func.ty),
+                ));
+                    return None;
+                }
+            } else if func.ty == pt::FunctionTy::Receive {
+                ns.diagnostics.push(Diagnostic::error(
+                    func.loc,
+                    format!("{} function must be declared payable", func.ty),
+                ));
+                return None;
+            }
         }
 
         let pos = ns.functions.len();
@@ -614,10 +634,11 @@ pub fn contract_function(
     }
 }
 
-/// Resolve function declaration outside a contract
+/// Resolve free function
 pub fn function(
     func: &pt::FunctionDefinition,
     file_no: usize,
+    tags: &[DocComment],
     ns: &mut Namespace,
 ) -> Option<usize> {
     let mut success = true;
@@ -626,13 +647,21 @@ pub fn function(
 
     for a in &func.attributes {
         match &a {
+            pt::FunctionAttribute::Immutable(loc) => {
+                ns.diagnostics.push(Diagnostic::error(
+                    *loc,
+                    "function cannot be declared 'immutable'".to_string(),
+                ));
+                success = false;
+                continue;
+            }
             pt::FunctionAttribute::Mutability(m) => {
                 if let Some(e) = &mutability {
                     ns.diagnostics.push(Diagnostic::error_with_note(
                         m.loc(),
-                        format!("function redeclared `{}'", m),
+                        format!("function redeclared '{}'", m),
                         e.loc(),
-                        format!("location of previous declaration of `{}'", e),
+                        format!("location of previous declaration of '{}'", e),
                     ));
                     success = false;
                     continue;
@@ -641,7 +670,7 @@ pub fn function(
                 if let pt::Mutability::Constant(loc) = m {
                     ns.diagnostics.push(Diagnostic::warning(
                         *loc,
-                        "‘constant’ is deprecated. Use ‘view’ instead".to_string(),
+                        "'constant' is deprecated. Use 'view' instead".to_string(),
                     ));
 
                     mutability = Some(pt::Mutability::View(*loc));
@@ -653,7 +682,7 @@ pub fn function(
                 ns.diagnostics.push(Diagnostic::error(
                     v.loc().unwrap(),
                     format!(
-                        "‘{}’: only functions in contracts can have a visibility specifier",
+                        "'{}': only functions in contracts can have a visibility specifier",
                         v
                     ),
                 ));
@@ -688,7 +717,7 @@ pub fn function(
         }
     }
 
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = Diagnostics::default();
 
     let (params, params_success) =
         resolve_params(&func.params, true, file_no, None, ns, &mut diagnostics);
@@ -724,7 +753,7 @@ pub fn function(
     let doc = resolve_tags(
         func.loc.file_no(),
         "function",
-        &func.doc,
+        tags,
         Some(&params),
         Some(&returns),
         None,
@@ -782,7 +811,7 @@ pub fn resolve_params(
     file_no: usize,
     contract_no: Option<usize>,
     ns: &mut Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> (Vec<Parameter>, bool) {
     let mut params = Vec::new();
     let mut success = true;
@@ -805,14 +834,14 @@ pub fn resolve_params(
                     if ty.contains_internal_function(ns) {
                         diagnostics.push(Diagnostic::error(
                         p.ty.loc(),
-                        "parameter of type ‘function internal’ not allowed public or external functions".to_string(),
+                        "parameter of type 'function internal' not allowed public or external functions".to_string(),
                     ));
                         success = false;
                     }
 
-                    if let Some(ty) = ty.contains_builtins(ns, BuiltinStruct::AccountInfo) {
+                    if let Some(ty) = ty.contains_builtins(ns, &StructType::AccountInfo) {
                         let message = format!(
-                            "parameter of type ‘{}’ not alowed in public or external functions",
+                            "parameter of type '{}' not alowed in public or external functions",
                             ty.to_string(ns)
                         );
                         ns.diagnostics.push(Diagnostic::error(p.ty.loc(), message));
@@ -823,8 +852,8 @@ pub fn resolve_params(
                 let ty = if !ty.can_have_data_location() {
                     if let Some(storage) = &p.storage {
                         diagnostics.push(Diagnostic::error(
-                            *storage.loc(),
-                                format!("data location ‘{}’ can only be specified for array, struct or mapping",
+                            storage.loc(),
+                                format!("data location '{}' can only be specified for array, struct or mapping",
                                 storage)
                             ));
                         success = false;
@@ -835,7 +864,7 @@ pub fn resolve_params(
                     if !is_internal {
                         diagnostics.push(Diagnostic::error(
                             loc,
-                            "parameter of type ‘storage’ not allowed public or external functions"
+                            "parameter of type 'storage' not allowed public or external functions"
                                 .to_string(),
                         ));
                         success = false;
@@ -848,7 +877,7 @@ pub fn resolve_params(
                     if ty.contains_mapping(ns) {
                         diagnostics.push(Diagnostic::error(
                             p.ty.loc(),
-                            "parameter with mapping type must be of type ‘storage’".to_string(),
+                            "parameter with mapping type must be of type 'storage'".to_string(),
                         ));
                         success = false;
                     }
@@ -866,11 +895,12 @@ pub fn resolve_params(
 
                 params.push(Parameter {
                     loc: *loc,
-                    name: p.name.clone(),
+                    id: p.name.clone(),
                     ty,
-                    ty_loc,
+                    ty_loc: Some(ty_loc),
                     indexed: false,
                     readonly: false,
+                    recursive: false,
                 });
             }
             Err(()) => success = false,
@@ -887,7 +917,7 @@ pub fn resolve_returns(
     file_no: usize,
     contract_no: Option<usize>,
     ns: &mut Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> (Vec<Parameter>, bool) {
     let mut resolved_returns = Vec::new();
     let mut success = true;
@@ -910,15 +940,15 @@ pub fn resolve_returns(
                     if ty.contains_internal_function(ns) {
                         diagnostics.push(Diagnostic::error(
                         r.ty.loc(),
-                        "return type ‘function internal’ not allowed in public or external functions"
+                        "return type 'function internal' not allowed in public or external functions"
                             .to_string(),
                     ));
                         success = false;
                     }
 
-                    if let Some(ty) = ty.contains_builtins(ns, BuiltinStruct::AccountInfo) {
+                    if let Some(ty) = ty.contains_builtins(ns, &StructType::AccountInfo) {
                         let message = format!(
-                            "return type ‘{}’ not allowed in public or external functions",
+                            "return type '{}' not allowed in public or external functions",
                             ty.to_string(ns)
                         );
                         ns.diagnostics.push(Diagnostic::error(r.ty.loc(), message));
@@ -928,8 +958,8 @@ pub fn resolve_returns(
                 let ty = if !ty.can_have_data_location() {
                     if let Some(storage) = &r.storage {
                         diagnostics.push(Diagnostic::error(
-                            *storage.loc(),
-                                format!("data location ‘{}’ can only be specified for array, struct or mapping",
+                            storage.loc(),
+                                format!("data location '{}' can only be specified for array, struct or mapping",
                                 storage)
                             ));
                         success = false;
@@ -942,7 +972,7 @@ pub fn resolve_returns(
                             if !is_internal {
                                 diagnostics.push(Diagnostic::error(
                                     loc,
-                                    "return type of type ‘storage’ not allowed public or external functions"
+                                    "return type of type 'storage' not allowed public or external functions"
                                         .to_string(),
                                 ));
                                 success = false;
@@ -956,7 +986,7 @@ pub fn resolve_returns(
                             if ty.contains_mapping(ns) {
                                 diagnostics.push(Diagnostic::error(
                                     r.ty.loc(),
-                                    "return type containing mapping must be of type ‘storage’"
+                                    "return type containing mapping must be of type 'storage'"
                                         .to_string(),
                                 ));
                                 success = false;
@@ -977,11 +1007,12 @@ pub fn resolve_returns(
 
                 resolved_returns.push(Parameter {
                     loc: *loc,
-                    name: r.name.clone(),
+                    id: r.name.clone(),
                     ty,
-                    ty_loc,
+                    ty_loc: Some(ty_loc),
                     indexed: false,
                     readonly: false,
+                    recursive: false,
                 });
             }
             Err(()) => success = false,
@@ -1015,19 +1046,21 @@ fn signatures() {
         vec![
             Parameter {
                 loc: pt::Loc::Implicit,
-                name: None,
+                id: None,
                 ty: Type::Uint(8),
-                ty_loc: pt::Loc::Implicit,
+                ty_loc: None,
                 indexed: false,
                 readonly: false,
+                recursive: false,
             },
             Parameter {
                 loc: pt::Loc::Implicit,
-                name: None,
+                id: None,
                 ty: Type::Address(false),
-                ty_loc: pt::Loc::Implicit,
+                ty_loc: None,
                 indexed: false,
                 readonly: false,
+                recursive: false,
             },
         ],
         Vec::new(),

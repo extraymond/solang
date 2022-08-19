@@ -1,5 +1,7 @@
-use crate::parser::pt::Loc;
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::sema::ast;
+use solang_parser::pt::Loc;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -48,7 +50,7 @@ impl FileResolver {
     }
 
     /// Add import path
-    pub fn add_import_path(&mut self, path: PathBuf) -> io::Result<()> {
+    pub fn add_import_path(&mut self, path: &Path) -> io::Result<()> {
         self.import_paths.push((None, path.canonicalize()?));
         Ok(())
     }
@@ -62,7 +64,7 @@ impl FileResolver {
         {
             Err(Error::new(
                 ErrorKind::Other,
-                format!("duplicate mapping for ‘{}’", map.to_string_lossy()),
+                format!("duplicate mapping for '{}'", map.to_string_lossy()),
             ))
         } else {
             self.import_paths.push((Some(map), path.canonicalize()?));
@@ -97,7 +99,7 @@ impl FileResolver {
         let mut f = match File::open(&path) {
             Err(err_info) => {
                 return Err(format!(
-                    "cannot open file ‘{}’: {}",
+                    "cannot open file '{}': {}",
                     path.display(),
                     err_info
                 ));
@@ -107,7 +109,7 @@ impl FileResolver {
 
         let mut contents = String::new();
         if let Err(e) = f.read_to_string(&mut contents) {
-            return Err(format!("failed to read file ‘{}’: {}", path.display(), e));
+            return Err(format!("failed to read file '{}': {}", path.display(), e));
         }
 
         let pos = self.files.len();
@@ -230,7 +232,7 @@ impl FileResolver {
             }
         }
 
-        Err(format!("file not found ‘{}’", filename.to_string_lossy()))
+        Err(format!("file not found '{}'", filename.to_string_lossy()))
     }
 
     /// Get line and the target symbol's offset from loc
@@ -244,10 +246,11 @@ impl FileResolver {
         } else {
             unreachable!();
         };
+        let cache_no = file.cache_no.unwrap();
         let (begin_line, mut begin_column) = file.offset_to_line_column(*start);
         let (end_line, mut end_column) = file.offset_to_line_column(*end);
 
-        let mut full_line = self.files[file.cache_no]
+        let mut full_line = self.files[cache_no]
             .lines()
             .nth(begin_line)
             .unwrap()
@@ -256,7 +259,7 @@ impl FileResolver {
         // If the loc spans across multiple lines, we concatenate them
         if begin_line != end_line {
             for i in begin_line + 1..=end_line {
-                let line = self.files[file.cache_no].lines().nth(i).unwrap();
+                let line = self.files[cache_no].lines().nth(i).unwrap();
                 if i == end_line {
                     end_column += full_line.len();
                 }

@@ -1,11 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::sema::{ast::Type, symtable::Symtable};
 use indexmap::IndexMap;
 use num_bigint::BigInt;
+use solang_parser::pt;
 use std::collections::BTreeSet;
-
-use crate::{
-    parser::pt,
-    sema::{ast::Type, symtable::Symtable},
-};
 
 #[derive(Clone)]
 pub struct Variable {
@@ -164,9 +163,11 @@ impl Vartable {
         }
     }
 
-    pub fn new_dirty_tracker(&mut self, lim: usize) {
+    /// Track dirty variables for phi instructions.
+    /// Any variable created after this command will not be considered dirty.
+    pub fn new_dirty_tracker(&mut self) {
         self.dirty.push(DirtyTracker {
-            lim,
+            lim: self.next_id,
             set: BTreeSet::new(),
         });
     }

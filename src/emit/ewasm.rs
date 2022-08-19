@@ -1,13 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::codegen;
 use crate::codegen::cfg::HashTy;
-use crate::parser::pt;
 use crate::sema::ast;
+use solang_parser::pt;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::str;
 
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::context::Context;
-use inkwell::module::Linkage;
+use inkwell::module::{Linkage, Module};
 use inkwell::types::IntType;
 use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
@@ -16,9 +19,9 @@ use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 
-use super::ethabiencoder;
-use super::{Binary, TargetRuntime, Variable};
+use crate::emit::ethabiencoder;
 use crate::emit::Generate;
+use crate::emit::{Binary, TargetRuntime, Variable};
 
 pub struct EwasmTarget {
     abi: ethabiencoder::EthAbiDecoder,
@@ -27,11 +30,13 @@ pub struct EwasmTarget {
 impl EwasmTarget {
     pub fn build<'a>(
         context: &'a Context,
+        std_lib: &Module<'a>,
         contract: &'a ast::Contract,
         ns: &'a ast::Namespace,
         filename: &'a str,
         opt: OptimizationLevel,
         math_overflow_check: bool,
+        generate_debug_info: bool,
     ) -> Binary<'a> {
         // first emit runtime code
         let mut b = EwasmTarget {
@@ -44,7 +49,9 @@ impl EwasmTarget {
             filename,
             opt,
             math_overflow_check,
+            std_lib,
             None,
+            generate_debug_info,
         );
 
         runtime_code.set_early_value_aborts(contract, ns);
@@ -73,7 +80,9 @@ impl EwasmTarget {
             filename,
             opt,
             math_overflow_check,
+            std_lib,
             Some(Box::new(runtime_code)),
+            generate_debug_info,
         );
 
         deploy_code.set_early_value_aborts(contract, ns);
@@ -119,6 +128,7 @@ impl EwasmTarget {
             "getBlockCoinbase",
             "getCaller",
             "log",
+            "getExternalCodeSize",
         ]);
 
         deploy_code
@@ -547,6 +557,17 @@ impl EwasmTarget {
                     u8_ptr_ty.into(), // topic2
                     u8_ptr_ty.into(), // topic3
                     u8_ptr_ty.into(), // topic4
+                ],
+                false,
+            ),
+            Some(Linkage::External),
+        );
+
+        binary.module.add_function(
+            "getExternalCodeSize",
+            u32_ty.fn_type(
+                &[
+                    u8_ptr_ty.into(), // address_ptr
                 ],
                 false,
             ),
@@ -1291,6 +1312,7 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
             "",
             binary.opt,
             binary.math_overflow_check,
+            binary.generate_debug_info,
         );
 
         // wasm
@@ -1405,13 +1427,15 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
     fn external_call<'b>(
         &self,
         binary: &Binary<'b>,
-        function: FunctionValue,
+        function: FunctionValue<'b>,
         success: Option<&mut BasicValueEnum<'b>>,
         payload: PointerValue<'b>,
         payload_len: IntValue<'b>,
         address: Option<PointerValue<'b>>,
         gas: IntValue<'b>,
         value: IntValue<'b>,
+        _accounts: Option<(PointerValue<'b>, IntValue<'b>)>,
+        _seeds: Option<(PointerValue<'b>, IntValue<'b>)>,
         callty: ast::CallTy,
         ns: &ast::Namespace,
     ) {
@@ -1850,7 +1874,7 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
     fn builtin<'b>(
         &self,
         binary: &Binary<'b>,
-        expr: &ast::Expression,
+        expr: &codegen::Expression,
         vartab: &HashMap<usize, Variable<'b>>,
         function: FunctionValue<'b>,
         ns: &ast::Namespace,
@@ -1911,37 +1935,37 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
         }
 
         match expr {
-            ast::Expression::Builtin(_, _, ast::Builtin::BlockNumber, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::BlockNumber, _) => {
                 straight_call!("block_number", "getBlockNumber")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Gasleft, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Gasleft, _) => {
                 straight_call!("gas_left", "getGasLeft")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::GasLimit, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::GasLimit, _) => {
                 straight_call!("gas_limit", "getBlockGasLimit")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Timestamp, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Timestamp, _) => {
                 straight_call!("time_stamp", "getBlockTimestamp")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::BlockDifficulty, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::BlockDifficulty, _) => {
                 single_int_stack!("block_difficulty", "getBlockDifficulty", 256)
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Origin, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Origin, _) => {
                 single_address_stack!("origin", "getTxOrigin")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Sender, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Sender, _) => {
                 single_address_stack!("caller", "getCaller")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::BlockCoinbase, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::BlockCoinbase, _) => {
                 single_address_stack!("coinbase", "getBlockCoinbase")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Gasprice, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Gasprice, _) => {
                 single_int_stack!("gas_price", "getTxGasPrice", ns.value_length as u32 * 8)
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Value, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Value, _) => {
                 single_int_stack!("value", "getCallValue", ns.value_length as u32 * 8)
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Calldata, _) => binary
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Calldata, _) => binary
                 .builder
                 .build_call(
                     binary.module.get_function("vector_new").unwrap(),
@@ -1961,7 +1985,7 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
                 .try_as_basic_value()
                 .left()
                 .unwrap(),
-            ast::Expression::Builtin(_, _, ast::Builtin::BlockHash, args) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::BlockHash, args) => {
                 let block_number = self.expression(binary, &args[0], vartab, function, ns);
 
                 let value = binary
@@ -1986,7 +2010,7 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
 
                 binary.builder.build_load(value, "block_hash")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::GetAddress, _) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::GetAddress, _) => {
                 let value = binary
                     .builder
                     .build_alloca(binary.address_type(ns), "self_address");
@@ -2006,7 +2030,7 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
 
                 binary.builder.build_load(value, "self_address")
             }
-            ast::Expression::Builtin(_, _, ast::Builtin::Balance, addr) => {
+            codegen::Expression::Builtin(_, _, codegen::Builtin::Balance, addr) => {
                 let addr = self
                     .expression(binary, &addr[0], vartab, function, ns)
                     .into_array_value();
@@ -2045,6 +2069,35 @@ impl<'a> TargetRuntime<'a> for EwasmTarget {
                 );
 
                 binary.builder.build_load(balance, "balance")
+            }
+            codegen::Expression::Builtin(_, _, codegen::Builtin::ExtCodeSize, addr) => {
+                let addr = self
+                    .expression(binary, &addr[0], vartab, function, ns)
+                    .into_array_value();
+
+                let address = binary
+                    .builder
+                    .build_alloca(binary.address_type(ns), "address");
+
+                binary.builder.build_store(address, addr);
+
+                binary
+                    .builder
+                    .build_call(
+                        binary.module.get_function("getExternalCodeSize").unwrap(),
+                        &[binary
+                            .builder
+                            .build_pointer_cast(
+                                address,
+                                binary.context.i8_type().ptr_type(AddressSpace::Generic),
+                                "",
+                            )
+                            .into()],
+                        "code_size",
+                    )
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
             }
             _ => unimplemented!("{:?}", expr),
         }

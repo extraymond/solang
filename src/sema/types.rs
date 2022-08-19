@@ -1,30 +1,51 @@
-use super::diagnostics::any_errors;
+// SPDX-License-Identifier: Apache-2.0
+
 use super::tags::resolve_tags;
 use super::SOLANA_BUCKET_SIZE;
 use super::{
     ast::{
-        BuiltinStruct, Contract, Diagnostic, EnumDecl, EventDecl, Namespace, Parameter, StructDecl,
-        Symbol, Tag, Type,
+        ArrayLength, Contract, Diagnostic, EnumDecl, EventDecl, Namespace, Parameter, StructDecl,
+        StructType, Symbol, Tag, Type, UserTypeDecl,
     },
+    diagnostics::Diagnostics,
     SOLANA_SPARSE_ARRAY_SIZE,
 };
-use crate::parser::pt;
 use crate::Target;
 use num_bigint::BigInt;
 use num_traits::{One, Zero};
-use std::collections::HashMap;
-use std::ops::Mul;
+use solang_parser::{
+    doccomment::{parse_doccomments, DocComment},
+    pt,
+    pt::CodeLocation,
+};
+use std::collections::HashSet;
+use std::{collections::HashMap, fmt::Write, ops::Mul};
 
 /// List the types which should be resolved later
 pub struct ResolveFields<'a> {
-    pub structs: Vec<(usize, &'a pt::StructDefinition, Option<usize>)>,
-    pub events: Vec<(usize, &'a pt::EventDefinition, Option<usize>)>,
+    structs: Vec<ResolveStructFields<'a>>,
+    events: Vec<ResolveEventFields<'a>>,
+}
+
+struct ResolveEventFields<'a> {
+    event_no: usize,
+    pt: &'a pt::EventDefinition,
+    comments: Vec<DocComment>,
+    contract: Option<usize>,
+}
+
+struct ResolveStructFields<'a> {
+    struct_no: usize,
+    pt: &'a pt::StructDefinition,
+    comments: Vec<DocComment>,
+    contract: Option<usize>,
 }
 
 /// Resolve all the types we can find (enums, structs, contracts). structs can have other
 /// structs as fields, including ones that have not been declared yet.
 pub fn resolve_typenames<'a>(
     s: &'a pt::SourceUnit,
+    comments: &[pt::Comment],
     file_no: usize,
     ns: &mut Namespace,
 ) -> ResolveFields<'a> {
@@ -36,22 +57,34 @@ pub fn resolve_typenames<'a>(
     // Find all the types: contracts, enums, and structs. Either in a contract or not
     // We do not resolve the struct fields yet as we do not know all the possible types until we're
     // done
+    let mut doc_comment_start = 0;
+
     for part in &s.0 {
         match part {
             pt::SourceUnitPart::ContractDefinition(def) => {
-                resolve_contract(def, file_no, &mut delay, ns);
+                let tags = parse_doccomments(comments, doc_comment_start, def.loc.start());
+
+                resolve_contract(def, comments, &tags, file_no, &mut delay, ns);
             }
             pt::SourceUnitPart::EnumDefinition(def) => {
-                let _ = enum_decl(def, file_no, None, ns);
+                let tags = parse_doccomments(comments, doc_comment_start, def.loc.start());
+
+                let _ = enum_decl(def, file_no, &tags, None, ns);
             }
             pt::SourceUnitPart::StructDefinition(def) => {
-                let pos = ns.structs.len();
+                let tags = parse_doccomments(comments, doc_comment_start, def.loc.start());
 
-                if ns.add_symbol(file_no, None, &def.name, Symbol::Struct(def.name.loc, pos)) {
+                let struct_no = ns.structs.len();
+
+                if ns.add_symbol(
+                    file_no,
+                    None,
+                    &def.name,
+                    Symbol::Struct(def.name.loc, StructType::UserDefined(struct_no)),
+                ) {
                     ns.structs.push(StructDecl {
                         tags: Vec::new(),
                         name: def.name.name.to_owned(),
-                        builtin: BuiltinStruct::None,
                         loc: def.name.loc,
                         contract: None,
                         fields: Vec::new(),
@@ -59,22 +92,29 @@ pub fn resolve_typenames<'a>(
                         storage_offsets: Vec::new(),
                     });
 
-                    delay.structs.push((pos, def, None));
+                    delay.structs.push(ResolveStructFields {
+                        struct_no,
+                        pt: def,
+                        comments: tags,
+                        contract: None,
+                    });
                 }
             }
             pt::SourceUnitPart::EventDefinition(def) => {
-                let pos = ns.events.len();
+                let event_no = ns.events.len();
+
+                let tags = parse_doccomments(comments, doc_comment_start, def.loc.start());
 
                 if let Some(Symbol::Event(events)) =
                     ns.variable_symbols
                         .get_mut(&(file_no, None, def.name.name.to_owned()))
                 {
-                    events.push((def.name.loc, pos));
+                    events.push((def.name.loc, event_no));
                 } else if !ns.add_symbol(
                     file_no,
                     None,
                     &def.name,
-                    Symbol::Event(vec![(def.name.loc, pos)]),
+                    Symbol::Event(vec![(def.name.loc, event_no)]),
                 ) {
                     continue;
                 }
@@ -90,76 +130,151 @@ pub fn resolve_typenames<'a>(
                     used: false,
                 });
 
-                delay.events.push((pos, def, None));
+                delay.events.push(ResolveEventFields {
+                    event_no,
+                    pt: def,
+                    comments: tags,
+                    contract: None,
+                });
+            }
+            pt::SourceUnitPart::TypeDefinition(ty) => {
+                let tags = parse_doccomments(comments, doc_comment_start, ty.loc.start());
+
+                type_decl(ty, file_no, &tags, None, ns);
+            }
+            pt::SourceUnitPart::FunctionDefinition(f) => {
+                if let Some(pt::Statement::Block { loc, .. }) = &f.body {
+                    doc_comment_start = loc.end();
+                    continue;
+                }
             }
             _ => (),
         }
+
+        doc_comment_start = part.loc().end();
     }
 
     delay
 }
 
+fn type_decl(
+    def: &pt::TypeDefinition,
+    file_no: usize,
+    tags: &[DocComment],
+    contract_no: Option<usize>,
+    ns: &mut Namespace,
+) {
+    let mut diagnostics = Diagnostics::default();
+
+    let mut ty = match ns.resolve_type(file_no, contract_no, false, &def.ty, &mut diagnostics) {
+        Ok(ty) => ty,
+        Err(_) => {
+            ns.diagnostics.extend(diagnostics);
+            return;
+        }
+    };
+
+    // We could permit all types to be defined here, however:
+    // - This would require resolving the types definition after all other types are resolved
+    // - Need for circular checks (type a is b; type b is a;)
+    if !matches!(
+        ty,
+        Type::Address(_) | Type::Bool | Type::Int(_) | Type::Uint(_) | Type::Bytes(_)
+    ) {
+        ns.diagnostics.push(Diagnostic::error(
+            def.ty.loc(),
+            format!("'{}' is not an elementary value type", ty.to_string(ns)),
+        ));
+        ty = Type::Unresolved;
+    }
+
+    let pos = ns.user_types.len();
+
+    if !ns.add_symbol(
+        file_no,
+        contract_no,
+        &def.name,
+        Symbol::UserType(def.name.loc, pos),
+    ) {
+        return;
+    }
+
+    let tags = resolve_tags(def.name.loc.file_no(), "type", tags, None, None, None, ns);
+
+    ns.user_types.push(UserTypeDecl {
+        tags,
+        loc: def.loc,
+        name: def.name.name.to_string(),
+        ty,
+        contract: contract_no.map(|no| ns.contracts[no].name.to_string()),
+    });
+}
+
+/// check if a struct contains itself. This function calls itself recursively
+fn find_struct_recursion(struct_no: usize, structs_visited: &mut Vec<usize>, ns: &mut Namespace) {
+    let def = ns.structs[struct_no].clone();
+    let mut types_seen: HashSet<usize> = HashSet::new();
+
+    for (field_no, field) in def.fields.iter().enumerate() {
+        if let Type::Struct(StructType::UserDefined(field_struct_no)) = field.ty {
+            if types_seen.contains(&field_struct_no) {
+                continue;
+            }
+
+            types_seen.insert(field_struct_no);
+
+            if structs_visited.contains(&field_struct_no) {
+                ns.diagnostics.push(Diagnostic::error_with_note(
+                    def.loc,
+                    format!("struct '{}' has infinite size", def.name),
+                    field.loc,
+                    format!("recursive field '{}'", field.name_as_str()),
+                ));
+
+                ns.structs[struct_no].fields[field_no].recursive = true;
+            } else {
+                structs_visited.push(field_struct_no);
+                find_struct_recursion(field_struct_no, structs_visited, ns);
+                structs_visited.pop();
+            }
+        }
+    }
+}
+
 pub fn resolve_fields(delay: ResolveFields, file_no: usize, ns: &mut Namespace) {
     // now we can resolve the fields for the structs
-    for (pos, def, contract) in delay.structs {
-        if let Some((tags, fields)) = struct_decl(def, file_no, contract, ns) {
-            ns.structs[pos].tags = tags;
-            ns.structs[pos].fields = fields;
-        }
+    for resolve in delay.structs {
+        let (tags, fields) =
+            struct_decl(resolve.pt, file_no, &resolve.comments, resolve.contract, ns);
+
+        ns.structs[resolve.struct_no].tags = tags;
+        ns.structs[resolve.struct_no].fields = fields;
     }
 
     // struct can contain other structs, and we have to check for recursiveness,
     // i.e. "struct a { b f1; } struct b { a f1; }"
-    for struct_no in 0..ns.structs.len() {
-        fn check(struct_no: usize, structs_visited: &mut Vec<usize>, ns: &mut Namespace) {
-            let def = ns.structs[struct_no].clone();
-            let mut types_seen = Vec::new();
+    (0..ns.structs.len())
+        .for_each(|struct_no| find_struct_recursion(struct_no, &mut vec![struct_no], ns));
 
-            for field in &def.fields {
-                if let Type::Struct(struct_no) = field.ty {
-                    if types_seen.contains(&struct_no) {
-                        continue;
-                    }
-
-                    types_seen.push(struct_no);
-
-                    if structs_visited.contains(&struct_no) {
-                        ns.diagnostics.push(Diagnostic::error_with_note(
-                            def.loc,
-                            format!("struct ‘{}’ has infinite size", def.name),
-                            field.loc,
-                            format!("recursive field ‘{}’", field.name_as_str()),
-                        ));
-                    } else {
-                        structs_visited.push(struct_no);
-                        check(struct_no, structs_visited, ns);
-                        let _ = structs_visited.pop();
-                    }
-                }
-            }
-        }
-
-        check(struct_no, &mut vec![struct_no], ns);
-    }
-
-    // Do not attempt to call struct offsets if there are any infinitely recursive structs
-    if !any_errors(&ns.diagnostics) {
-        struct_offsets(ns);
-    }
+    // Calculate the offset of each field in all the struct types
+    struct_offsets(ns);
 
     // now we can resolve the fields for the events
-    for (pos, def, contract) in delay.events {
-        if let Some((tags, fields)) = event_decl(def, file_no, contract, ns) {
-            ns.events[pos].signature = ns.signature(&ns.events[pos].name, &fields);
-            ns.events[pos].fields = fields;
-            ns.events[pos].tags = tags;
-        }
+    for event in delay.events {
+        let (tags, fields) = event_decl(event.pt, file_no, &event.comments, event.contract, ns);
+
+        ns.events[event.event_no].signature =
+            ns.signature(&ns.events[event.event_no].name, &fields);
+        ns.events[event.event_no].fields = fields;
+        ns.events[event.event_no].tags = tags;
     }
 }
 
 /// Resolve all the types in a contract
 fn resolve_contract<'a>(
     def: &'a pt::ContractDefinition,
+    comments: &[pt::Comment],
+    contract_tags: &[DocComment],
     file_no: usize,
     delay: &mut ResolveFields<'a>,
     ns: &mut Namespace,
@@ -169,7 +284,7 @@ fn resolve_contract<'a>(
     let doc = resolve_tags(
         def.name.loc.file_no(),
         "contract",
-        &def.doc,
+        contract_tags,
         None,
         None,
         None,
@@ -190,58 +305,70 @@ fn resolve_contract<'a>(
         ns.diagnostics.push(Diagnostic::error(
             def.name.loc,
             format!(
-                "contract name ‘{}’ is reserved file name on Windows",
+                "contract name '{}' is reserved file name on Windows",
                 def.name.name
             ),
         ));
     }
 
+    let mut doc_comment_start = def.loc.start();
+
     for parts in &def.parts {
         match parts {
             pt::ContractPart::EnumDefinition(ref e) => {
-                if !enum_decl(e, file_no, Some(contract_no), ns) {
+                let tags = parse_doccomments(comments, doc_comment_start, e.loc.start());
+
+                if !enum_decl(e, file_no, &tags, Some(contract_no), ns) {
                     broken = true;
                 }
             }
-            pt::ContractPart::StructDefinition(ref s) => {
-                let pos = ns.structs.len();
+            pt::ContractPart::StructDefinition(ref pt) => {
+                let struct_no = ns.structs.len();
+
+                let tags = parse_doccomments(comments, doc_comment_start, pt.loc.start());
 
                 if ns.add_symbol(
                     file_no,
                     Some(contract_no),
-                    &s.name,
-                    Symbol::Struct(s.name.loc, pos),
+                    &pt.name,
+                    Symbol::Struct(pt.name.loc, StructType::UserDefined(struct_no)),
                 ) {
                     ns.structs.push(StructDecl {
                         tags: Vec::new(),
-                        name: s.name.name.to_owned(),
-                        builtin: BuiltinStruct::None,
-                        loc: s.name.loc,
+                        name: pt.name.name.to_owned(),
+                        loc: pt.name.loc,
                         contract: Some(def.name.name.to_owned()),
                         fields: Vec::new(),
                         offsets: Vec::new(),
                         storage_offsets: Vec::new(),
                     });
 
-                    delay.structs.push((pos, s, Some(contract_no)));
+                    delay.structs.push(ResolveStructFields {
+                        struct_no,
+                        pt,
+                        comments: tags,
+                        contract: Some(contract_no),
+                    });
                 } else {
                     broken = true;
                 }
             }
-            pt::ContractPart::EventDefinition(ref s) => {
-                let pos = ns.events.len();
+            pt::ContractPart::EventDefinition(ref pt) => {
+                let tags = parse_doccomments(comments, doc_comment_start, pt.loc.start());
+
+                let event_no = ns.events.len();
 
                 if let Some(Symbol::Event(events)) = ns.variable_symbols.get_mut(&(
                     file_no,
                     Some(contract_no),
-                    s.name.name.to_owned(),
+                    pt.name.name.to_owned(),
                 )) {
-                    events.push((s.name.loc, pos));
+                    events.push((pt.name.loc, event_no));
                 } else if !ns.add_symbol(
                     file_no,
                     Some(contract_no),
-                    &s.name,
-                    Symbol::Event(vec![(s.name.loc, pos)]),
+                    &pt.name,
+                    Symbol::Event(vec![(pt.name.loc, event_no)]),
                 ) {
                     broken = true;
                     continue;
@@ -249,19 +376,37 @@ fn resolve_contract<'a>(
 
                 ns.events.push(EventDecl {
                     tags: Vec::new(),
-                    name: s.name.name.to_owned(),
-                    loc: s.name.loc,
+                    name: pt.name.name.to_owned(),
+                    loc: pt.name.loc,
                     contract: Some(contract_no),
                     fields: Vec::new(),
-                    anonymous: s.anonymous,
+                    anonymous: pt.anonymous,
                     signature: String::new(),
                     used: false,
                 });
 
-                delay.events.push((pos, s, Some(contract_no)));
+                delay.events.push(ResolveEventFields {
+                    event_no,
+                    pt,
+                    comments: tags,
+                    contract: Some(contract_no),
+                });
+            }
+            pt::ContractPart::TypeDefinition(ty) => {
+                let tags = parse_doccomments(comments, doc_comment_start, ty.loc.start());
+
+                type_decl(ty, file_no, &tags, Some(contract_no), ns);
+            }
+            pt::ContractPart::FunctionDefinition(f) => {
+                if let Some(pt::Statement::Block { loc, .. }) = &f.body {
+                    doc_comment_start = loc.end();
+                    continue;
+                }
             }
             _ => (),
         }
+
+        doc_comment_start = parts.loc().end();
     }
 
     broken
@@ -274,41 +419,39 @@ fn resolve_contract<'a>(
 pub fn struct_decl(
     def: &pt::StructDefinition,
     file_no: usize,
+    tags: &[DocComment],
     contract_no: Option<usize>,
     ns: &mut Namespace,
-) -> Option<(Vec<Tag>, Vec<Parameter>)> {
-    let mut valid = true;
+) -> (Vec<Tag>, Vec<Parameter>) {
     let mut fields: Vec<Parameter> = Vec::new();
 
     for field in &def.fields {
-        let mut diagnostics = Vec::new();
+        let mut diagnostics = Diagnostics::default();
 
         let ty = match ns.resolve_type(file_no, contract_no, false, &field.ty, &mut diagnostics) {
             Ok(s) => s,
             Err(()) => {
                 ns.diagnostics.extend(diagnostics);
-                valid = false;
-                continue;
+                Type::Unresolved
             }
         };
 
         if let Some(other) = fields
             .iter()
-            .find(|f| f.name.as_ref().map(|id| id.name.as_str()) == Some(field.name.name.as_str()))
+            .find(|f| f.id.as_ref().map(|id| id.name.as_str()) == Some(field.name.name.as_str()))
         {
             ns.diagnostics.push(Diagnostic::error_with_note(
                 field.name.loc,
                 format!(
-                    "struct ‘{}’ has duplicate struct field ‘{}’",
+                    "struct '{}' has duplicate struct field '{}'",
                     def.name.name, field.name.name
                 ),
                 other.loc,
                 format!(
-                    "location of previous declaration of ‘{}’",
+                    "location of previous declaration of '{}'",
                     other.name_as_str()
                 ),
             ));
-            valid = false;
             continue;
         }
 
@@ -318,54 +461,46 @@ pub fn struct_decl(
         // allowed as parameter/return types of public functions though.
         if let Some(storage) = &field.storage {
             ns.diagnostics.push(Diagnostic::error(
-                *storage.loc(),
+                storage.loc(),
                 format!(
-                    "storage location ‘{}’ not allowed for struct field",
+                    "storage location '{}' not allowed for struct field",
                     storage
                 ),
             ));
-            valid = false;
         }
 
         fields.push(Parameter {
             loc: field.loc,
-            name: Some(pt::Identifier {
+            id: Some(pt::Identifier {
                 name: field.name.name.to_string(),
                 loc: field.name.loc,
             }),
             ty,
-            ty_loc: field.ty.loc(),
+            ty_loc: Some(field.ty.loc()),
             indexed: false,
             readonly: false,
+            recursive: false,
         });
     }
 
     if fields.is_empty() {
-        if valid {
-            ns.diagnostics.push(Diagnostic::error(
-                def.name.loc,
-                format!("struct definition for ‘{}’ has no fields", def.name.name),
-            ));
-        }
-
-        valid = false;
+        ns.diagnostics.push(Diagnostic::error(
+            def.name.loc,
+            format!("struct definition for '{}' has no fields", def.name.name),
+        ));
     }
 
-    if valid {
-        let doc = resolve_tags(
-            def.name.loc.file_no(),
-            "struct",
-            &def.doc,
-            Some(&fields),
-            None,
-            None,
-            ns,
-        );
+    let doc = resolve_tags(
+        def.name.loc.file_no(),
+        "struct",
+        tags,
+        Some(&fields),
+        None,
+        None,
+        ns,
+    );
 
-        Some((doc, fields))
-    } else {
-        None
-    }
+    (doc, fields)
 }
 
 /// Resolve a parsed event definition. The return value will be true if the entire
@@ -375,22 +510,22 @@ pub fn struct_decl(
 fn event_decl(
     def: &pt::EventDefinition,
     file_no: usize,
+    tags: &[DocComment],
     contract_no: Option<usize>,
     ns: &mut Namespace,
-) -> Option<(Vec<Tag>, Vec<Parameter>)> {
-    let mut valid = true;
+) -> (Vec<Tag>, Vec<Parameter>) {
     let mut fields: Vec<Parameter> = Vec::new();
     let mut indexed_fields = 0;
 
     for field in &def.fields {
-        let mut diagnostics = Vec::new();
+        let mut diagnostics = Diagnostics::default();
 
-        let ty = match ns.resolve_type(file_no, contract_no, false, &field.ty, &mut diagnostics) {
+        let mut ty = match ns.resolve_type(file_no, contract_no, false, &field.ty, &mut diagnostics)
+        {
             Ok(s) => s,
             Err(()) => {
                 ns.diagnostics.extend(diagnostics);
-                valid = false;
-                continue;
+                Type::Unresolved
             }
         };
 
@@ -399,27 +534,26 @@ fn event_decl(
                 field.loc,
                 "mapping type is not permitted as event field".to_string(),
             ));
-            valid = false;
+            ty = Type::Unresolved;
         }
 
         let name = if let Some(name) = &field.name {
             if let Some(other) = fields
                 .iter()
-                .find(|f| f.name.as_ref().map(|id| id.name.as_str()) == Some(name.name.as_str()))
+                .find(|f| f.id.as_ref().map(|id| id.name.as_str()) == Some(name.name.as_str()))
             {
                 ns.diagnostics.push(Diagnostic::error_with_note(
                     name.loc,
                     format!(
-                        "event ‘{}’ has duplicate field name ‘{}’",
+                        "event '{}' has duplicate field name '{}'",
                         def.name.name, name.name
                     ),
                     other.loc,
                     format!(
-                        "location of previous declaration of ‘{}’",
+                        "location of previous declaration of '{}'",
                         other.name_as_str()
                     ),
                 ));
-                valid = false;
                 continue;
             }
             Some(pt::Identifier {
@@ -436,11 +570,12 @@ fn event_decl(
 
         fields.push(Parameter {
             loc: field.loc,
-            name,
+            id: name,
             ty,
-            ty_loc: field.ty.loc(),
+            ty_loc: Some(field.ty.loc()),
             indexed: field.indexed,
             readonly: false,
+            recursive: false,
         });
     }
 
@@ -448,39 +583,31 @@ fn event_decl(
         ns.diagnostics.push(Diagnostic::error(
             def.name.loc,
             format!(
-                "anonymous event definition for ‘{}’ has {} indexed fields where 4 permitted",
+                "anonymous event definition for '{}' has {} indexed fields where 4 permitted",
                 def.name.name, indexed_fields
             ),
         ));
-
-        valid = false;
     } else if !def.anonymous && indexed_fields > 3 {
         ns.diagnostics.push(Diagnostic::error(
             def.name.loc,
             format!(
-                "event definition for ‘{}’ has {} indexed fields where 3 permitted",
+                "event definition for '{}' has {} indexed fields where 3 permitted",
                 def.name.name, indexed_fields
             ),
         ));
-
-        valid = false;
     }
 
-    if valid {
-        let doc = resolve_tags(
-            def.name.loc.file_no(),
-            "event",
-            &def.doc,
-            Some(&fields),
-            None,
-            None,
-            ns,
-        );
+    let doc = resolve_tags(
+        def.name.loc.file_no(),
+        "event",
+        tags,
+        Some(&fields),
+        None,
+        None,
+        ns,
+    );
 
-        Some((doc, fields))
-    } else {
-        None
-    }
+    (doc, fields)
 }
 
 /// Parse enum declaration. If the declaration is invalid, it is still generated
@@ -488,6 +615,7 @@ fn event_decl(
 fn enum_decl(
     enum_: &pt::EnumDefinition,
     file_no: usize,
+    tags: &[DocComment],
     contract_no: Option<usize>,
     ns: &mut Namespace,
 ) -> bool {
@@ -496,14 +624,14 @@ fn enum_decl(
     if enum_.values.is_empty() {
         ns.diagnostics.push(Diagnostic::error(
             enum_.name.loc,
-            format!("enum ‘{}’ has no fields", enum_.name.name),
+            format!("enum '{}' has no fields", enum_.name.name),
         ));
         valid = false;
     } else if enum_.values.len() > 256 {
         ns.diagnostics.push(Diagnostic::error(
             enum_.name.loc,
             format!(
-                "enum ‘{}’ has {} fields, which is more than the 256 limit",
+                "enum '{}' has {} fields, which is more than the 256 limit",
                 enum_.name.name,
                 enum_.values.len()
             ),
@@ -529,15 +657,7 @@ fn enum_decl(
         entries.insert(e.name.to_string(), (e.loc, i));
     }
 
-    let tags = resolve_tags(
-        enum_.name.loc.file_no(),
-        "enum",
-        &enum_.doc,
-        None,
-        None,
-        None,
-        ns,
-    );
+    let tags = resolve_tags(enum_.name.loc.file_no(), "enum", tags, None, None, None, ns);
 
     let decl = EnumDecl {
         tags,
@@ -592,7 +712,9 @@ fn struct_offsets(ns: &mut Namespace) {
 
                 offsets.push(offset.clone());
 
-                offset += field.ty.size_of(ns);
+                if !field.recursive {
+                    offset += field.ty.solana_storage_size(ns);
+                }
             }
 
             // add entry for overall size
@@ -616,17 +738,19 @@ fn struct_offsets(ns: &mut Namespace) {
             let mut largest_alignment = BigInt::zero();
 
             for field in &ns.structs[struct_no].fields {
-                let alignment = field.ty.storage_align(ns);
-                largest_alignment = std::cmp::max(alignment.clone(), largest_alignment.clone());
-                let remainder = offset.clone() % alignment.clone();
+                if !field.recursive {
+                    let alignment = field.ty.storage_align(ns);
+                    largest_alignment = std::cmp::max(alignment.clone(), largest_alignment.clone());
+                    let remainder = offset.clone() % alignment.clone();
 
-                if remainder > BigInt::zero() {
-                    offset += alignment - remainder;
+                    if remainder > BigInt::zero() {
+                        offset += alignment - remainder;
+                    }
+
+                    storage_offsets.push(offset.clone());
+
+                    offset += field.ty.storage_slots(ns);
                 }
-
-                storage_offsets.push(offset.clone());
-
-                offset += field.ty.storage_slots(ns);
             }
 
             // add entry for overall size
@@ -666,14 +790,14 @@ impl Type {
             Type::String => "string".to_string(),
             Type::DynamicBytes => "bytes".to_string(),
             Type::Enum(n) => format!("enum {}", ns.enums[*n]),
-            Type::Struct(n) => format!("struct {}", ns.structs[*n]),
+            Type::Struct(str_ty) => format!("struct {}", str_ty.definition(ns)),
             Type::Array(ty, len) => format!(
                 "{}{}",
                 ty.to_string(ns),
                 len.iter()
-                    .map(|l| match l {
-                        None => "[]".to_string(),
-                        Some(l) => format!("[{}]", l),
+                    .map(|len| match len {
+                        ArrayLength::Fixed(len) => format!("[{}]", len),
+                        _ => "[]".to_string(),
                     })
                     .collect::<String>()
             ),
@@ -703,28 +827,33 @@ impl Type {
                 );
 
                 if !mutability.is_default() {
-                    s.push_str(&format!(" {}", mutability));
+                    write!(s, " {}", mutability).unwrap();
                 }
 
                 if !returns.is_empty() {
-                    s.push_str(&format!(
+                    write!(
+                        s,
                         " returns ({})",
                         returns
                             .iter()
                             .map(|ty| ty.to_string(ns))
                             .collect::<Vec<String>>()
                             .join(",")
-                    ));
+                    )
+                    .unwrap();
                 }
 
                 s
             }
             Type::Contract(n) => format!("contract {}", ns.contracts[*n].name),
+            Type::UserType(n) => format!("usertype {}", ns.user_types[*n]),
             Type::Ref(r) => r.to_string(ns),
             Type::StorageRef(_, ty) => format!("{} storage", ty.to_string(ns)),
             Type::Void => "void".to_owned(),
             Type::Unreachable => "unreachable".to_owned(),
-            Type::Slice => "slice".to_owned(),
+            Type::Slice(ty) => format!("{} slice", ty.to_string(ns)),
+            Type::Unresolved => "unresolved".to_owned(),
+            Type::BufferPointer => "buffer_pointer".to_owned(),
         }
     }
 
@@ -763,19 +892,20 @@ impl Type {
                 "{}{}",
                 ty.to_signature_string(say_tuple, ns),
                 len.iter()
-                    .map(|l| match l {
-                        None => "[]".to_string(),
-                        Some(l) => format!("[{}]", l),
+                    .map(|len| match len {
+                        ArrayLength::Fixed(len) => format!("[{}]", len),
+                        _ => "[]".to_string(),
                     })
                     .collect::<String>()
             ),
             Type::Ref(r) => r.to_string(ns),
             Type::StorageRef(_, r) => r.to_string(ns),
             Type::Struct(_) if say_tuple => "tuple".to_string(),
-            Type::Struct(struct_no) => {
+            Type::Struct(struct_type) => {
                 format!(
                     "({})",
-                    ns.structs[*struct_no]
+                    struct_type
+                        .definition(ns)
                         .fields
                         .iter()
                         .map(|f| f.ty.to_signature_string(say_tuple, ns))
@@ -784,6 +914,10 @@ impl Type {
                 )
             }
             Type::InternalFunction { .. } | Type::ExternalFunction { .. } => "function".to_owned(),
+            Type::UserType(n) => ns.user_types[*n].ty.to_signature_string(say_tuple, ns),
+            // TODO: should an unresolved type not match another unresolved type?
+            Type::Unresolved => "unresolved".to_owned(),
+            Type::Slice(ty) => format!("{} slice", ty.to_string(ns)),
             _ => unreachable!(),
         }
     }
@@ -794,12 +928,47 @@ impl Type {
         match self {
             Type::String | Type::DynamicBytes => Type::Ref(Box::new(Type::Uint(8))),
             Type::Ref(t) => t.array_deref(),
-            Type::Array(ty, dim) if dim.len() > 1 => {
-                Type::Array(ty.clone(), dim[..dim.len() - 1].to_vec())
-            }
+            Type::Array(ty, dim) if dim.len() > 1 => Type::Ref(Box::new(Type::Array(
+                ty.clone(),
+                dim[..dim.len() - 1].to_vec(),
+            ))),
             Type::Array(ty, dim) if dim.len() == 1 => Type::Ref(ty.clone()),
             Type::Bytes(_) => Type::Bytes(1),
             _ => panic!("deref on non-array"),
+        }
+    }
+
+    /// Fetch the type of an array element
+    pub fn elem_ty(&self) -> Self {
+        match self {
+            Type::Array(ty, _) => *ty.clone(),
+            _ => unreachable!("Type is not an array"),
+        }
+    }
+
+    /// Is this a reference type of fixed size
+    pub fn is_fixed_reference_type(&self) -> bool {
+        match self {
+            Type::Bool => false,
+            Type::Address(_) => false,
+            Type::Int(_) => false,
+            Type::Uint(_) => false,
+            Type::Rational => false,
+            Type::Bytes(_) => false,
+            Type::Enum(_) => false,
+            Type::Struct(_) => true,
+            Type::Array(_, dims) => matches!(dims.last(), Some(ArrayLength::Fixed(_))),
+            Type::DynamicBytes => false,
+            Type::String => false,
+            Type::Mapping(..) => false,
+            Type::Contract(_) => false,
+            Type::Ref(_) => false,
+            Type::StorageRef(..) => false,
+            Type::InternalFunction { .. } => false,
+            Type::ExternalFunction { .. } => false,
+            Type::Slice(_) => false,
+            Type::Unresolved => false,
+            _ => unreachable!("{:?}", self),
         }
     }
 
@@ -811,6 +980,7 @@ impl Type {
                 Type::Array(ty.clone(), dim[..dim.len() - 1].to_vec())
             }
             Type::Array(ty, dim) if dim.len() == 1 => *ty.clone(),
+            Type::DynamicBytes => Type::Bytes(1),
             _ => panic!("not an array"),
         }
     }
@@ -821,7 +991,7 @@ impl Type {
     pub fn storage_array_elem(&self) -> Self {
         match self {
             Type::Mapping(_, v) => Type::StorageRef(false, v.clone()),
-            Type::DynamicBytes => Type::Bytes(1),
+            Type::DynamicBytes | Type::String => Type::Bytes(1),
             Type::Array(ty, dim) if dim.len() > 1 => Type::StorageRef(
                 false,
                 Box::new(Type::Array(ty.clone(), dim[..dim.len() - 1].to_vec())),
@@ -838,15 +1008,13 @@ impl Type {
         match self {
             Type::StorageRef(_, ty) => ty.array_length(),
             Type::Ref(ty) => ty.array_length(),
-            Type::Array(_, dim) => dim.last().unwrap().as_ref(),
+            Type::Array(_, dim) => dim.last().unwrap().array_length(),
             _ => panic!("array_length on non-array"),
         }
     }
 
-    /// Calculate how much memory we expect this type to use when allocated on the
-    /// stack or on the heap. Depending on the llvm implementation there might be
-    /// padding between elements which is not accounted for.
-    pub fn size_of(&self, ns: &Namespace) -> BigInt {
+    /// Returns the size a type occupies in memory
+    pub fn memory_size_of(&self, ns: &Namespace) -> BigInt {
         match self {
             Type::Enum(_) => BigInt::one(),
             Type::Bool => BigInt::one(),
@@ -856,36 +1024,72 @@ impl Type {
             Type::Uint(n) | Type::Int(n) => BigInt::from(n / 8),
             Type::Rational => unreachable!(),
             Type::Array(ty, dims) => {
-                let pointer_size = BigInt::from(4);
-                ty.size_of(ns).mul(
+                let pointer_size = BigInt::from(ns.target.ptr_size() / 8);
+                ty.memory_size_of(ns).mul(
                     dims.iter()
                         .map(|d| match d {
-                            None => &pointer_size,
-                            Some(d) => d,
+                            ArrayLength::Dynamic => &pointer_size,
+                            ArrayLength::Fixed(n) => n,
+                            ArrayLength::AnyFixed => unreachable!(),
                         })
                         .product::<BigInt>(),
                 )
             }
-            Type::Struct(n) => ns.structs[*n]
+            Type::Struct(str_ty) => str_ty
+                .definition(ns)
+                .fields
+                .iter()
+                .map(|d| d.ty.memory_size_of(ns))
+                .sum::<BigInt>(),
+            Type::String
+            | Type::DynamicBytes
+            | Type::InternalFunction { .. }
+            | Type::Ref(_)
+            | Type::StorageRef(..) => BigInt::from(ns.target.ptr_size() / 8),
+            Type::ExternalFunction { .. } => {
+                // Address and selector
+                Type::Address(false).memory_size_of(ns) + Type::Uint(32).memory_size_of(ns)
+            }
+            Type::Unresolved | Type::Mapping(..) => BigInt::zero(),
+            Type::UserType(no) => ns.user_types[*no].ty.memory_size_of(ns),
+            _ => unimplemented!("sizeof on {:?}", self),
+        }
+    }
+
+    /// Calculate how much memory this type occupies in Solana's storage.
+    /// Depending on the llvm implementation there might be padding between elements
+    /// which is not accounted for.
+    pub fn solana_storage_size(&self, ns: &Namespace) -> BigInt {
+        match self {
+            Type::Array(ty, dims) => {
+                let pointer_size = BigInt::from(4);
+                ty.solana_storage_size(ns).mul(
+                    dims.iter()
+                        .map(|d| match d {
+                            ArrayLength::Dynamic => &pointer_size,
+                            ArrayLength::Fixed(d) => d,
+                            ArrayLength::AnyFixed => panic!("unknown length"),
+                        })
+                        .product::<BigInt>(),
+                )
+            }
+            Type::Struct(str_ty) => str_ty
+                .definition(ns)
                 .offsets
                 .last()
                 .cloned()
                 .unwrap_or_else(BigInt::zero),
             Type::String | Type::DynamicBytes => BigInt::from(4),
-            Type::InternalFunction { .. } => BigInt::from(ns.target.ptr_size()),
-            Type::ExternalFunction { .. } => {
-                // Address and selector
-                Type::Address(false).size_of(ns) + Type::Uint(32).size_of(ns)
-            }
-            Type::Mapping(..) => BigInt::zero(),
-            Type::Ref(ty) | Type::StorageRef(_, ty) => ty.size_of(ns),
-            _ => unimplemented!("sizeof on {:?}", self),
+            Type::Ref(ty) | Type::StorageRef(_, ty) => ty.solana_storage_size(ns),
+            Type::UserType(no) => ns.user_types[*no].ty.solana_storage_size(ns),
+            // Other types have the same size both in storage and in memory
+            _ => self.memory_size_of(ns),
         }
     }
 
     /// Does this type fit into memory
     pub fn fits_in_memory(&self, ns: &Namespace) -> bool {
-        self.size_of(ns) < BigInt::from(u16::MAX)
+        self.memory_size_of(ns) < BigInt::from(u16::MAX)
     }
 
     /// Calculate the alignment
@@ -895,10 +1099,11 @@ impl Type {
             Type::Uint(n) | Type::Int(n) if *n <= 16 => 2,
             Type::Uint(n) | Type::Int(n) if *n <= 32 => 4,
             Type::Uint(_) | Type::Int(_) => 8,
-            Type::Struct(n) => ns.structs[*n]
+            Type::Struct(str_ty) => str_ty
+                .definition(ns)
                 .fields
                 .iter()
-                .map(|f| f.ty.align_of(ns))
+                .map(|f| if f.recursive { 1 } else { f.ty.align_of(ns) })
                 .max()
                 .unwrap(),
             Type::InternalFunction { .. } => ns.target.ptr_size().into(),
@@ -917,6 +1122,7 @@ impl Type {
             Type::Enum(n) => ns.enums[*n].ty.bits(ns),
             Type::Value => ns.value_length as u16 * 8,
             Type::StorageRef(..) => ns.storage_type().bits(ns),
+            Type::Ref(ty) => ty.bits(ns),
             _ => panic!("type not allowed"),
         }
     }
@@ -935,6 +1141,7 @@ impl Type {
             Type::Int(_) => true,
             Type::Uint(_) => true,
             Type::Value => true,
+            Type::Bytes(1) => true,
             Type::Ref(r) => r.is_integer(),
             Type::StorageRef(_, r) => r.is_integer(),
             _ => false,
@@ -965,7 +1172,9 @@ impl Type {
                 Type::Value => BigInt::from(ns.value_length),
                 Type::Uint(n) | Type::Int(n) => BigInt::from(n / 8),
                 Type::Rational => unreachable!(),
-                Type::Array(_, dims) if dims[0].is_none() => BigInt::from(4),
+                Type::Array(_, dims) if dims.last() == Some(&ArrayLength::Dynamic) => {
+                    BigInt::from(4)
+                }
                 Type::Array(ty, dims) => {
                     let pointer_size = BigInt::from(4);
                     if self.is_sparse_solana(ns) {
@@ -974,14 +1183,18 @@ impl Type {
                         ty.storage_slots(ns).mul(
                             dims.iter()
                                 .map(|d| match d {
-                                    None => &pointer_size,
-                                    Some(d) => d,
+                                    ArrayLength::Dynamic => &pointer_size,
+                                    ArrayLength::Fixed(d) => d,
+                                    ArrayLength::AnyFixed => {
+                                        panic!("unknown length");
+                                    }
                                 })
                                 .product::<BigInt>(),
                         )
                     }
                 }
-                Type::Struct(n) => ns.structs[*n]
+                Type::Struct(str_ty) => str_ty
+                    .definition(ns)
                     .storage_offsets
                     .last()
                     .cloned()
@@ -994,15 +1207,23 @@ impl Type {
                 }
                 Type::Mapping(..) => BigInt::from(SOLANA_BUCKET_SIZE) * BigInt::from(4),
                 Type::Ref(ty) | Type::StorageRef(_, ty) => ty.storage_slots(ns),
+                Type::Unresolved => BigInt::one(),
                 _ => unimplemented!(),
             }
         } else {
             match self {
                 Type::StorageRef(_, r) | Type::Ref(r) => r.storage_slots(ns),
-                Type::Struct(n) => ns.structs[*n]
+                Type::Struct(str_ty) => str_ty
+                    .definition(ns)
                     .fields
                     .iter()
-                    .map(|f| f.ty.storage_slots(ns))
+                    .map(|f| {
+                        if f.recursive {
+                            BigInt::one()
+                        } else {
+                            f.ty.storage_slots(ns)
+                        }
+                    })
                     .sum(),
                 Type::Array(ty, dims) => {
                     let one = BigInt::one();
@@ -1010,9 +1231,12 @@ impl Type {
                     ty.storage_slots(ns)
                         * dims
                             .iter()
-                            .map(|l| match l {
-                                None => &one,
-                                Some(l) => l,
+                            .map(|len| match len {
+                                ArrayLength::Dynamic => &one,
+                                ArrayLength::Fixed(len) => len,
+                                ArrayLength::AnyFixed => {
+                                    unreachable!("unknown length")
+                                }
                             })
                             .product::<BigInt>()
                 }
@@ -1032,7 +1256,9 @@ impl Type {
                 Type::Value => BigInt::from(ns.value_length),
                 Type::Uint(n) | Type::Int(n) => BigInt::from(n / 8),
                 Type::Rational => unreachable!(),
-                Type::Array(_, dims) if dims[0].is_none() => BigInt::from(4),
+                Type::Array(_, dims) if dims.last() == Some(&ArrayLength::Dynamic) => {
+                    BigInt::from(4)
+                }
                 Type::Array(ty, _) => {
                     if self.is_sparse_solana(ns) {
                         BigInt::from(4)
@@ -1040,10 +1266,17 @@ impl Type {
                         ty.storage_align(ns)
                     }
                 }
-                Type::Struct(n) => ns.structs[*n]
+                Type::Struct(str_ty) => str_ty
+                    .definition(ns)
                     .fields
                     .iter()
-                    .map(|field| field.ty.storage_align(ns))
+                    .map(|field| {
+                        if field.recursive {
+                            BigInt::one()
+                        } else {
+                            field.ty.storage_align(ns)
+                        }
+                    })
                     .max()
                     .unwrap(),
                 Type::String | Type::DynamicBytes => BigInt::from(4),
@@ -1051,6 +1284,7 @@ impl Type {
                 Type::ExternalFunction { .. } => BigInt::from(ns.address_length),
                 Type::Mapping(..) => BigInt::from(4),
                 Type::Ref(ty) | Type::StorageRef(_, ty) => ty.storage_align(ns),
+                Type::Unresolved => BigInt::one(),
                 _ => unimplemented!(),
             };
 
@@ -1084,7 +1318,8 @@ impl Type {
             Type::StorageRef(_, r) => r.is_reference_type(ns),
             Type::InternalFunction { .. } => false,
             Type::ExternalFunction { .. } => false,
-            _ => unreachable!(),
+            Type::UserType(no) => ns.user_types[*no].ty.is_reference_type(ns),
+            _ => false,
         }
     }
 
@@ -1094,13 +1329,17 @@ impl Type {
             Type::String | Type::DynamicBytes => true,
             Type::Ref(r) => r.is_dynamic(ns),
             Type::Array(ty, dim) => {
-                if dim.iter().any(|d| d.is_none()) {
+                if dim.iter().any(|d| d == &ArrayLength::Dynamic) {
                     return true;
                 }
 
                 ty.is_dynamic(ns)
             }
-            Type::Struct(n) => ns.structs[*n].fields.iter().any(|f| f.ty.is_dynamic(ns)),
+            Type::Struct(str_ty) => str_ty
+                .definition(ns)
+                .fields
+                .iter()
+                .any(|f| f.ty.is_dynamic(ns)),
             Type::StorageRef(_, r) => r.is_dynamic(ns),
             _ => false,
         }
@@ -1125,11 +1364,11 @@ impl Type {
         matches!(self, Type::StorageRef(..))
     }
 
-    /// Is this a reference to contract storage?
+    /// Is this a reference to dynamic memory (arrays, strings)
     pub fn is_dynamic_memory(&self) -> bool {
         match self {
-            Type::DynamicBytes => true,
-            Type::Array(_, dim) if dim.len() == 1 && dim[0].is_none() => true,
+            Type::String | Type::DynamicBytes | Type::Slice(_) => true,
+            Type::Array(_, dim) if dim.last() == Some(&ArrayLength::Dynamic) => true,
             Type::Ref(ty) => ty.is_dynamic_memory(),
             _ => false,
         }
@@ -1165,10 +1404,11 @@ impl Type {
         match self {
             Type::Mapping(..) => true,
             Type::Array(ty, _) => ty.contains_mapping(ns),
-            Type::Struct(n) => ns.structs[*n]
+            Type::Struct(str_ty) => str_ty
+                .definition(ns)
                 .fields
                 .iter()
-                .any(|f| f.ty.contains_mapping(ns)),
+                .any(|f| !f.recursive && f.ty.contains_mapping(ns)),
             Type::StorageRef(_, r) | Type::Ref(r) => r.contains_mapping(ns),
             _ => false,
         }
@@ -1179,21 +1419,28 @@ impl Type {
         match self {
             Type::InternalFunction { .. } => true,
             Type::Array(ty, _) => ty.contains_internal_function(ns),
-            Type::Struct(n) => ns.structs[*n]
+            Type::Struct(str_ty) => str_ty
+                .definition(ns)
                 .fields
                 .iter()
-                .any(|f| f.ty.contains_internal_function(ns)),
+                .any(|f| !f.recursive && f.ty.contains_internal_function(ns)),
             Type::StorageRef(_, r) | Type::Ref(r) => r.contains_internal_function(ns),
             _ => false,
         }
     }
 
     /// Is this structure a builtin
-    pub fn builtin_struct(&self, ns: &Namespace) -> BuiltinStruct {
+    pub fn is_builtin_struct(&self) -> Option<StructType> {
         match self {
-            Type::Struct(n) => ns.structs[*n].builtin,
-            Type::StorageRef(_, r) | Type::Ref(r) => r.builtin_struct(ns),
-            _ => BuiltinStruct::None,
+            Type::Struct(str_ty) => {
+                if matches!(str_ty, StructType::UserDefined(_)) {
+                    None
+                } else {
+                    Some(*str_ty)
+                }
+            }
+            Type::StorageRef(_, r) | Type::Ref(r) => r.is_builtin_struct(),
+            _ => None,
         }
     }
 
@@ -1201,18 +1448,21 @@ impl Type {
     pub fn contains_builtins<'a>(
         &'a self,
         ns: &'a Namespace,
-        builtin: BuiltinStruct,
+        builtin: &StructType,
     ) -> Option<&'a Type> {
         match self {
             Type::Array(ty, _) => ty.contains_builtins(ns, builtin),
             Type::Mapping(key, value) => key
                 .contains_builtins(ns, builtin)
                 .or_else(|| value.contains_builtins(ns, builtin)),
-            Type::Struct(n) if ns.structs[*n].builtin == builtin => Some(self),
-            Type::Struct(n) => ns.structs[*n]
-                .fields
-                .iter()
-                .find_map(|f| f.ty.contains_builtins(ns, builtin)),
+            Type::Struct(str_ty) if str_ty == builtin => Some(self),
+            Type::Struct(str_ty) => str_ty.definition(ns).fields.iter().find_map(|f| {
+                if f.recursive {
+                    None
+                } else {
+                    f.ty.contains_builtins(ns, builtin)
+                }
+            }),
             Type::StorageRef(_, r) | Type::Ref(r) => r.contains_builtins(ns, builtin),
             _ => None,
         }
@@ -1256,14 +1506,14 @@ impl Type {
             Type::DynamicBytes => "bytes".to_string(),
             Type::String => "string".to_string(),
             Type::Enum(i) => format!("{}", ns.enums[*i]),
-            Type::Struct(i) => format!("{}", ns.structs[*i]),
+            Type::Struct(str_ty) => format!("{}", str_ty.definition(ns)),
             Type::Array(ty, len) => format!(
                 "{}{}",
                 ty.to_llvm_string(ns),
                 len.iter()
                     .map(|r| match r {
-                        None => ":".to_string(),
-                        Some(r) => format!(":{}", r),
+                        ArrayLength::Dynamic | ArrayLength::AnyFixed => ":".to_string(),
+                        ArrayLength::Fixed(r) => format!(":{}", r),
                     })
                     .collect::<String>()
             ),
@@ -1275,6 +1525,8 @@ impl Type {
             Type::ExternalFunction { .. } => "function".to_owned(),
             Type::Ref(r) => r.to_llvm_string(ns),
             Type::StorageRef(_, r) => r.to_llvm_string(ns),
+            Type::UserType(no) => ns.user_types[*no].ty.to_llvm_string(ns),
+            Type::Slice(ty) => format!("slice:{}", ty.to_llvm_string(ns)),
             _ => unreachable!(),
         }
     }
@@ -1283,14 +1535,14 @@ impl Type {
     pub fn is_sparse_solana(&self, ns: &Namespace) -> bool {
         match self.deref_any() {
             Type::Mapping(..) => true,
-            Type::Array(_, dims) if dims[0].is_none() => false,
+            Type::Array(_, dims) if dims.last() == Some(&ArrayLength::Dynamic) => false,
             Type::Array(ty, dims) => {
                 let pointer_size = BigInt::from(4);
                 let len = ty.storage_slots(ns).mul(
                     dims.iter()
                         .map(|d| match d {
-                            None => &pointer_size,
-                            Some(d) => d,
+                            ArrayLength::Fixed(d) => d,
+                            _ => &pointer_size,
                         })
                         .product::<BigInt>(),
                 );

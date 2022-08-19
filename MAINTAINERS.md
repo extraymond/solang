@@ -1,6 +1,8 @@
 ## Maintainers
 
 ### Active Maintainers
-| name | Github | RocketChat |
-| --- | --- | --- |
-| Sean Young | seanyoung | seanyoung |
+| name              | Github    | Discord        |
+|-------------------|-----------|----------------|
+| Sean Young        | [@seanyoung](https://github.com/seanyoung) | seanyoung#0481 |
+| Lucas Steuernagel | [@LucasSte](https://github.com/LucasSte)  | LucasSte#2331  |
+| Cyrill Leutwiler  | [@xermicus](https://github.com/xermicus)  | kägifret#8095  |

@@ -1,5 +1,15 @@
-use super::ast::*;
-use crate::parser::pt;
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::sema::{
+    ast::*,
+    symtable::Symtable,
+    yul::{
+        ast::{YulBlock, YulExpression, YulStatement},
+        builtin::YulBuiltInFunction,
+    },
+};
+use solang_parser::{pt, pt::Loc};
+use std::fmt::Write;
 
 struct Node {
     name: String,
@@ -33,25 +43,31 @@ impl Dot {
 
         for node in &self.nodes {
             if !node.labels.is_empty() {
-                result.push_str(&format!(
-                    "\t{} [label=\"{}\"]\n",
+                writeln!(
+                    result,
+                    "\t{} [label=\"{}\"]",
                     node.name,
                     node.labels.join("\\n")
-                ));
+                )
+                .unwrap();
             }
         }
 
         for edge in &self.edges {
             if let Some(label) = &edge.label {
-                result.push_str(&format!(
-                    "\t{} -> {} [label=\"{}\"]\n",
+                writeln!(
+                    result,
+                    "\t{} -> {} [label=\"{}\"]",
                     self.nodes[edge.from].name, self.nodes[edge.to].name, label
-                ));
+                )
+                .unwrap();
             } else {
-                result.push_str(&format!(
-                    "\t{} -> {}\n",
+                writeln!(
+                    result,
+                    "\t{} -> {}",
                     self.nodes[edge.from].name, self.nodes[edge.to].name
-                ));
+                )
+                .unwrap();
             }
         }
 
@@ -153,7 +169,7 @@ impl Dot {
         if !func.params.is_empty() {
             let mut labels = vec![String::from("parameters")];
 
-            for param in &func.params {
+            for param in &*func.params {
                 labels.push(format!(
                     "{} {}",
                     param.ty.to_string(ns),
@@ -172,7 +188,7 @@ impl Dot {
         if !func.returns.is_empty() {
             let mut labels = vec![String::from("returns")];
 
-            for param in &func.returns {
+            for param in &*func.returns {
                 labels.push(format!(
                     "{} {}",
                     param.ty.to_string(ns),
@@ -216,18 +232,6 @@ impl Dot {
         parent_rel: String,
     ) {
         match expr {
-            Expression::FunctionArg(loc, ty, arg_no) => {
-                let labels = vec![
-                    format!("func arg #{}: {}", arg_no, ty.to_string(ns)),
-                    ns.loc_to_string(loc),
-                ];
-
-                self.add_node(
-                    Node::new("func_arg", labels),
-                    Some(parent),
-                    Some(parent_rel),
-                );
-            }
             Expression::BoolLiteral(loc, val) => {
                 let labels = vec![
                     format!("bool literal: {}", if *val { "true" } else { "false" }),
@@ -501,30 +505,7 @@ impl Dot {
                 self.add_expression(right, func, ns, node, String::from("right"));
             }
             Expression::ConstantVariable(loc, ty, contract, var_no) => {
-                let mut labels = vec![
-                    String::from("constant variable"),
-                    ty.to_string(ns),
-                    ns.loc_to_string(loc),
-                ];
-
-                if let Some(contract) = contract {
-                    labels.insert(
-                        1,
-                        format!(
-                            "{}.{}",
-                            ns.contracts[*contract].name,
-                            ns.contracts[*contract].variables[*var_no].name
-                        ),
-                    );
-                } else {
-                    labels.insert(1, ns.constants[*var_no].name.to_string());
-                }
-
-                self.add_node(
-                    Node::new("constant", labels),
-                    Some(parent),
-                    Some(parent_rel),
-                );
+                self.add_constant_variable(loc, ty, contract, var_no, parent, parent_rel, ns);
             }
             Expression::Variable(loc, ty, var_no) => {
                 let labels = vec![
@@ -540,22 +521,7 @@ impl Dot {
                 );
             }
             Expression::StorageVariable(loc, ty, contract, var_no) => {
-                let labels = vec![
-                    String::from("storage variable"),
-                    format!(
-                        "{}.{}",
-                        ns.contracts[*contract].name,
-                        ns.contracts[*contract].variables[*var_no].name
-                    ),
-                    ty.to_string(ns),
-                    ns.loc_to_string(loc),
-                ];
-
-                self.add_node(
-                    Node::new("storage_var", labels),
-                    Some(parent),
-                    Some(parent_rel),
-                );
+                self.add_storage_variable(loc, ty, contract, var_no, parent, parent_rel, ns);
             }
             Expression::Load(loc, ty, expr) => {
                 let node = self.add_node(
@@ -854,7 +820,7 @@ impl Dot {
             Expression::UnaryMinus(loc, ty, expr) => {
                 let node = self.add_node(
                     Node::new(
-                        "unary minus",
+                        "unary_minus",
                         vec![
                             format!("unary minus {}", ty.to_string(ns)),
                             ns.loc_to_string(loc),
@@ -901,23 +867,19 @@ impl Dot {
                 self.add_expression(index, func, ns, node, String::from("index"));
             }
             Expression::StructMember(loc, ty, var, member) => {
-                if let Type::Struct(struct_no) = ty {
-                    let field = &ns.structs[*struct_no].fields[*member];
-                    let node = self.add_node(
-                        Node::new(
-                            "struct member",
-                            vec![
-                                format!("struct member {}", ty.to_string(ns),),
-                                format!("field {} {}", field.ty.to_string(ns), field.name_as_str()),
-                                ns.loc_to_string(loc),
-                            ],
-                        ),
-                        Some(parent),
-                        Some(parent_rel),
-                    );
+                let node = self.add_node(
+                    Node::new(
+                        "structmember",
+                        vec![
+                            format!("struct member #{} {}", member, ty.to_string(ns)),
+                            ns.loc_to_string(loc),
+                        ],
+                    ),
+                    Some(parent),
+                    Some(parent_rel),
+                );
 
-                    self.add_expression(var, func, ns, node, String::from("var"));
-                }
+                self.add_expression(var, func, ns, node, String::from("var"));
             }
 
             Expression::AllocDynamicArray(loc, ty, length, initializer) => {
@@ -1090,9 +1052,8 @@ impl Dot {
             Expression::ExternalFunctionCall {
                 loc,
                 function,
-                value,
-                gas,
                 args,
+                call_args,
                 ..
             } => {
                 let labels = vec![
@@ -1112,19 +1073,13 @@ impl Dot {
                     self.add_expression(arg, func, ns, node, format!("arg #{}", no));
                 }
 
-                if let Some(gas) = gas {
-                    self.add_expression(gas, func, ns, node, String::from("gas"));
-                }
-                if let Some(value) = value {
-                    self.add_expression(value, func, ns, node, String::from("value"));
-                }
+                self.add_call_args(call_args, func, ns, node);
             }
             Expression::ExternalFunctionCallRaw {
                 loc,
                 address,
-                value,
-                gas,
                 args,
+                call_args,
                 ..
             } => {
                 let labels = vec![
@@ -1140,21 +1095,13 @@ impl Dot {
 
                 self.add_expression(address, func, ns, node, String::from("address"));
                 self.add_expression(args, func, ns, node, String::from("args"));
-                if let Some(gas) = gas {
-                    self.add_expression(gas, func, ns, node, String::from("gas"));
-                }
-                if let Some(value) = value {
-                    self.add_expression(value, func, ns, node, String::from("value"));
-                }
+                self.add_call_args(call_args, func, ns, node);
             }
             Expression::Constructor {
                 loc,
                 contract_no,
-                value,
-                gas,
                 args,
-                space,
-                salt,
+                call_args,
                 ..
             } => {
                 let labels = vec![
@@ -1172,18 +1119,7 @@ impl Dot {
                     self.add_expression(arg, func, ns, node, format!("arg #{}", no));
                 }
 
-                if let Some(value) = value {
-                    self.add_expression(value, func, ns, node, String::from("value"));
-                }
-                if let Some(salt) = salt {
-                    self.add_expression(salt, func, ns, node, String::from("salt"));
-                }
-                if let Some(space) = space {
-                    self.add_expression(space, func, ns, node, String::from("space"));
-                }
-                if let Some(gas) = gas {
-                    self.add_expression(gas, func, ns, node, String::from("gas"));
-                }
+                self.add_call_args(call_args, func, ns, node);
             }
 
             Expression::FormatString(loc, args) => {
@@ -1233,21 +1169,39 @@ impl Dot {
                     self.add_expression(expr, func, ns, node, format!("entry #{}", no));
                 }
             }
+        }
+    }
 
-            Expression::InternalFunctionCfg(..)
-            | Expression::ReturnData(..)
-            | Expression::Poison
-            | Expression::AbiEncode { .. }
-            | Expression::Undefined(..)
-            | Expression::Keccak256(..) => {
-                panic!("should not present in ast");
-            }
+    fn add_call_args(
+        &mut self,
+        call_args: &CallArgs,
+        func: Option<&Function>,
+        ns: &Namespace,
+        node: usize,
+    ) {
+        if let Some(gas) = &call_args.gas {
+            self.add_expression(gas, func, ns, node, String::from("gas"));
+        }
+        if let Some(value) = &call_args.value {
+            self.add_expression(value, func, ns, node, String::from("value"));
+        }
+        if let Some(salt) = &call_args.salt {
+            self.add_expression(salt, func, ns, node, String::from("salt"));
+        }
+        if let Some(space) = &call_args.space {
+            self.add_expression(space, func, ns, node, String::from("space"));
+        }
+        if let Some(accounts) = &call_args.accounts {
+            self.add_expression(accounts, func, ns, node, String::from("accounts"));
+        }
+        if let Some(seeds) = &call_args.seeds {
+            self.add_expression(seeds, func, ns, node, String::from("seeds"));
         }
     }
 
     fn add_string_location(
         &mut self,
-        loc: &StringLocation,
+        loc: &StringLocation<Expression>,
         func: Option<&Function>,
         ns: &Namespace,
         parent: usize,
@@ -1561,20 +1515,548 @@ impl Dot {
                         Some(parent_rel),
                     );
                 }
+                Statement::Assembly(inline_assembly, ..) => {
+                    let labels = vec![
+                        "inline assembly".to_string(),
+                        ns.loc_to_string(&inline_assembly.loc),
+                    ];
+                    parent = self.add_node(
+                        Node::new("inline_assembly", labels),
+                        Some(parent),
+                        Some(parent_rel),
+                    );
 
-                Statement::AssemblyBlock(_) => {
-                    unimplemented!("Assembly block graphviz not ready yet");
+                    let mut local_parent = parent;
+
+                    for n in inline_assembly.functions.start..inline_assembly.functions.end {
+                        self.add_yul_function(
+                            n,
+                            ns,
+                            local_parent,
+                            format!("func def #{}", inline_assembly.functions.end - n),
+                        );
+                    }
+
+                    local_parent = parent;
+                    for (item_no, item) in inline_assembly.body.iter().enumerate() {
+                        local_parent = self.add_yul_statement(
+                            item,
+                            local_parent,
+                            format!("statement #{}", item_no),
+                            &func.symtable,
+                            ns,
+                        );
+                    }
                 }
             }
             parent_rel = String::from("next");
         }
+    }
+
+    fn add_yul_function(
+        &mut self,
+        func_no: usize,
+        ns: &Namespace,
+        parent: usize,
+        parent_rel: String,
+    ) {
+        let labels = vec![
+            format!("function definition {}", ns.yul_functions[func_no].name),
+            ns.loc_to_string(&ns.yul_functions[func_no].loc),
+        ];
+
+        let func_node = self.add_node(
+            Node::new("yul_function_definition", labels),
+            Some(parent),
+            Some(parent_rel),
+        );
+
+        let mut local_parent = func_node;
+        for (item_no, item) in (*ns.yul_functions[func_no].params).iter().enumerate() {
+            let labels = vec![
+                format!(
+                    "function parameter {}: {}",
+                    item.ty.to_string(ns),
+                    item.id.as_ref().unwrap().name,
+                ),
+                ns.loc_to_string(&item.loc),
+            ];
+            local_parent = self.add_node(
+                Node::new("yul_function_parameter", labels),
+                Some(local_parent),
+                Some(format!("parameter #{}", item_no)),
+            );
+        }
+
+        local_parent = func_node;
+        for (item_no, item) in (*ns.yul_functions[func_no].returns).iter().enumerate() {
+            let labels = vec![
+                format!(
+                    "return parameter {}: {}",
+                    item.ty.to_string(ns),
+                    item.id.as_ref().unwrap().name
+                ),
+                ns.loc_to_string(&item.loc),
+            ];
+            local_parent = self.add_node(
+                Node::new("yul_function_return", labels),
+                Some(local_parent),
+                Some(format!("return #{}", item_no)),
+            );
+        }
+
+        local_parent = func_node;
+        for (item_no, item) in ns.yul_functions[func_no].body.iter().enumerate() {
+            local_parent = self.add_yul_statement(
+                item,
+                local_parent,
+                format!("statement #{}", item_no),
+                &ns.yul_functions[func_no].symtable,
+                ns,
+            );
+        }
+    }
+
+    fn add_yul_expression(
+        &mut self,
+        expr: &YulExpression,
+        symtable: &Symtable,
+        ns: &Namespace,
+        parent: usize,
+        parent_rel: String,
+    ) {
+        match expr {
+            YulExpression::BoolLiteral(loc, value, ty) => {
+                let labels = vec![
+                    format!(
+                        "bool literal: {} of type {}",
+                        if *value { "true" } else { "false" },
+                        ty.to_string(ns)
+                    ),
+                    ns.loc_to_string(loc),
+                ];
+
+                self.add_node(
+                    Node::new("yul_bool_literal", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+            }
+            YulExpression::NumberLiteral(loc, value, ty) => {
+                let labels = vec![
+                    format!("{} literal: {}", ty.to_string(ns), value),
+                    ns.loc_to_string(loc),
+                ];
+
+                self.add_node(
+                    Node::new("yul_number_literal", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+            }
+            YulExpression::StringLiteral(loc, value, ty) => {
+                let labels = vec![
+                    format!("{} literal: {}", ty.to_string(ns), hex::encode(value)),
+                    ns.loc_to_string(loc),
+                ];
+
+                self.add_node(
+                    Node::new("bytes_literal", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+            }
+            YulExpression::YulLocalVariable(loc, ty, var_no) => {
+                let labels = vec![
+                    format!("yul variable: {}", symtable.vars[var_no].id.name),
+                    ty.to_string(ns),
+                    ns.loc_to_string(loc),
+                ];
+                self.add_node(
+                    Node::new("yul_variable", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+            }
+            YulExpression::SolidityLocalVariable(loc, ty, _, var_no) => {
+                let labels = vec![
+                    format!("solidity variable: {}", symtable.vars[var_no].id.name),
+                    ty.to_string(ns),
+                    ns.loc_to_string(loc),
+                ];
+
+                self.add_node(
+                    Node::new("solidity_variable", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+            }
+            YulExpression::ConstantVariable(loc, ty, contract, var_no) => {
+                self.add_constant_variable(loc, ty, contract, var_no, parent, parent_rel, ns);
+            }
+            YulExpression::StorageVariable(loc, ty, contract, var_no) => {
+                self.add_storage_variable(loc, ty, contract, var_no, parent, parent_rel, ns);
+            }
+            YulExpression::BuiltInCall(loc, builtin_ty, args) => {
+                self.add_yul_builtin_call(loc, builtin_ty, args, parent, parent_rel, symtable, ns);
+            }
+            YulExpression::FunctionCall(loc, func_no, args, _) => {
+                self.add_yul_function_call(loc, func_no, args, parent, parent_rel, symtable, ns);
+            }
+            YulExpression::SuffixAccess(loc, member, suffix) => {
+                let labels = vec![
+                    format!("yul suffix '{}' access", suffix.to_string()),
+                    ns.loc_to_string(loc),
+                ];
+
+                let node = self.add_node(
+                    Node::new("yul_suffix_access", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+
+                self.add_yul_expression(member, symtable, ns, node, "parent".to_string());
+            }
+        }
+    }
+
+    fn add_constant_variable(
+        &mut self,
+        loc: &Loc,
+        ty: &Type,
+        contract: &Option<usize>,
+        var_no: &usize,
+        parent: usize,
+        parent_rel: String,
+        ns: &Namespace,
+    ) {
+        let mut labels = vec![
+            String::from("constant variable"),
+            ty.to_string(ns),
+            ns.loc_to_string(loc),
+        ];
+
+        if let Some(contract) = contract {
+            labels.insert(
+                1,
+                format!(
+                    "{}.{}",
+                    ns.contracts[*contract].name, ns.contracts[*contract].variables[*var_no].name
+                ),
+            );
+        } else {
+            labels.insert(1, ns.constants[*var_no].name.to_string());
+        }
+
+        self.add_node(
+            Node::new("constant", labels),
+            Some(parent),
+            Some(parent_rel),
+        );
+    }
+
+    fn add_storage_variable(
+        &mut self,
+        loc: &Loc,
+        ty: &Type,
+        contract: &usize,
+        var_no: &usize,
+        parent: usize,
+        parent_rel: String,
+        ns: &Namespace,
+    ) {
+        let labels = vec![
+            String::from("storage variable"),
+            format!(
+                "{}.{}",
+                ns.contracts[*contract].name, ns.contracts[*contract].variables[*var_no].name
+            ),
+            ty.to_string(ns),
+            ns.loc_to_string(loc),
+        ];
+
+        self.add_node(
+            Node::new("storage_var", labels),
+            Some(parent),
+            Some(parent_rel),
+        );
+    }
+
+    fn add_yul_statement(
+        &mut self,
+        statement: &YulStatement,
+        parent: usize,
+        parent_rel: String,
+        symtable: &Symtable,
+        ns: &Namespace,
+    ) -> usize {
+        match statement {
+            YulStatement::FunctionCall(loc, _, func_no, args) => {
+                self.add_yul_function_call(loc, func_no, args, parent, parent_rel, symtable, ns)
+            }
+            YulStatement::BuiltInCall(loc, _, builtin_ty, args) => {
+                self.add_yul_builtin_call(loc, builtin_ty, args, parent, parent_rel, symtable, ns)
+            }
+            YulStatement::Block(block) => {
+                self.add_yul_block(block, parent, parent_rel, symtable, ns)
+            }
+            YulStatement::VariableDeclaration(loc, _, declared_vars, initializer) => {
+                let labels = vec![
+                    "yul variable declaration".to_string(),
+                    ns.loc_to_string(loc),
+                ];
+
+                let node = self.add_node(
+                    Node::new("yul_var_decl", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+
+                for (decl_no, item) in declared_vars.iter().enumerate() {
+                    let var = &symtable.vars[&item.0];
+                    self.add_node(
+                        Node::new(
+                            "var_decl_item",
+                            vec![
+                                format!(
+                                    "yul variable declaration {} {}",
+                                    var.ty.to_string(ns),
+                                    var.id.name
+                                ),
+                                ns.loc_to_string(&var.id.loc),
+                            ],
+                        ),
+                        Some(node),
+                        Some(format!("decl item #{}", decl_no)),
+                    );
+                }
+
+                if let Some(init) = initializer {
+                    self.add_yul_expression(init, symtable, ns, node, "init".to_string());
+                }
+
+                node
+            }
+            YulStatement::Assignment(loc, _, lhs, rhs) => {
+                let labels = vec!["yul assignment".to_string(), ns.loc_to_string(loc)];
+
+                let node = self.add_node(
+                    Node::new("yul_assignment", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                );
+
+                for (item_no, item) in lhs.iter().enumerate() {
+                    self.add_yul_expression(item, symtable, ns, node, format!("rhs #{}", item_no));
+                }
+
+                self.add_yul_expression(rhs, symtable, ns, node, "lhs".to_string());
+                node
+            }
+            YulStatement::IfBlock(loc, _, condition, block) => {
+                let labels = vec!["yul if".to_string(), ns.loc_to_string(loc)];
+
+                let node = self.add_node(Node::new("if", labels), Some(parent), Some(parent_rel));
+
+                self.add_yul_expression(condition, symtable, ns, node, "cond".to_string());
+                self.add_yul_block(block, node, "if-block".to_string(), symtable, ns);
+                node
+            }
+            YulStatement::Switch {
+                loc,
+                condition,
+                cases,
+                default,
+                ..
+            } => {
+                let labels = vec!["yul switch".to_string(), ns.loc_to_string(loc)];
+
+                let node =
+                    self.add_node(Node::new("switch", labels), Some(parent), Some(parent_rel));
+
+                self.add_yul_expression(condition, symtable, ns, node, "cond".to_string());
+
+                for (item_no, item) in cases.iter().enumerate() {
+                    let case_block = self.add_node(
+                        Node::new(
+                            "case",
+                            vec!["yul switch case".to_string(), ns.loc_to_string(&item.loc)],
+                        ),
+                        Some(node),
+                        Some(format!("case #{}", item_no)),
+                    );
+                    self.add_yul_expression(
+                        &item.condition,
+                        symtable,
+                        ns,
+                        case_block,
+                        "case-condition".to_string(),
+                    );
+                    self.add_yul_block(
+                        &item.block,
+                        case_block,
+                        "case block".to_string(),
+                        symtable,
+                        ns,
+                    );
+                }
+
+                if let Some(default_block) = default {
+                    let default_node = self.add_node(
+                        Node::new(
+                            "default",
+                            vec![
+                                "yul switch default".to_string(),
+                                ns.loc_to_string(&default_block.loc),
+                            ],
+                        ),
+                        Some(node),
+                        Some("default".to_string()),
+                    );
+                    self.add_yul_block(
+                        default_block,
+                        default_node,
+                        "default block".to_string(),
+                        symtable,
+                        ns,
+                    );
+                }
+                node
+            }
+            YulStatement::For {
+                loc,
+                init_block,
+                condition,
+                post_block,
+                execution_block,
+                ..
+            } => {
+                let labels = vec!["yul for".to_string(), ns.loc_to_string(loc)];
+
+                let node = self.add_node(Node::new("for", labels), Some(parent), Some(parent_rel));
+
+                self.add_yul_block(init_block, node, "init block".to_string(), symtable, ns);
+                self.add_yul_expression(condition, symtable, ns, node, "for condition".to_string());
+                self.add_yul_block(post_block, node, "post block".to_string(), symtable, ns);
+                self.add_yul_block(
+                    execution_block,
+                    node,
+                    "execution block".to_string(),
+                    symtable,
+                    ns,
+                );
+                node
+            }
+            YulStatement::Leave(loc, _) => {
+                let labels = vec!["leave".to_string(), ns.loc_to_string(loc)];
+                self.add_node(Node::new("leave", labels), Some(parent), Some(parent_rel))
+            }
+            YulStatement::Break(loc, _) => {
+                let labels = vec!["break".to_string(), ns.loc_to_string(loc)];
+                self.add_node(Node::new("break", labels), Some(parent), Some(parent_rel))
+            }
+            YulStatement::Continue(loc, _) => {
+                let labels = vec!["continue".to_string(), ns.loc_to_string(loc)];
+                self.add_node(
+                    Node::new("continue", labels),
+                    Some(parent),
+                    Some(parent_rel),
+                )
+            }
+        }
+    }
+
+    fn add_yul_block(
+        &mut self,
+        block: &YulBlock,
+        mut parent: usize,
+        parent_rel: String,
+        symtable: &Symtable,
+        ns: &Namespace,
+    ) -> usize {
+        let label = vec!["assembly block".to_string(), ns.loc_to_string(&block.loc)];
+
+        let node = self.add_node(
+            Node::new("assembly_block", label),
+            Some(parent),
+            Some(parent_rel),
+        );
+
+        parent = node;
+        for (statement_no, child_statement) in block.body.iter().enumerate() {
+            parent = self.add_yul_statement(
+                child_statement,
+                parent,
+                format!("statement #{}", statement_no),
+                symtable,
+                ns,
+            );
+        }
+
+        node
+    }
+
+    fn add_yul_function_call(
+        &mut self,
+        loc: &Loc,
+        func_no: &usize,
+        args: &[YulExpression],
+        parent: usize,
+        parent_rel: String,
+        symtable: &Symtable,
+        ns: &Namespace,
+    ) -> usize {
+        let labels = vec![
+            format!("yul function call '{}'", ns.yul_functions[*func_no].name),
+            ns.loc_to_string(loc),
+        ];
+
+        let node = self.add_node(
+            Node::new("yul_function_call", labels),
+            Some(parent),
+            Some(parent_rel),
+        );
+
+        for (arg_no, arg) in args.iter().enumerate() {
+            self.add_yul_expression(arg, symtable, ns, node, format!("arg #{}", arg_no));
+        }
+
+        node
+    }
+
+    fn add_yul_builtin_call(
+        &mut self,
+        loc: &Loc,
+        builtin_ty: &YulBuiltInFunction,
+        args: &[YulExpression],
+        parent: usize,
+        parent_rel: String,
+        symtable: &Symtable,
+        ns: &Namespace,
+    ) -> usize {
+        let labels = vec![
+            format!("yul builtin call '{}'", builtin_ty.to_string()),
+            ns.loc_to_string(loc),
+        ];
+
+        let node = self.add_node(
+            Node::new("yul_builtin_call", labels),
+            Some(parent),
+            Some(parent_rel),
+        );
+
+        for (arg_no, arg) in args.iter().enumerate() {
+            self.add_yul_expression(arg, symtable, ns, node, format!("arg #{}", arg_no));
+        }
+
+        node
     }
 }
 
 impl Namespace {
     pub fn dotgraphviz(&self) -> String {
         let mut dot = Dot {
-            filename: format!("{}", self.files[0].path.display()),
+            filename: format!("{}", self.files[self.top_file_no()].path.display()),
             nodes: Vec::new(),
             edges: Vec::new(),
         };
@@ -1666,12 +2148,38 @@ impl Namespace {
             }
         }
 
+        // user types
+        if !self.user_types.is_empty() {
+            let types = dot.add_node(Node::new("types", Vec::new()), None, None);
+
+            for decl in &self.user_types {
+                let mut labels = vec![
+                    format!("name:{} ty:{}", decl.name, decl.ty.to_string(self)),
+                    self.loc_to_string(&decl.loc),
+                ];
+
+                if let Some(contract) = &decl.contract {
+                    labels.insert(1, format!("contract: {}", contract));
+                }
+
+                let e = Node::new(&decl.name, labels);
+
+                let node = dot.add_node(e, Some(types), None);
+
+                dot.add_tags(&decl.tags, node);
+            }
+        }
+
         // free functions
-        if !self.functions.iter().any(|func| func.contract_no.is_some()) {
+        if self
+            .functions
+            .iter()
+            .any(|func| func.contract_no.is_none() && func.loc != pt::Loc::Builtin)
+        {
             let functions = dot.add_node(Node::new("free_functions", Vec::new()), None, None);
 
             for func in &self.functions {
-                if func.contract_no.is_none() {
+                if func.contract_no.is_none() && func.loc != pt::Loc::Builtin {
                     dot.add_function(func, self, functions);
                 }
             }
@@ -1740,30 +2248,32 @@ impl Namespace {
                 dot.add_tags(&var.tags, node);
             }
 
-            for (library, ty) in &c.using {
-                if let Some(ty) = ty {
-                    dot.add_node(
-                        Node::new(
-                            "using",
-                            vec![format!(
-                                "using {} for {}",
-                                self.contracts[*library].name,
-                                ty.to_string(self)
-                            )],
-                        ),
-                        Some(contract),
-                        Some(String::from("base")),
-                    );
-                } else {
-                    dot.add_node(
-                        Node::new(
-                            "using",
-                            vec![format!("using {}", self.contracts[*library].name)],
-                        ),
-                        Some(contract),
-                        Some(String::from("base")),
-                    );
+            for using in &c.using {
+                let mut labels = match &using.list {
+                    UsingList::Functions(functions) => functions
+                        .iter()
+                        .map(|func_no| {
+                            let func = &self.functions[*func_no];
+
+                            format!("function {} {}", func.name, self.loc_to_string(&func.loc))
+                        })
+                        .collect(),
+                    UsingList::Library(library_no) => {
+                        let library = &self.contracts[*library_no];
+
+                        vec![format!("library {}", library.name)]
+                    }
+                };
+
+                if let Some(ty) = &using.ty {
+                    labels.insert(0, format!("using for {}", ty.to_string(self)));
                 }
+
+                dot.add_node(
+                    Node::new("using", labels),
+                    Some(contract),
+                    Some(String::from("base")),
+                );
             }
 
             for func in &c.functions {
@@ -1775,10 +2285,10 @@ impl Namespace {
         if !self.diagnostics.is_empty() {
             let diagnostics = dot.add_node(Node::new("diagnostics", Vec::new()), None, None);
 
-            for diag in &self.diagnostics {
+            for diag in self.diagnostics.iter() {
                 let mut labels = vec![diag.message.to_string(), format!("level {:?}", diag.level)];
 
-                labels.push(self.loc_to_string(&diag.pos));
+                labels.push(self.loc_to_string(&diag.loc));
 
                 let node = dot.add_node(
                     Node::new("diagnostic", labels),
@@ -1790,7 +2300,7 @@ impl Namespace {
                     dot.add_node(
                         Node::new(
                             "note",
-                            vec![note.message.to_string(), self.loc_to_string(&note.pos)],
+                            vec![note.message.to_string(), self.loc_to_string(&note.loc)],
                         ),
                         Some(node),
                         Some(String::from("note")),

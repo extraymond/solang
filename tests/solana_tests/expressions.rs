@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 use ethabi::{ethereum_types::U256, Token};
 use rand::Rng;
@@ -18,9 +20,9 @@ fn interfaceid() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("get", &[], &[], 0, None);
+    let returns = vm.function("get", &[], &[], None);
 
     assert_eq!(
         returns,
@@ -55,9 +57,9 @@ fn write_buffer() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test1", &[], &[], 0, None);
+    let returns = vm.function("test1", &[], &[], None);
 
     assert_eq!(
         returns,
@@ -66,14 +68,14 @@ fn write_buffer() {
         )]
     );
 
-    let returns = vm.function("test2", &[], &[], 0, None);
+    let returns = vm.function("test2", &[], &[], None);
 
     let mut buf = vec![0x42u8, 0x41u8];
     buf.extend_from_slice(&vm.origin);
 
     assert_eq!(returns, vec![Token::Bytes(buf)]);
 
-    let res = vm.function_must_fail("test3", &[], &[], 0, None);
+    let res = vm.function_must_fail("test3", &[], &[], None);
     assert_eq!(res, Ok(4294967296));
 }
 
@@ -92,7 +94,7 @@ fn read_buffer() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     let returns = vm.function(
         "test1",
@@ -100,7 +102,6 @@ fn read_buffer() {
             [0xbc, 0xbc, 0xbd, 0xbe, 8, 7, 6, 5, 4, 3, 2, 1].to_vec(),
         )],
         &[],
-        0,
         None,
     );
 
@@ -120,7 +121,6 @@ fn read_buffer() {
             [0xbc, 0xbc, 0xbd, 0xbe, 8, 7, 6, 5, 4, 3, 2].to_vec(),
         )],
         &[],
-        0,
         None,
     );
     assert_eq!(res, Ok(4294967296));
@@ -128,7 +128,7 @@ fn read_buffer() {
     let mut buf = vec![0x42u8, 0x41u8];
     buf.extend_from_slice(&vm.origin);
 
-    let returns = vm.function("test2", &[Token::Bytes(buf.clone())], &[], 0, None);
+    let returns = vm.function("test2", &[Token::Bytes(buf.clone())], &[], None);
 
     assert_eq!(
         returns,
@@ -140,7 +140,7 @@ fn read_buffer() {
 
     buf.pop();
 
-    let res = vm.function_must_fail("test2", &[Token::Bytes(buf)], &[], 0, None);
+    let res = vm.function_must_fail("test2", &[Token::Bytes(buf)], &[], None);
     assert_eq!(res, Ok(4294967296));
 }
 
@@ -159,13 +159,12 @@ fn bytes_compare() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     let returns = vm.function(
         "test1",
         &[Token::FixedBytes([0xbc, 0xbc, 0xbd, 0xbe].to_vec())],
         &[],
-        0,
         None,
     );
 
@@ -175,7 +174,6 @@ fn bytes_compare() {
         "test2",
         &[Token::FixedBytes([0xbc, 0xbc, 0xbd, 0xbe].to_vec())],
         &[],
-        0,
         None,
     );
 
@@ -195,7 +193,7 @@ fn assignment_in_ternary() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     for _ in 0..10 {
         let left = rng.gen::<u64>();
@@ -208,7 +206,6 @@ fn assignment_in_ternary() {
                 Token::Uint(U256::from(right)),
             ],
             &[],
-            0,
             None,
         );
 
@@ -217,4 +214,25 @@ fn assignment_in_ternary() {
             vec![Token::Uint(U256::from(std::cmp::min(left, right)))]
         );
     }
+}
+
+#[test]
+fn power() {
+    let mut vm = build_solidity(
+        r#"
+        contract foo {
+            function power() public returns (uint) {
+                return 2 ** 3 ** 4;
+            }
+        }"#,
+    );
+
+    vm.constructor("foo", &[]);
+
+    let returns = vm.function("power", &[], &[], None);
+
+    assert_eq!(
+        returns,
+        vec![Token::Uint(U256::from(2417851639229258349412352u128))]
+    );
 }

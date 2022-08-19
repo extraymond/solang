@@ -1,11 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::codegen::subexpression_elimination::{ConstantType, ExpressionType};
-use crate::sema::ast::{Expression, StringLocation};
+use crate::codegen::Expression;
+use crate::sema::ast::StringLocation;
 
 impl Expression {
     /// Rebuild a binary expression given the new left and right subexpressions
     #[must_use]
     pub fn rebuild_binary_expression(&self, left: &Expression, right: &Expression) -> Expression {
-        let expr = match self {
+        match self {
             Expression::Add(loc, expr_type, check, ..) => Expression::Add(
                 *loc,
                 expr_type.clone(),
@@ -42,15 +45,6 @@ impl Expression {
                 Box::new(left.clone()),
                 Box::new(right.clone()),
             ),
-
-            Expression::Or(loc, ..) => {
-                Expression::Or(*loc, Box::new(left.clone()), Box::new(right.clone()))
-            }
-
-            Expression::And(loc, ..) => {
-                Expression::And(*loc, Box::new(left.clone()), Box::new(right.clone()))
-            }
-
             Expression::Equal(loc, ..) => {
                 Expression::Equal(*loc, Box::new(left.clone()), Box::new(right.clone()))
             }
@@ -66,15 +60,28 @@ impl Expression {
                 Box::new(left.clone()),
                 Box::new(right.clone()),
             ),
-
-            Expression::Divide(loc, expr_type, ..) => Expression::Divide(
+            Expression::UnsignedDivide(loc, expr_type, ..) => Expression::UnsignedDivide(
                 *loc,
                 expr_type.clone(),
                 Box::new(left.clone()),
                 Box::new(right.clone()),
             ),
 
-            Expression::Modulo(loc, expr_type, ..) => Expression::Modulo(
+            Expression::SignedDivide(loc, expr_type, ..) => Expression::SignedDivide(
+                *loc,
+                expr_type.clone(),
+                Box::new(left.clone()),
+                Box::new(right.clone()),
+            ),
+
+            Expression::SignedModulo(loc, expr_type, ..) => Expression::SignedModulo(
+                *loc,
+                expr_type.clone(),
+                Box::new(left.clone()),
+                Box::new(right.clone()),
+            ),
+
+            Expression::UnsignedModulo(loc, expr_type, ..) => Expression::UnsignedModulo(
                 *loc,
                 expr_type.clone(),
                 Box::new(left.clone()),
@@ -104,12 +111,20 @@ impl Expression {
                 *check,
             ),
 
-            Expression::More(loc, ..) => {
-                Expression::More(*loc, Box::new(left.clone()), Box::new(right.clone()))
+            Expression::SignedMore(loc, ..) => {
+                Expression::SignedMore(*loc, Box::new(left.clone()), Box::new(right.clone()))
             }
 
-            Expression::Less(loc, ..) => {
-                Expression::Less(*loc, Box::new(left.clone()), Box::new(right.clone()))
+            Expression::UnsignedMore(loc, ..) => {
+                Expression::UnsignedMore(*loc, Box::new(left.clone()), Box::new(right.clone()))
+            }
+
+            Expression::UnsignedLess(loc, ..) => {
+                Expression::UnsignedLess(*loc, Box::new(left.clone()), Box::new(right.clone()))
+            }
+
+            Expression::SignedLess(loc, ..) => {
+                Expression::SignedLess(*loc, Box::new(left.clone()), Box::new(right.clone()))
             }
 
             Expression::MoreEqual(loc, ..) => {
@@ -119,6 +134,13 @@ impl Expression {
             Expression::LessEqual(loc, ..) => {
                 Expression::LessEqual(*loc, Box::new(left.clone()), Box::new(right.clone()))
             }
+
+            Expression::AdvancePointer { loc, ty, .. } => Expression::AdvancePointer {
+                loc: *loc,
+                ty: ty.clone(),
+                pointer: Box::new(left.clone()),
+                bytes_offset: Box::new(right.clone()),
+            },
 
             Expression::StringCompare(loc, left_exp, right_exp) => {
                 if !matches!(
@@ -152,9 +174,7 @@ impl Expression {
             }
 
             _ => unreachable!("Cannot rebuild this expression"),
-        };
-
-        expr
+        }
     }
 
     /// Rebuild a unary expression give the new operand expression
@@ -206,8 +226,6 @@ impl Expression {
             | Expression::BitwiseOr(_, _, left, right)
             | Expression::BitwiseAnd(_, _, left, right)
             | Expression::BitwiseXor(_, _, left, right)
-            | Expression::Or(_, left, right)
-            | Expression::And(_, left, right)
             | Expression::Equal(_, left, right)
             | Expression::NotEqual(_, left, right) => Some((left, right)),
 
@@ -219,14 +237,23 @@ impl Expression {
     pub fn get_non_commutative_operands(&self) -> Option<(&Expression, &Expression)> {
         match self {
             Expression::Subtract(_, _, _, left, right)
-            | Expression::Divide(_, _, left, right)
-            | Expression::Modulo(_, _, left, right)
+            | Expression::UnsignedDivide(_, _, left, right)
+            | Expression::SignedDivide(_, _, left, right)
+            | Expression::SignedModulo(_, _, left, right)
+            | Expression::UnsignedModulo(_, _, left, right)
             | Expression::Power(_, _, _, left, right)
             | Expression::ShiftLeft(_, _, left, right)
             | Expression::ShiftRight(_, _, left, right, _)
-            | Expression::More(_, left, right)
-            | Expression::Less(_, left, right)
+            | Expression::SignedMore(_, left, right)
+            | Expression::UnsignedMore(_, left, right)
+            | Expression::SignedLess(_, left, right)
+            | Expression::UnsignedLess(_, left, right)
             | Expression::MoreEqual(_, left, right)
+            | Expression::AdvancePointer {
+                pointer: left,
+                bytes_offset: right,
+                ..
+            }
             | Expression::LessEqual(_, left, right) => Some((left, right)),
 
             _ => None,
@@ -255,10 +282,6 @@ impl Expression {
             Expression::BoolLiteral(_, value) => ConstantType::Bool(*value),
             Expression::NumberLiteral(_, _, value) => ConstantType::Number(value.clone()),
             Expression::BytesLiteral(_, _, value) => ConstantType::Bytes(value.clone()),
-            Expression::ConstantVariable(_, _, contract_no, var_no) => {
-                ConstantType::ConstantVariable(*contract_no, *var_no)
-            }
-
             _ => unreachable!("Not a constant expression"),
         };
 

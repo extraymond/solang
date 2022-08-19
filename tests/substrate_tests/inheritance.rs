@@ -1,6 +1,7 @@
-use crate::{build_solidity, no_errors};
-use parity_scale_codec::{Decode, Encode};
+// SPDX-License-Identifier: Apache-2.0
 
+use crate::build_solidity;
+use parity_scale_codec::{Decode, Encode};
 use solang::file_resolver::FileResolver;
 use solang::Target;
 use std::ffi::OsStr;
@@ -37,7 +38,7 @@ fn test_abstract() {
         false,
     );
 
-    no_errors(ns.diagnostics);
+    assert!(!ns.diagnostics.any_errors());
 
     assert_eq!(contracts.len(), 1);
 
@@ -75,7 +76,7 @@ fn test_abstract() {
         false,
     );
 
-    no_errors(ns.diagnostics);
+    assert!(!ns.diagnostics.any_errors());
 
     assert_eq!(contracts.len(), 1);
 }
@@ -144,7 +145,7 @@ fn inherit_variables() {
 
 #[test]
 fn call_inherited_function() {
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Val(u64);
 
     let mut runtime = build_solidity(
@@ -333,7 +334,7 @@ fn test_override() {
 
 #[test]
 fn base_contract() {
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Val(u32);
 
     let mut runtime = build_solidity(
@@ -362,9 +363,9 @@ fn base_contract() {
 
 #[test]
 fn base_contract_on_constructor() {
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Val(i32);
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Val64(u64);
 
     let mut runtime = build_solidity(
@@ -473,9 +474,9 @@ fn base_contract_on_constructor() {
 
 #[test]
 fn call_base_function_via_basename() {
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Val(i32);
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Val64(u64);
 
     let mut runtime = build_solidity(

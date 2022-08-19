@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use solang::codegen::{codegen, OptimizationLevel, Options};
 use solang::file_resolver::FileResolver;
 use solang::sema::ast::Diagnostic;
-use solang::sema::ast::{Level, Namespace};
+use solang::sema::ast::Namespace;
 use solang::{parse_and_resolve, Target};
 use std::ffi::OsStr;
 
@@ -9,7 +11,6 @@ fn parse_and_codegen(src: &'static str) -> Namespace {
     let mut cache = FileResolver::new();
     cache.set_file_contents("test.sol", src.to_string());
     let mut ns = parse_and_resolve(OsStr::new("test.sol"), &mut cache, Target::Ewasm);
-
     let opt = Options {
         dead_storage: false,
         constant_folding: false,
@@ -18,21 +19,12 @@ fn parse_and_codegen(src: &'static str) -> Namespace {
         common_subexpression_elimination: false,
         opt_level: OptimizationLevel::Default,
         math_overflow_check: false,
+        generate_debug_information: false,
     };
 
     codegen(&mut ns, &opt);
 
     ns
-}
-
-fn get_errors(ns: &Namespace) -> Vec<&Diagnostic> {
-    let mut vec = Vec::new();
-    for diag in &ns.diagnostics {
-        if matches!(diag.level, Level::Error) {
-            vec.push(diag);
-        }
-    }
-    vec
 }
 
 fn contains_error_message_and_notes(
@@ -78,7 +70,7 @@ fn used_before_being_defined() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 'b32' is undefined");
     assert_eq!(errors[0].notes.len(), 2);
@@ -126,7 +118,7 @@ fn struct_as_ref() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 'f' is undefined");
     assert_eq!(errors[0].notes.len(), 3);
@@ -175,7 +167,7 @@ fn struct_as_ref() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 0);
 }
 
@@ -195,7 +187,7 @@ fn while_loop() {
     }
     "#;
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 's' is undefined");
     assert_eq!(errors[0].notes.len(), 1);
@@ -223,7 +215,7 @@ fn while_loop() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 's' is undefined");
     assert_eq!(errors[0].notes.len(), 1);
@@ -253,7 +245,7 @@ fn while_loop() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 0);
 }
 
@@ -277,7 +269,7 @@ fn for_loop() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 2);
     assert!(contains_error_message_and_notes(
         &errors,
@@ -312,7 +304,7 @@ fn for_loop() {
     }
     "#;
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 0);
 }
 
@@ -337,7 +329,7 @@ fn do_while_loop() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 0);
 }
 
@@ -360,7 +352,7 @@ fn if_else_condition() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 'o' is undefined");
     assert_eq!(errors[0].notes.len(), 1);
@@ -390,7 +382,7 @@ fn if_else_condition() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 'o' is undefined");
     assert_eq!(errors[0].notes.len(), 1);
@@ -418,7 +410,7 @@ fn if_else_condition() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 0);
 }
 
@@ -435,14 +427,8 @@ fn array() {
     }
     "#;
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].message, "Variable 'vec' is undefined");
-    assert_eq!(errors[0].notes.len(), 1);
-    assert_eq!(
-        errors[0].notes[0].message,
-        "Variable read before being defined"
-    );
+    let errors = ns.diagnostics.errors();
+    assert_eq!(errors.len(), 0);
 
     let file = r#"
     contract test {
@@ -460,7 +446,7 @@ fn array() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 0);
 }
 
@@ -493,7 +479,7 @@ contract test {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert!(contains_error_message_and_notes(
         &errors,
         "Variable 'o' is undefined",
@@ -533,7 +519,7 @@ fn basic_types() {
 }
     "#;
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert!(contains_error_message_and_notes(
         &errors,
         "Variable 'bt' is undefined",
@@ -594,7 +580,7 @@ contract test {
 }
     "#;
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert!(contains_error_message_and_notes(
         &errors,
         "Variable 'b' is undefined",
@@ -642,7 +628,7 @@ fn try_catch() {
     // "#;
     //
     // let ns = parse_and_codegen(file);
-    // let errors = get_errors(&ns);
+    // let errors = ns.diagnostics.errors();
     // assert_eq!(errors.len(), 1);
     // assert_eq!(errors[0].message, "Variable 'r' is undefined");
     // assert_eq!(errors[0].notes.len(), 1);
@@ -675,7 +661,7 @@ fn try_catch() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 0);
 
     let file = r#"
@@ -703,7 +689,7 @@ fn try_catch() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 'r' is undefined");
     assert_eq!(errors[0].notes.len(), 1);
@@ -737,7 +723,7 @@ fn try_catch() {
     "#;
 
     let ns = parse_and_codegen(file);
-    let errors = get_errors(&ns);
+    let errors = ns.diagnostics.errors();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].message, "Variable 'r' is undefined");
     assert_eq!(errors[0].notes.len(), 1);

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 use ethabi::Token;
 
@@ -19,8 +21,8 @@ fn test_slice_in_phi() {
     "#;
 
     let mut vm = build_solidity(file);
-    vm.constructor("c1", &[], 0);
-    let returns = vm.function("test", &[], &[], 0, None);
+    vm.constructor("c1", &[]);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![Token::String(String::from("Hello!"))]);
 }

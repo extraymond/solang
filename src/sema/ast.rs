@@ -1,11 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::symtable::Symtable;
-use crate::codegen::cfg::ControlFlowGraph;
-pub use crate::parser::diagnostics::*;
-use crate::parser::pt;
-use crate::sema::assembly::AssemblyStatement;
-use crate::Target;
+use crate::codegen::cfg::{ControlFlowGraph, Instr};
+use crate::diagnostics::Diagnostics;
+use crate::sema::yul::ast::{InlineAssembly, YulFunction};
+use crate::sema::Recurse;
+use crate::{codegen, Target};
 use num_bigint::BigInt;
 use num_rational::BigRational;
+pub use solang_parser::diagnostics::*;
+use solang_parser::pt;
+use solang_parser::pt::{CodeLocation, OptionalCodeLocation};
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -13,7 +19,7 @@ use std::{
 };
 use tiny_keccak::{Hasher, Keccak};
 
-#[derive(PartialEq, Clone, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Clone, Hash, Debug)]
 pub enum Type {
     Address(bool),
     Bool,
@@ -23,10 +29,13 @@ pub enum Type {
     Bytes(u8),
     DynamicBytes,
     String,
-    Array(Box<Type>, Vec<Option<BigInt>>),
+    Array(Box<Type>, Vec<ArrayLength>),
+    /// The usize is an index into enums in the namespace
     Enum(usize),
-    Struct(usize),
+    /// The usize is an index into contracts in the namespace
+    Struct(StructType),
     Mapping(Box<Type>, Box<Type>),
+    /// The usize is an index into contracts in the namespace
     Contract(usize),
     Ref(Box<Type>),
     /// Reference to storage, first bool is true for immutables
@@ -41,12 +50,50 @@ pub enum Type {
         params: Vec<Type>,
         returns: Vec<Type>,
     },
+    /// User type definitions, e.g. `type Foo is int128;`. The usize
+    /// is an index into user_types in the namespace.
+    UserType(usize),
     /// There is no way to declare value in Solidity (should there be?)
     Value,
     Void,
     Unreachable,
     /// DynamicBytes and String are lowered to a vector.
-    Slice,
+    Slice(Box<Type>),
+    /// We could not resolve this type
+    Unresolved,
+    /// When we advance a pointer, it cannot be any of the previous types.
+    /// e.g. Type::Bytes is a pointer to struct.vector. When we advance it, it is a pointer
+    /// to latter's data region.
+    BufferPointer,
+}
+
+#[derive(PartialEq, Eq, Clone, Hash, Debug)]
+pub enum ArrayLength {
+    Fixed(BigInt),
+    Dynamic,
+    /// Fixed length arrays, any length permitted. This is useful for when we
+    /// do not want dynamic length, but want to permit any length. For example
+    /// the create_program_address() call takes any number of seeds as its
+    /// first argument, and we don't want to allocate a dynamic array for
+    /// this parameter as this would be wasteful to allocate a vector for
+    /// this argument.
+    AnyFixed,
+}
+
+impl ArrayLength {
+    /// Get the length, if fixed
+    pub fn array_length(&self) -> Option<&BigInt> {
+        match self {
+            ArrayLength::Fixed(len) => Some(len),
+            _ => None,
+        }
+    }
+}
+
+pub trait RetrieveType {
+    /// Return the type for this expression. This assumes the expression has a single value,
+    /// panics will occur otherwise
+    fn ty(&self) -> Type;
 }
 
 impl Type {
@@ -57,21 +104,29 @@ impl Type {
             _ => unimplemented!("size of type not known"),
         }
     }
+
+    pub fn unwrap_user_type(self, ns: &Namespace) -> Type {
+        if let Type::UserType(type_no) = self {
+            ns.user_types[type_no].ty.clone()
+        } else {
+            self
+        }
+    }
 }
 
-#[derive(PartialEq, Clone, Debug, Copy)]
-pub enum BuiltinStruct {
-    None,
+#[derive(PartialEq, Eq, Clone, Debug, Copy, Hash)]
+pub enum StructType {
+    UserDefined(usize),
     AccountInfo,
     AccountMeta,
+    ExternalFunction,
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct StructDecl {
     pub tags: Vec<Tag>,
     pub name: String,
     pub loc: pt::Loc,
-    pub builtin: BuiltinStruct,
     pub contract: Option<String>,
     pub fields: Vec<Parameter>,
     // List of offsets of the fields, last entry is the offset for the struct overall size
@@ -80,7 +135,7 @@ pub struct StructDecl {
     pub storage_offsets: Vec<BigInt>,
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct EventDecl {
     pub tags: Vec<Tag>,
     pub name: String,
@@ -102,7 +157,7 @@ impl EventDecl {
 }
 
 impl fmt::Display for StructDecl {
-    /// Make the struct name into a string for printing. The enum can be declared either
+    /// Make the struct name into a string for printing. The struct can be declared either
     /// inside or outside a contract.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.contract {
@@ -132,20 +187,26 @@ impl fmt::Display for EnumDecl {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct Parameter {
     pub loc: pt::Loc,
-    // The name can empty (e.g. in an event field or unnamed parameter/return)
-    pub name: Option<pt::Identifier>,
+    /// The name can empty (e.g. in an event field or unnamed parameter/return)
+    pub id: Option<pt::Identifier>,
     pub ty: Type,
-    pub ty_loc: pt::Loc,
+    /// Yul function parameters may not have a type identifier
+    pub ty_loc: Option<pt::Loc>,
+    /// Event fields may indexed, which means they are sent to the log
     pub indexed: bool,
+    /// Some builtin structs have readonly fields
     pub readonly: bool,
+    /// A struct may contain itself which make the struct infinite size in
+    /// memory. This boolean specifies which field introduces the recursion.
+    pub recursive: bool,
 }
 
 impl Parameter {
     pub fn name_as_str(&self) -> &str {
-        if let Some(name) = &self.name {
+        if let Some(name) = &self.id {
             name.name.as_str()
         } else {
             ""
@@ -188,8 +249,8 @@ pub struct Function {
     pub signature: String,
     pub mutability: Mutability,
     pub visibility: pt::Visibility,
-    pub params: Vec<Parameter>,
-    pub returns: Vec<Parameter>,
+    pub params: Arc<Vec<Parameter>>,
+    pub returns: Arc<Vec<Parameter>>,
     // constructor arguments for base contracts, only present on constructors
     pub bases: BTreeMap<usize, (pt::Loc, usize, Vec<Expression>)>,
     // modifiers for functions
@@ -205,6 +266,28 @@ pub struct Function {
     pub symtable: Symtable,
     // What events are emitted by the body of this function
     pub emits_events: Vec<usize>,
+}
+
+/// This trait provides a single interface for fetching paramenters, returns and the symbol table
+/// for both yul and solidity functions
+pub trait FunctionAttributes {
+    fn get_symbol_table(&self) -> &Symtable;
+    fn get_parameters(&self) -> &Vec<Parameter>;
+    fn get_returns(&self) -> &Vec<Parameter>;
+}
+
+impl FunctionAttributes for Function {
+    fn get_symbol_table(&self) -> &Symtable {
+        &self.symtable
+    }
+
+    fn get_parameters(&self) -> &Vec<Parameter> {
+        &self.params
+    }
+
+    fn get_returns(&self) -> &Vec<Parameter> {
+        &self.returns
+    }
 }
 
 impl Function {
@@ -243,8 +326,8 @@ impl Function {
             signature,
             mutability,
             visibility,
-            params,
-            returns,
+            params: Arc::new(params),
+            returns: Arc::new(returns),
             bases: BTreeMap::new(),
             modifiers: Vec::new(),
             is_virtual: false,
@@ -291,25 +374,6 @@ impl Function {
         matches!(self.visibility, pt::Visibility::Private(_))
     }
 
-    /// Return a unique string for this function which is a valid llvm symbol
-    pub fn llvm_symbol(&self, ns: &Namespace) -> String {
-        let mut sig = self.name.to_owned();
-
-        if !self.params.is_empty() {
-            sig.push_str("__");
-
-            for (i, p) in self.params.iter().enumerate() {
-                if i > 0 {
-                    sig.push('_');
-                }
-
-                sig.push_str(&p.ty.to_llvm_string(ns));
-            }
-        }
-
-        sig
-    }
-
     /// Print the function type, contract name, and name
     pub fn print_name(&self, ns: &Namespace) -> String {
         if let Some(contract_no) = &self.contract_no {
@@ -343,6 +407,26 @@ impl From<&pt::Type> for Type {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct UserTypeDecl {
+    pub tags: Vec<Tag>,
+    pub loc: pt::Loc,
+    pub name: String,
+    pub ty: Type,
+    pub contract: Option<String>,
+}
+
+impl fmt::Display for UserTypeDecl {
+    /// Make the user type name into a string for printing. The user type can
+    /// be declared either inside or outside a contract.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.contract {
+            Some(c) => write!(f, "{}.{}", c, self.name),
+            None => write!(f, "{}", self.name),
+        }
+    }
+}
+
 pub struct Variable {
     pub tags: Vec<Tag>,
     pub name: String,
@@ -356,30 +440,33 @@ pub struct Variable {
     pub read: bool,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Symbol {
     Enum(pt::Loc, usize),
     Function(Vec<(pt::Loc, usize)>),
     Variable(pt::Loc, Option<usize>, usize),
-    Struct(pt::Loc, usize),
+    Struct(pt::Loc, StructType),
     Event(Vec<(pt::Loc, usize)>),
     Contract(pt::Loc, usize),
     Import(pt::Loc, usize),
+    UserType(pt::Loc, usize),
+}
+
+impl CodeLocation for Symbol {
+    fn loc(&self) -> pt::Loc {
+        match self {
+            Symbol::Enum(loc, _)
+            | Symbol::Variable(loc, ..)
+            | Symbol::Struct(loc, _)
+            | Symbol::Contract(loc, _)
+            | Symbol::Import(loc, _)
+            | Symbol::UserType(loc, _) => *loc,
+            Symbol::Event(items) | Symbol::Function(items) => items[0].0,
+        }
+    }
 }
 
 impl Symbol {
-    pub fn loc(&self) -> &pt::Loc {
-        match self {
-            Symbol::Enum(loc, _) => loc,
-            Symbol::Function(funcs) => &funcs[0].0,
-            Symbol::Variable(loc, ..) => loc,
-            Symbol::Struct(loc, _) => loc,
-            Symbol::Event(events) => &events[0].0,
-            Symbol::Contract(loc, _) => loc,
-            Symbol::Import(loc, _) => loc,
-        }
-    }
-
     /// Is this symbol for an event
     pub fn is_event(&self) -> bool {
         matches!(self, Symbol::Event(_))
@@ -396,17 +483,29 @@ impl Symbol {
             false
         }
     }
+
+    /// Is this a private symbol
+    pub fn is_private_variable(&self, ns: &Namespace) -> bool {
+        match self {
+            Symbol::Variable(_, Some(contract_no), var_no) => {
+                let visibility = &ns.contracts[*contract_no].variables[*var_no].visibility;
+
+                matches!(visibility, pt::Visibility::Private(_))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Any Solidity file, either the main file or anything that was imported
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct File {
     /// The on-disk filename
     pub path: PathBuf,
     /// Used for offset to line-column conversions
     pub line_starts: Vec<usize>,
     /// Indicates the file number in FileResolver.files
-    pub cache_no: usize,
+    pub cache_no: Option<usize>,
 }
 
 /// When resolving a Solidity file, this holds all the resolved items
@@ -417,15 +516,21 @@ pub struct Namespace {
     pub structs: Vec<StructDecl>,
     pub events: Vec<EventDecl>,
     pub contracts: Vec<Contract>,
+    /// Global using declarations
+    pub using: Vec<Using>,
+    /// All type declarations
+    pub user_types: Vec<UserTypeDecl>,
     /// All functions
     pub functions: Vec<Function>,
+    /// Yul functions
+    pub yul_functions: Vec<YulFunction>,
     /// Global constants
     pub constants: Vec<Variable>,
     /// address length in bytes
     pub address_length: usize,
     /// value length in bytes
     pub value_length: usize,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Diagnostics,
     /// There is a separate namespace for functions and non-functions
     pub function_symbols: HashMap<(usize, Option<usize>, String), Symbol>,
     /// Symbol key is file_no, contract, identifier
@@ -434,7 +539,7 @@ pub struct Namespace {
     pub next_id: usize,
     /// For a variable reference at a location, give the constant value
     /// This for use by the language server to show the value of a variable at a location
-    pub var_constants: HashMap<pt::Loc, Expression>,
+    pub var_constants: HashMap<pt::Loc, codegen::Expression>,
     /// Overrides for hover in the language server
     pub hover_overrides: HashMap<pt::Loc, String>,
 }
@@ -452,18 +557,30 @@ pub struct Base {
     pub constructor: Option<(usize, Vec<Expression>)>,
 }
 
+pub struct Using {
+    pub list: UsingList,
+    pub ty: Option<Type>,
+    pub file_no: Option<usize>,
+}
+
+pub enum UsingList {
+    Library(usize),
+    Functions(Vec<usize>),
+}
+
 pub struct Contract {
     pub tags: Vec<Tag>,
     pub loc: pt::Loc,
     pub ty: pt::ContractTy,
     pub name: String,
     pub bases: Vec<Base>,
-    pub using: Vec<(usize, Option<Type>)>,
+    pub using: Vec<Using>,
     pub layout: Vec<Layout>,
     pub fixed_layout_size: BigInt,
     pub functions: Vec<usize>,
     pub all_functions: BTreeMap<usize, usize>,
     pub virtual_functions: HashMap<String, usize>,
+    pub yul_functions: Vec<usize>,
     pub variables: Vec<Variable>,
     // List of contracts this contract instantiates
     pub creates: Vec<usize>,
@@ -516,9 +633,8 @@ impl Contract {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Expression {
-    FunctionArg(pt::Loc, Type, usize),
     BoolLiteral(pt::Loc, bool),
     BytesLiteral(pt::Loc, Type, Vec<u8>),
     CodeLiteral(pt::Loc, usize, bool),
@@ -585,8 +701,17 @@ pub enum Expression {
         array: Box<Expression>,
         elem_ty: Type,
     },
-    StringCompare(pt::Loc, StringLocation, StringLocation),
-    StringConcat(pt::Loc, Type, StringLocation, StringLocation),
+    StringCompare(
+        pt::Loc,
+        StringLocation<Expression>,
+        StringLocation<Expression>,
+    ),
+    StringConcat(
+        pt::Loc,
+        Type,
+        StringLocation<Expression>,
+        StringLocation<Expression>,
+    ),
 
     Or(pt::Loc, Box<Expression>, Box<Expression>),
     And(pt::Loc, Box<Expression>, Box<Expression>),
@@ -613,421 +738,59 @@ pub enum Expression {
         returns: Vec<Type>,
         function: Box<Expression>,
         args: Vec<Expression>,
-        value: Option<Box<Expression>>,
-        gas: Option<Box<Expression>>,
+        call_args: CallArgs,
     },
     ExternalFunctionCallRaw {
         loc: pt::Loc,
         ty: CallTy,
         address: Box<Expression>,
         args: Box<Expression>,
-        value: Option<Box<Expression>>,
-        gas: Option<Box<Expression>>,
+        call_args: CallArgs,
     },
     Constructor {
         loc: pt::Loc,
         contract_no: usize,
         constructor_no: Option<usize>,
         args: Vec<Expression>,
-        gas: Option<Box<Expression>>,
-        value: Option<Box<Expression>>,
-        salt: Option<Box<Expression>>,
-        space: Option<Box<Expression>>,
+        call_args: CallArgs,
     },
     FormatString(pt::Loc, Vec<(FormatArg, Expression)>),
     Builtin(pt::Loc, Vec<Type>, Builtin, Vec<Expression>),
     InterfaceId(pt::Loc, usize),
     List(pt::Loc, Vec<Expression>),
-    // The remaining types are only generated during codegen
-    Keccak256(pt::Loc, Type, Vec<Expression>),
-    ReturnData(pt::Loc),
-    AbiEncode {
-        loc: pt::Loc,
-        tys: Vec<Type>,
-        packed: Vec<Expression>,
-        args: Vec<Expression>,
-    },
-    InternalFunctionCfg(usize),
-    Undefined(Type),
-    Poison,
 }
 
-impl Expression {
-    /// Recurse over expression and copy each element through a filter. This allows the optimizer passes to create
-    /// copies of expressions while modifying the results slightly
-    #[must_use]
-    pub fn copy_filter<T, F>(&self, ctx: &mut T, filter: F) -> Expression
-    where
-        F: Fn(&Expression, &mut T) -> Expression,
-    {
-        filter(
-            &match self {
-                Expression::StructLiteral(loc, ty, args) => Expression::StructLiteral(
-                    *loc,
-                    ty.clone(),
-                    args.iter().map(|e| filter(e, ctx)).collect(),
-                ),
-                Expression::ArrayLiteral(loc, ty, lengths, args) => Expression::ArrayLiteral(
-                    *loc,
-                    ty.clone(),
-                    lengths.clone(),
-                    args.iter().map(|e| filter(e, ctx)).collect(),
-                ),
-                Expression::ConstArrayLiteral(loc, ty, lengths, args) => {
-                    Expression::ConstArrayLiteral(
-                        *loc,
-                        ty.clone(),
-                        lengths.clone(),
-                        args.iter().map(|e| filter(e, ctx)).collect(),
-                    )
-                }
-                Expression::Add(loc, ty, unchecked, left, right) => Expression::Add(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Subtract(loc, ty, unchecked, left, right) => Expression::Subtract(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Multiply(loc, ty, unchecked, left, right) => Expression::Multiply(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Divide(loc, ty, left, right) => Expression::Divide(
-                    *loc,
-                    ty.clone(),
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Power(loc, ty, unchecked, left, right) => Expression::Power(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::BitwiseOr(loc, ty, left, right) => Expression::BitwiseOr(
-                    *loc,
-                    ty.clone(),
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::BitwiseAnd(loc, ty, left, right) => Expression::BitwiseAnd(
-                    *loc,
-                    ty.clone(),
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::BitwiseXor(loc, ty, left, right) => Expression::BitwiseXor(
-                    *loc,
-                    ty.clone(),
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::ShiftLeft(loc, ty, left, right) => Expression::ShiftLeft(
-                    *loc,
-                    ty.clone(),
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::ShiftRight(loc, ty, left, right, sign_extend) => {
-                    Expression::ShiftRight(
-                        *loc,
-                        ty.clone(),
-                        Box::new(filter(left, ctx)),
-                        Box::new(filter(right, ctx)),
-                        *sign_extend,
-                    )
-                }
-                Expression::Load(loc, ty, expr) => {
-                    Expression::Load(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::StorageLoad(loc, ty, expr) => {
-                    Expression::StorageLoad(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::ZeroExt(loc, ty, expr) => {
-                    Expression::ZeroExt(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::SignExt(loc, ty, expr) => {
-                    Expression::SignExt(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::Trunc(loc, ty, expr) => {
-                    Expression::Trunc(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::Cast(loc, ty, expr) => {
-                    Expression::Cast(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::BytesCast(loc, ty, from, expr) => Expression::BytesCast(
-                    *loc,
-                    ty.clone(),
-                    from.clone(),
-                    Box::new(filter(expr, ctx)),
-                ),
-                Expression::PreIncrement(loc, ty, unchecked, expr) => Expression::PreIncrement(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(expr, ctx)),
-                ),
-                Expression::PreDecrement(loc, ty, unchecked, expr) => Expression::PreDecrement(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(expr, ctx)),
-                ),
-                Expression::PostIncrement(loc, ty, unchecked, expr) => Expression::PostIncrement(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(expr, ctx)),
-                ),
-                Expression::PostDecrement(loc, ty, unchecked, expr) => Expression::PostDecrement(
-                    *loc,
-                    ty.clone(),
-                    *unchecked,
-                    Box::new(filter(expr, ctx)),
-                ),
-                Expression::Assign(loc, ty, left, right) => Expression::Assign(
-                    *loc,
-                    ty.clone(),
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::More(loc, left, right) => Expression::More(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Less(loc, left, right) => Expression::Less(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::MoreEqual(loc, left, right) => Expression::MoreEqual(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::LessEqual(loc, left, right) => Expression::LessEqual(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Equal(loc, left, right) => Expression::Equal(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::NotEqual(loc, left, right) => Expression::NotEqual(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Not(loc, expr) => Expression::Not(*loc, Box::new(filter(expr, ctx))),
-                Expression::Complement(loc, ty, expr) => {
-                    Expression::Complement(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::UnaryMinus(loc, ty, expr) => {
-                    Expression::UnaryMinus(*loc, ty.clone(), Box::new(filter(expr, ctx)))
-                }
-                Expression::Ternary(loc, ty, cond, left, right) => Expression::Ternary(
-                    *loc,
-                    ty.clone(),
-                    Box::new(filter(cond, ctx)),
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::Subscript(loc, elem_ty, array_ty, left, right) => {
-                    Expression::Subscript(
-                        *loc,
-                        elem_ty.clone(),
-                        array_ty.clone(),
-                        Box::new(filter(left, ctx)),
-                        Box::new(filter(right, ctx)),
-                    )
-                }
-                Expression::StructMember(loc, ty, expr, field) => {
-                    Expression::StructMember(*loc, ty.clone(), Box::new(filter(expr, ctx)), *field)
-                }
-                Expression::AllocDynamicArray(loc, ty, expr, initializer) => {
-                    Expression::AllocDynamicArray(
-                        *loc,
-                        ty.clone(),
-                        Box::new(filter(expr, ctx)),
-                        initializer.clone(),
-                    )
-                }
-                Expression::StorageArrayLength {
-                    loc,
-                    ty,
-                    array,
-                    elem_ty,
-                } => Expression::StorageArrayLength {
-                    loc: *loc,
-                    ty: ty.clone(),
-                    array: Box::new(filter(array, ctx)),
-                    elem_ty: elem_ty.clone(),
-                },
-                Expression::StringCompare(loc, left, right) => Expression::StringCompare(
-                    *loc,
-                    match left {
-                        StringLocation::CompileTime(_) => left.clone(),
-                        StringLocation::RunTime(expr) => {
-                            StringLocation::RunTime(Box::new(filter(expr, ctx)))
-                        }
-                    },
-                    match right {
-                        StringLocation::CompileTime(_) => right.clone(),
-                        StringLocation::RunTime(expr) => {
-                            StringLocation::RunTime(Box::new(filter(expr, ctx)))
-                        }
-                    },
-                ),
-                Expression::StringConcat(loc, ty, left, right) => Expression::StringConcat(
-                    *loc,
-                    ty.clone(),
-                    match left {
-                        StringLocation::CompileTime(_) => left.clone(),
-                        StringLocation::RunTime(expr) => {
-                            StringLocation::RunTime(Box::new(filter(expr, ctx)))
-                        }
-                    },
-                    match right {
-                        StringLocation::CompileTime(_) => right.clone(),
-                        StringLocation::RunTime(expr) => {
-                            StringLocation::RunTime(Box::new(filter(expr, ctx)))
-                        }
-                    },
-                ),
-                Expression::Or(loc, left, right) => Expression::Or(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::And(loc, left, right) => Expression::And(
-                    *loc,
-                    Box::new(filter(left, ctx)),
-                    Box::new(filter(right, ctx)),
-                ),
-                Expression::ExternalFunction {
-                    loc,
-                    ty,
-                    address,
-                    function_no,
-                } => Expression::ExternalFunction {
-                    loc: *loc,
-                    ty: ty.clone(),
-                    address: Box::new(filter(address, ctx)),
-                    function_no: *function_no,
-                },
-                Expression::InternalFunctionCall {
-                    loc,
-                    returns,
-                    function,
-                    args,
-                } => Expression::InternalFunctionCall {
-                    loc: *loc,
-                    returns: returns.clone(),
-                    function: Box::new(filter(function, ctx)),
-                    args: args.iter().map(|e| filter(e, ctx)).collect(),
-                },
-                Expression::ExternalFunctionCall {
-                    loc,
-                    returns,
-                    function,
-                    args,
-                    value,
-                    gas,
-                } => Expression::ExternalFunctionCall {
-                    loc: *loc,
-                    returns: returns.clone(),
-                    function: Box::new(filter(function, ctx)),
-                    args: args.iter().map(|e| filter(e, ctx)).collect(),
-                    value: value.as_ref().map(|value| Box::new(filter(value, ctx))),
-                    gas: gas.as_ref().map(|gas| Box::new(filter(gas, ctx))),
-                },
-                Expression::ExternalFunctionCallRaw {
-                    loc,
-                    ty,
-                    address,
-                    args,
-                    value,
-                    gas,
-                } => Expression::ExternalFunctionCallRaw {
-                    loc: *loc,
-                    ty: ty.clone(),
-                    address: Box::new(filter(address, ctx)),
-                    args: Box::new(filter(args, ctx)),
-                    value: value.as_ref().map(|value| Box::new(filter(value, ctx))),
-                    gas: gas.as_ref().map(|gas| Box::new(filter(gas, ctx))),
-                },
-                Expression::Constructor {
-                    loc,
-                    contract_no,
-                    constructor_no,
-                    args,
-                    gas,
-                    value,
-                    salt,
-                    space,
-                } => Expression::Constructor {
-                    loc: *loc,
-                    contract_no: *contract_no,
-                    constructor_no: *constructor_no,
-                    args: args.iter().map(|e| filter(e, ctx)).collect(),
-                    value: value.as_ref().map(|e| Box::new(filter(e, ctx))),
-                    gas: gas.as_ref().map(|e| Box::new(filter(e, ctx))),
-                    salt: salt.as_ref().map(|e| Box::new(filter(e, ctx))),
-                    space: space.as_ref().map(|e| Box::new(filter(e, ctx))),
-                },
-                Expression::Keccak256(loc, ty, args) => {
-                    let args = args.iter().map(|e| filter(e, ctx)).collect();
+#[derive(PartialEq, Eq, Clone, Default, Debug)]
+pub struct CallArgs {
+    pub gas: Option<Box<Expression>>,
+    pub salt: Option<Box<Expression>>,
+    pub value: Option<Box<Expression>>,
+    pub space: Option<Box<Expression>>,
+    pub accounts: Option<Box<Expression>>,
+    pub seeds: Option<Box<Expression>>,
+}
 
-                    Expression::Keccak256(*loc, ty.clone(), args)
-                }
-                Expression::FormatString(loc, args) => {
-                    let args = args.iter().map(|(f, e)| (*f, filter(e, ctx))).collect();
-
-                    Expression::FormatString(*loc, args)
-                }
-                Expression::Builtin(loc, tys, builtin, args) => {
-                    let args = args.iter().map(|e| filter(e, ctx)).collect();
-
-                    Expression::Builtin(*loc, tys.clone(), *builtin, args)
-                }
-                Expression::AbiEncode {
-                    loc,
-                    tys,
-                    packed,
-                    args,
-                } => {
-                    let packed = packed.iter().map(|e| filter(e, ctx)).collect();
-                    let args = args.iter().map(|e| filter(e, ctx)).collect();
-
-                    Expression::AbiEncode {
-                        loc: *loc,
-                        tys: tys.clone(),
-                        packed,
-                        args,
-                    }
-                }
-                _ => self.clone(),
-            },
-            ctx,
-        )
+impl Recurse for CallArgs {
+    type ArgType = Expression;
+    fn recurse<T>(&self, cx: &mut T, f: fn(expr: &Expression, ctx: &mut T) -> bool) {
+        if let Some(gas) = &self.gas {
+            f(gas, cx);
+        }
+        if let Some(salt) = &self.salt {
+            f(salt, cx);
+        }
+        if let Some(value) = &self.value {
+            f(value, cx);
+        }
+        if let Some(accounts) = &self.accounts {
+            f(accounts, cx);
+        }
     }
+}
 
-    /// recurse over the expression
-    pub fn recurse<T>(&self, cx: &mut T, f: fn(expr: &Expression, ctx: &mut T) -> bool) {
+impl Recurse for Expression {
+    type ArgType = Expression;
+    fn recurse<T>(&self, cx: &mut T, f: fn(expr: &Expression, ctx: &mut T) -> bool) {
         if f(self, cx) {
             match self {
                 Expression::StructLiteral(_, _, exprs)
@@ -1116,69 +879,35 @@ impl Expression {
                 Expression::ExternalFunctionCall {
                     function,
                     args,
-                    value,
-                    gas,
+                    call_args,
                     ..
                 } => {
                     for e in args {
                         e.recurse(cx, f);
                     }
                     function.recurse(cx, f);
-                    if let Some(value) = value {
-                        value.recurse(cx, f);
-                    }
-                    if let Some(gas) = gas {
-                        gas.recurse(cx, f);
-                    }
+                    call_args.recurse(cx, f);
                 }
                 Expression::ExternalFunctionCallRaw {
                     address,
                     args,
-                    value,
-                    gas,
+                    call_args,
                     ..
                 } => {
                     args.recurse(cx, f);
                     address.recurse(cx, f);
-                    if let Some(value) = value {
-                        value.recurse(cx, f);
-                    }
-                    if let Some(gas) = gas {
-                        gas.recurse(cx, f);
-                    }
+                    call_args.recurse(cx, f);
                 }
                 Expression::Constructor {
-                    args,
-                    value,
-                    gas,
-                    salt,
-                    ..
+                    args, call_args, ..
                 } => {
                     for e in args {
                         e.recurse(cx, f);
                     }
-                    if let Some(value) = value {
-                        value.recurse(cx, f);
-                    }
-                    if let Some(gas) = gas {
-                        gas.recurse(cx, f);
-                    }
-                    if let Some(salt) = salt {
-                        salt.recurse(cx, f);
-                    }
+                    call_args.recurse(cx, f);
                 }
-                Expression::Builtin(_, _, _, exprs)
-                | Expression::List(_, exprs)
-                | Expression::Keccak256(_, _, exprs) => {
+                Expression::Builtin(_, _, _, exprs) | Expression::List(_, exprs) => {
                     for e in exprs {
-                        e.recurse(cx, f);
-                    }
-                }
-                Expression::AbiEncode { packed, args, .. } => {
-                    for e in packed {
-                        e.recurse(cx, f);
-                    }
-                    for e in args {
                         e.recurse(cx, f);
                     }
                 }
@@ -1186,12 +915,12 @@ impl Expression {
             }
         }
     }
+}
 
-    /// Return the location for this expression
-    pub fn loc(&self) -> pt::Loc {
+impl CodeLocation for Expression {
+    fn loc(&self) -> pt::Loc {
         match self {
-            Expression::FunctionArg(loc, ..)
-            | Expression::BoolLiteral(loc, _)
+            Expression::BoolLiteral(loc, _)
             | Expression::BytesLiteral(loc, ..)
             | Expression::CodeLiteral(loc, ..)
             | Expression::NumberLiteral(loc, ..)
@@ -1239,8 +968,6 @@ impl Expression {
             | Expression::StorageArrayLength { loc, .. }
             | Expression::StringCompare(loc, ..)
             | Expression::StringConcat(loc, ..)
-            | Expression::Keccak256(loc, ..)
-            | Expression::ReturnData(loc)
             | Expression::InternalFunction { loc, .. }
             | Expression::ExternalFunction { loc, .. }
             | Expression::InternalFunctionCall { loc, .. }
@@ -1255,17 +982,81 @@ impl Expression {
             | Expression::Assign(loc, ..)
             | Expression::List(loc, _)
             | Expression::FormatString(loc, _)
-            | Expression::AbiEncode { loc, .. }
             | Expression::InterfaceId(loc, ..)
             | Expression::And(loc, ..) => *loc,
-            Expression::InternalFunctionCfg(_) | Expression::Undefined(_) | Expression::Poison => {
-                unreachable!()
-            }
         }
     }
 }
 
-#[derive(PartialEq, Clone, Copy, Debug)]
+impl CodeLocation for Statement {
+    fn loc(&self) -> pt::Loc {
+        match self {
+            Statement::Block { loc, .. }
+            | Statement::VariableDecl(loc, ..)
+            | Statement::If(loc, ..)
+            | Statement::While(loc, ..)
+            | Statement::For { loc, .. }
+            | Statement::DoWhile(loc, ..)
+            | Statement::Expression(loc, ..)
+            | Statement::Delete(loc, ..)
+            | Statement::Destructure(loc, ..)
+            | Statement::Continue(loc, ..)
+            | Statement::Break(loc, ..)
+            | Statement::Return(loc, ..)
+            | Statement::Emit { loc, .. }
+            | Statement::TryCatch(loc, ..)
+            | Statement::Underscore(loc, ..) => *loc,
+            Statement::Assembly(..) => pt::Loc::Codegen,
+        }
+    }
+}
+
+impl CodeLocation for Instr {
+    fn loc(&self) -> pt::Loc {
+        match self {
+            Instr::Set { loc, expr, .. } => match loc {
+                pt::Loc::File(_, _, _) => *loc,
+                _ => expr.loc(),
+            },
+            Instr::Call { args, .. } if args.is_empty() => pt::Loc::Codegen,
+            Instr::Call { args, .. } => args[0].loc(),
+            Instr::Return { value } if value.is_empty() => pt::Loc::Codegen,
+            Instr::Return { value } => value[0].loc(),
+            Instr::EmitEvent { data, .. } if data.is_empty() => pt::Loc::Codegen,
+            Instr::EmitEvent { data, .. } => data[0].loc(),
+            Instr::BranchCond { cond, .. } => cond.loc(),
+            Instr::Store { dest, .. } => dest.loc(),
+            Instr::SetStorageBytes { storage, .. }
+            | Instr::PushStorage { storage, .. }
+            | Instr::PopStorage { storage, .. }
+            | Instr::LoadStorage { storage, .. }
+            | Instr::ClearStorage { storage, .. } => storage.loc(),
+            Instr::ExternalCall { value, .. } | Instr::SetStorage { value, .. } => value.loc(),
+            Instr::PushMemory { value, .. } => value.loc(),
+            Instr::Constructor { gas, .. } => gas.loc(),
+            Instr::ValueTransfer { address, .. } => address.loc(),
+            Instr::AbiDecode { data, .. } => data.loc(),
+            Instr::SelfDestruct { recipient } => recipient.loc(),
+            Instr::WriteBuffer { buf, .. } => buf.loc(),
+            Instr::Print { expr } => expr.loc(),
+            Instr::MemCopy {
+                source,
+                destination,
+                ..
+            } => match source.loc() {
+                pt::Loc::File(_, _, _) => source.loc(),
+                _ => destination.loc(),
+            },
+            Instr::Branch { .. }
+            | Instr::Unreachable
+            | Instr::Nop
+            | Instr::AssertFailure { .. }
+            | Instr::PopMemory { .. } => pt::Loc::Codegen,
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug, Eq)]
 pub enum FormatArg {
     StringLiteral,
     Default,
@@ -1284,13 +1075,13 @@ impl fmt::Display for FormatArg {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
-pub enum StringLocation {
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub enum StringLocation<T> {
     CompileTime(Vec<u8>),
-    RunTime(Box<Expression>),
+    RunTime(Box<T>),
 }
 
-#[derive(PartialEq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Builtin {
     GetAddress,
     Balance,
@@ -1315,6 +1106,7 @@ pub enum Builtin {
     GasLimit,
     BlockNumber,
     Slot,
+    ProgramId,
     Timestamp,
     Calldata,
     Sender,
@@ -1364,9 +1156,11 @@ pub enum Builtin {
     WriteUint256LE,
     WriteAddress,
     Accounts,
+    UserTypeWrap,
+    UserTypeUnwrap,
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum CallTy {
     Regular,
     Delegate,
@@ -1391,7 +1185,7 @@ pub enum Statement {
         unchecked: bool,
         statements: Vec<Statement>,
     },
-    VariableDecl(pt::Loc, usize, Parameter, Option<Expression>),
+    VariableDecl(pt::Loc, usize, Parameter, Option<Arc<Expression>>),
     If(pt::Loc, bool, Expression, Vec<Statement>, Vec<Statement>),
     While(pt::Loc, bool, Expression, Vec<Statement>),
     For {
@@ -1417,7 +1211,7 @@ pub enum Statement {
     },
     TryCatch(pt::Loc, bool, TryCatch),
     Underscore(pt::Loc),
-    AssemblyBlock(Vec<AssemblyStatement>),
+    Assembly(InlineAssembly, bool),
 }
 
 #[derive(Clone, Debug)]
@@ -1439,8 +1233,8 @@ pub enum DestructureField {
     VariableDecl(usize, Parameter),
 }
 
-impl DestructureField {
-    pub fn loc(&self) -> Option<pt::Loc> {
+impl OptionalCodeLocation for DestructureField {
+    fn loc(&self) -> Option<pt::Loc> {
         match self {
             DestructureField::None => None,
             DestructureField::Expression(e) => Some(e.loc()),
@@ -1449,9 +1243,9 @@ impl DestructureField {
     }
 }
 
-impl Statement {
-    /// recurse over the statement
-    pub fn recurse<T>(&self, cx: &mut T, f: fn(stmt: &Statement, ctx: &mut T) -> bool) {
+impl Recurse for Statement {
+    type ArgType = Statement;
+    fn recurse<T>(&self, cx: &mut T, f: fn(stmt: &Statement, ctx: &mut T) -> bool) {
         if f(self, cx) {
             match self {
                 Statement::Block { statements, .. } => {
@@ -1512,7 +1306,9 @@ impl Statement {
             }
         }
     }
+}
 
+impl Statement {
     /// Shorthand for checking underscore
     pub fn is_underscore(&self) -> bool {
         matches!(&self, Statement::Underscore(_))
@@ -1521,23 +1317,26 @@ impl Statement {
     pub fn reachable(&self) -> bool {
         match self {
             Statement::Block { statements, .. } => statements.iter().all(|s| s.reachable()),
-            Statement::Underscore(_) | Statement::Destructure(..) | Statement::VariableDecl(..) => {
-                true
-            }
+            Statement::Underscore(_)
+            | Statement::Destructure(..)
+            | Statement::VariableDecl(..)
+            | Statement::Emit { .. }
+            | Statement::Delete(..) => true,
+
+            Statement::Continue(_) | Statement::Break(_) | Statement::Return(..) => false,
+
             Statement::If(_, reachable, ..)
             | Statement::While(_, reachable, ..)
             | Statement::DoWhile(_, reachable, ..)
-            | Statement::Expression(_, reachable, _) => *reachable,
-            Statement::Emit { .. } => true,
-            Statement::Delete(..) => true,
-            Statement::Continue(_) | Statement::Break(_) | Statement::Return(..) => false,
-            Statement::For { reachable, .. } | Statement::TryCatch(_, reachable, _) => *reachable,
-            Statement::AssemblyBlock(_) => unimplemented!("Assembly block ast not ready"),
+            | Statement::Expression(_, reachable, _)
+            | Statement::For { reachable, .. }
+            | Statement::TryCatch(_, reachable, _)
+            | Statement::Assembly(_, reachable) => *reachable,
         }
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct Tag {
     pub tag: String,
     pub no: usize,

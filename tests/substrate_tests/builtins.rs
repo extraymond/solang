@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use parity_scale_codec::{Decode, Encode};
 
 use crate::build_solidity;
@@ -446,9 +448,9 @@ fn functions() {
 
 #[test]
 fn data() {
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Uint32(u32);
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct String(Vec<u8>);
 
     let mut runtime = build_solidity(
@@ -679,7 +681,7 @@ fn mulmod() {
 
 #[test]
 fn my_token() {
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct TokenTest([u8; 32], bool);
     let mut runtime = build_solidity(
         "
@@ -704,4 +706,16 @@ fn my_token() {
 
     runtime.function("test", TokenTest(addr, false).encode());
     assert_eq!(&runtime.vm.output[..], &addr[..]);
+
+    runtime.function(
+        "test",
+        TokenTest(<[u8; 32]>::try_from(&runtime.vm.caller[..]).unwrap(), true).encode(),
+    );
+    assert_eq!(&runtime.vm.caller[..], &runtime.vm.output[..]);
+
+    runtime.function(
+        "test",
+        TokenTest(<[u8; 32]>::try_from(&runtime.vm.caller[..]).unwrap(), false).encode(),
+    );
+    assert_eq!(&runtime.vm.caller[..], &runtime.vm.output[..]);
 }

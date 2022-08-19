@@ -1,13 +1,15 @@
-use crate::parser::pt;
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::codegen::{Builtin, Expression};
+use crate::sema::ast::RetrieveType;
 use crate::sema::ast::{
-    Builtin, BuiltinStruct, CallTy, Contract, Expression, FormatArg, Namespace, Parameter,
-    StringLocation, Type,
+    ArrayLength, CallTy, Contract, FormatArg, Function, Namespace, Parameter, StringLocation,
+    StructType, Type,
 };
-use std::cell::RefCell;
+use solang_parser::pt;
+// use solang_parser::pt::Loc;
 use std::convert::TryFrom;
-use std::ffi::CStr;
 use std::fmt;
-use std::path::Path;
 use std::str;
 
 use num_bigint::{BigInt, Sign};
@@ -16,39 +18,32 @@ use num_traits::ToPrimitive;
 use std::collections::{HashMap, VecDeque};
 
 use crate::Target;
-use inkwell::builder::Builder;
-use inkwell::context::Context;
-use inkwell::memory_buffer::MemoryBuffer;
-use inkwell::module::{Linkage, Module};
-use inkwell::passes::PassManager;
-use inkwell::targets::{CodeModel, FileType, RelocMode, TargetTriple};
-use inkwell::types::{
-    ArrayType, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, IntType, StringRadix,
-};
+use inkwell::debug_info::AsDIScope;
+use inkwell::debug_info::DISubprogram;
+use inkwell::debug_info::DIType;
+use inkwell::module::Linkage;
+use inkwell::targets::TargetTriple;
+use inkwell::types::{BasicType, IntType, StringRadix};
 use inkwell::values::{
-    ArrayValue, BasicMetadataValueEnum, BasicValueEnum, CallableValue, FunctionValue, GlobalValue,
-    IntValue, PhiValue, PointerValue,
+    ArrayValue, BasicMetadataValueEnum, BasicValueEnum, CallableValue, FunctionValue, IntValue,
+    PhiValue, PointerValue,
 };
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
-use inkwell::OptimizationLevel;
+use solang_parser::pt::{CodeLocation, Loc};
 
+pub mod binary;
 mod ethabiencoder;
-mod ewasm;
+pub mod ewasm;
 mod loop_builder;
-mod solana;
-mod substrate;
-use once_cell::sync::OnceCell;
+pub mod solana;
+pub mod substrate;
 
-use crate::{
-    codegen::{
-        cfg::{ControlFlowGraph, HashTy, Instr, InternalCallTy},
-        vartable::Storage,
-    },
-    linker::link,
+use crate::codegen::{
+    cfg::{ControlFlowGraph, HashTy, Instr, InternalCallTy},
+    vartable::Storage,
 };
-
-static LLVM_INIT: OnceCell<()> = OnceCell::new();
+use crate::emit::binary::Binary;
 
 #[derive(Clone)]
 pub struct Variable<'a> {
@@ -248,6 +243,16 @@ pub trait TargetRuntime<'a> {
     /// Return failure without any result
     fn assert_failure<'b>(&self, bin: &'b Binary, data: PointerValue, length: IntValue);
 
+    fn builtin_function(
+        &self,
+        _binary: &Binary<'a>,
+        _func: &Function,
+        _args: &[BasicMetadataValueEnum<'a>],
+        _ns: &Namespace,
+    ) -> BasicValueEnum<'a> {
+        unimplemented!();
+    }
+
     /// Calls constructor
     fn create_contract<'b>(
         &mut self,
@@ -269,13 +274,15 @@ pub trait TargetRuntime<'a> {
     fn external_call<'b>(
         &self,
         bin: &Binary<'b>,
-        function: FunctionValue,
+        function: FunctionValue<'b>,
         success: Option<&mut BasicValueEnum<'b>>,
         payload: PointerValue<'b>,
         payload_len: IntValue<'b>,
         address: Option<PointerValue<'b>>,
         gas: IntValue<'b>,
         value: IntValue<'b>,
+        accounts: Option<(PointerValue<'b>, IntValue<'b>)>,
+        seeds: Option<(PointerValue<'b>, IntValue<'b>)>,
         ty: CallTy,
         ns: &Namespace,
     );
@@ -351,41 +358,43 @@ pub trait TargetRuntime<'a> {
 
     /// If we receive a value transfer, and we are "payable", abort with revert
     fn abort_if_value_transfer(&self, binary: &Binary, function: FunctionValue, ns: &Namespace) {
-        let value = self.value_transferred(binary, ns);
+        if ns.target != Target::Solana {
+            let value = self.value_transferred(binary, ns);
 
-        let got_value = binary.builder.build_int_compare(
-            IntPredicate::NE,
-            value,
-            binary.value_type(ns).const_zero(),
-            "is_value_transfer",
-        );
+            let got_value = binary.builder.build_int_compare(
+                IntPredicate::NE,
+                value,
+                binary.value_type(ns).const_zero(),
+                "is_value_transfer",
+            );
 
-        let not_value_transfer = binary
-            .context
-            .append_basic_block(function, "not_value_transfer");
-        let abort_value_transfer = binary
-            .context
-            .append_basic_block(function, "abort_value_transfer");
-
-        binary.builder.build_conditional_branch(
-            got_value,
-            abort_value_transfer,
-            not_value_transfer,
-        );
-
-        binary.builder.position_at_end(abort_value_transfer);
-
-        self.assert_failure(
-            binary,
-            binary
+            let not_value_transfer = binary
                 .context
-                .i8_type()
-                .ptr_type(AddressSpace::Generic)
-                .const_null(),
-            binary.context.i32_type().const_zero(),
-        );
+                .append_basic_block(function, "not_value_transfer");
+            let abort_value_transfer = binary
+                .context
+                .append_basic_block(function, "abort_value_transfer");
 
-        binary.builder.position_at_end(not_value_transfer);
+            binary.builder.build_conditional_branch(
+                got_value,
+                abort_value_transfer,
+                not_value_transfer,
+            );
+
+            binary.builder.position_at_end(abort_value_transfer);
+
+            self.assert_failure(
+                binary,
+                binary
+                    .context
+                    .i8_type()
+                    .ptr_type(AddressSpace::Generic)
+                    .const_null(),
+                binary.context.i32_type().const_zero(),
+            );
+
+            binary.builder.position_at_end(not_value_transfer);
+        }
     }
 
     /// Recursively load a type from bin storage
@@ -416,8 +425,8 @@ pub trait TargetRuntime<'a> {
     ) -> BasicValueEnum<'a> {
         match ty {
             Type::Ref(ty) => self.storage_load_slot(bin, ty, slot, slot_ptr, function, ns),
-            Type::Array(_, dim) => {
-                if let Some(d) = &dim[0] {
+            Type::Array(elem_ty, dim) => {
+                if let Some(ArrayLength::Fixed(d)) = dim.last() {
                     let llvm_ty = bin.llvm_type(ty.deref_any(), ns);
                     // LLVMSizeOf() produces an i64
                     let size = bin.builder.build_int_truncate(
@@ -462,6 +471,12 @@ pub trait TargetRuntime<'a> {
                             let val =
                                 self.storage_load_slot(bin, &ty, slot, slot_ptr, function, ns);
 
+                            let val = if ty.deref_memory().is_fixed_reference_type() {
+                                bin.builder.build_load(val.into_pointer_value(), "elem")
+                            } else {
+                                val
+                            };
+
                             bin.builder.build_store(elem, val);
                         },
                     );
@@ -478,10 +493,10 @@ pub trait TargetRuntime<'a> {
                         "size",
                     );
 
-                    let elem_ty = bin.llvm_var(&ty.array_elem(), ns);
+                    let llvm_elem_ty = bin.llvm_field_ty(elem_ty, ns);
 
                     let elem_size = bin.builder.build_int_truncate(
-                        elem_ty.size_of().unwrap(),
+                        llvm_elem_ty.size_of().unwrap(),
                         bin.context.i32_type(),
                         "size_of",
                     );
@@ -526,44 +541,25 @@ pub trait TargetRuntime<'a> {
                         size,
                         &mut elem_slot,
                         |elem_no: IntValue<'a>, slot: &mut IntValue<'a>| {
-                            let index = bin.builder.build_int_mul(elem_no, elem_size, "");
+                            let elem = bin.array_subscript(ty, dest, elem_no, ns);
 
-                            let entry = self.storage_load_slot(
-                                bin,
-                                &ty.array_elem(),
-                                slot,
-                                slot_ptr,
-                                function,
-                                ns,
-                            );
+                            let entry =
+                                self.storage_load_slot(bin, elem_ty, slot, slot_ptr, function, ns);
 
-                            let data = unsafe {
-                                bin.builder.build_gep(
-                                    dest,
-                                    &[
-                                        bin.context.i32_type().const_zero(),
-                                        bin.context.i32_type().const_int(2, false),
-                                        index,
-                                    ],
-                                    "data",
-                                )
+                            let entry = if elem_ty.deref_memory().is_fixed_reference_type() {
+                                bin.builder.build_load(entry.into_pointer_value(), "elem")
+                            } else {
+                                entry
                             };
 
-                            bin.builder.build_store(
-                                bin.builder.build_pointer_cast(
-                                    data,
-                                    elem_ty.ptr_type(AddressSpace::Generic),
-                                    "entry",
-                                ),
-                                entry,
-                            );
+                            bin.builder.build_store(elem, entry);
                         },
                     );
                     // load
                     dest.into()
                 }
             }
-            Type::Struct(n) => {
+            Type::Struct(str_ty) => {
                 let llvm_ty = bin.llvm_type(ty.deref_any(), ns);
                 // LLVMSizeOf() produces an i64
                 let size = bin.builder.build_int_truncate(
@@ -590,7 +586,7 @@ pub trait TargetRuntime<'a> {
                     "dest",
                 );
 
-                for (i, field) in ns.structs[*n].fields.iter().enumerate() {
+                for (i, field) in str_ty.definition(ns).fields.iter().enumerate() {
                     let val = self.storage_load_slot(bin, &field.ty, slot, slot_ptr, function, ns);
 
                     let elem = unsafe {
@@ -602,6 +598,13 @@ pub trait TargetRuntime<'a> {
                             ],
                             field.name_as_str(),
                         )
+                    };
+
+                    let val = if field.ty.deref_memory().is_fixed_reference_type() {
+                        bin.builder
+                            .build_load(val.into_pointer_value(), field.name_as_str())
+                    } else {
+                        val
                     };
 
                     bin.builder.build_store(elem, val);
@@ -691,6 +694,7 @@ pub trait TargetRuntime<'a> {
         &self,
         bin: &Binary<'a>,
         ty: &Type,
+        _existing: bool,
         slot: &mut IntValue<'a>,
         dest: BasicValueEnum<'a>,
         function: FunctionValue<'a>,
@@ -713,10 +717,8 @@ pub trait TargetRuntime<'a> {
         ns: &Namespace,
     ) {
         match ty.deref_any() {
-            Type::Array(_, dim) => {
-                if let Some(d) = &dim[0] {
-                    let ty = ty.array_deref();
-
+            Type::Array(elem_ty, dim) => {
+                if let Some(ArrayLength::Fixed(d)) = dim.last() {
                     bin.emit_static_loop_with_int(
                         function,
                         bin.context.i64_type().const_zero(),
@@ -731,13 +733,15 @@ pub trait TargetRuntime<'a> {
                                 )
                             };
 
-                            if ty.is_reference_type(ns) {
+                            if elem_ty.is_reference_type(ns)
+                                && !elem_ty.deref_memory().is_fixed_reference_type()
+                            {
                                 elem = bin.builder.build_load(elem, "").into_pointer_value();
                             }
 
                             self.storage_store_slot(
                                 bin,
-                                &ty,
+                                elem_ty,
                                 slot,
                                 slot_ptr,
                                 elem.into(),
@@ -745,10 +749,10 @@ pub trait TargetRuntime<'a> {
                                 ns,
                             );
 
-                            if !ty.is_reference_type(ns) {
+                            if !elem_ty.is_reference_type(ns) {
                                 *slot = bin.builder.build_int_add(
                                     *slot,
-                                    bin.number_literal(256, &ty.storage_slots(ns), ns),
+                                    bin.number_literal(256, &elem_ty.storage_slots(ns), ns),
                                     "",
                                 );
                             }
@@ -761,9 +765,9 @@ pub trait TargetRuntime<'a> {
                     let slot_ty = Type::Uint(256);
 
                     // details about our array elements
-                    let elem_ty = bin.llvm_var(&ty.array_elem(), ns);
+                    let llvm_elem_ty = bin.llvm_field_ty(elem_ty, ns);
                     let elem_size = bin.builder.build_int_truncate(
-                        elem_ty.size_of().unwrap(),
+                        llvm_elem_ty.size_of().unwrap(),
                         bin.context.i32_type(),
                         "size_of",
                     );
@@ -808,8 +812,6 @@ pub trait TargetRuntime<'a> {
                         .build_load(new_slot, "elem_slot")
                         .into_int_value();
 
-                    let ty = ty.array_deref();
-
                     bin.emit_loop_cond_first_with_int(
                         function,
                         bin.context.i32_type().const_zero(),
@@ -832,17 +834,19 @@ pub trait TargetRuntime<'a> {
 
                             let mut elem = bin.builder.build_pointer_cast(
                                 data,
-                                elem_ty.ptr_type(AddressSpace::Generic),
+                                llvm_elem_ty.ptr_type(AddressSpace::Generic),
                                 "entry",
                             );
 
-                            if ty.is_reference_type(ns) {
+                            if elem_ty.is_reference_type(ns)
+                                && !elem_ty.deref_memory().is_fixed_reference_type()
+                            {
                                 elem = bin.builder.build_load(elem, "").into_pointer_value();
                             }
 
                             self.storage_store_slot(
                                 bin,
-                                &ty,
+                                elem_ty,
                                 slot,
                                 slot_ptr,
                                 elem.into(),
@@ -850,10 +854,10 @@ pub trait TargetRuntime<'a> {
                                 ns,
                             );
 
-                            if !ty.is_reference_type(ns) {
+                            if !elem_ty.is_reference_type(ns) {
                                 *slot = bin.builder.build_int_add(
                                     *slot,
-                                    bin.number_literal(256, &ty.storage_slots(ns), ns),
+                                    bin.number_literal(256, &elem_ty.storage_slots(ns), ns),
                                     "",
                                 );
                             }
@@ -868,12 +872,12 @@ pub trait TargetRuntime<'a> {
                         previous_size,
                         &mut elem_slot,
                         |_: IntValue<'a>, slot: &mut IntValue<'a>| {
-                            self.storage_delete_slot(bin, &ty, slot, slot_ptr, function, ns);
+                            self.storage_delete_slot(bin, elem_ty, slot, slot_ptr, function, ns);
 
-                            if !ty.is_reference_type(ns) {
+                            if !elem_ty.is_reference_type(ns) {
                                 *slot = bin.builder.build_int_add(
                                     *slot,
-                                    bin.number_literal(256, &ty.storage_slots(ns), ns),
+                                    bin.number_literal(256, &elem_ty.storage_slots(ns), ns),
                                     "",
                                 );
                             }
@@ -881,8 +885,8 @@ pub trait TargetRuntime<'a> {
                     );
                 }
             }
-            Type::Struct(n) => {
-                for (i, field) in ns.structs[*n].fields.iter().enumerate() {
+            Type::Struct(str_ty) => {
+                for (i, field) in str_ty.definition(ns).fields.iter().enumerate() {
                     let mut elem = unsafe {
                         bin.builder.build_gep(
                             dest.into_pointer_value(),
@@ -894,7 +898,7 @@ pub trait TargetRuntime<'a> {
                         )
                     };
 
-                    if field.ty.is_reference_type(ns) {
+                    if field.ty.is_reference_type(ns) && !field.ty.is_fixed_reference_type() {
                         elem = bin
                             .builder
                             .build_load(elem, field.name_as_str())
@@ -1025,7 +1029,7 @@ pub trait TargetRuntime<'a> {
             Type::Array(_, dim) => {
                 let ty = ty.array_deref();
 
-                if let Some(d) = &dim[0] {
+                if let Some(ArrayLength::Fixed(d)) = dim.last() {
                     bin.emit_static_loop_with_int(
                         function,
                         bin.context.i64_type().const_zero(),
@@ -1091,8 +1095,8 @@ pub trait TargetRuntime<'a> {
                     self.storage_delete_slot(bin, &Type::Uint(256), slot, slot_ptr, function, ns);
                 }
             }
-            Type::Struct(n) => {
-                for (_, field) in ns.structs[*n].fields.iter().enumerate() {
+            Type::Struct(str_ty) => {
+                for (_, field) in str_ty.definition(ns).fields.iter().enumerate() {
                     self.storage_delete_slot(bin, &field.ty, slot, slot_ptr, function, ns);
 
                     if !field.ty.is_reference_type(ns)
@@ -1189,8 +1193,8 @@ pub trait TargetRuntime<'a> {
                     "struct_literal",
                 );
 
-                for (i, f) in exprs.iter().enumerate() {
-                    let elem = unsafe {
+                for (i, expr) in exprs.iter().enumerate() {
+                    let elemptr = unsafe {
                         bin.builder.build_gep(
                             s,
                             &[
@@ -1201,8 +1205,15 @@ pub trait TargetRuntime<'a> {
                         )
                     };
 
-                    bin.builder
-                        .build_store(elem, self.expression(bin, f, vartab, function, ns));
+                    let elem = self.expression(bin, expr, vartab, function, ns);
+
+                    let elem = if expr.ty().is_fixed_reference_type() {
+                        bin.builder.build_load(elem.into_pointer_value(), "elem")
+                    } else {
+                        elem
+                    };
+
+                    bin.builder.build_store(elemptr, elem);
                 }
 
                 s.into()
@@ -1227,6 +1238,7 @@ pub trait TargetRuntime<'a> {
                     "",
                     bin.opt,
                     bin.math_overflow_check,
+                    bin.generate_debug_info,
                 );
 
                 let code = if *runtime && target_bin.runtime.is_some() {
@@ -1255,8 +1267,7 @@ pub trait TargetRuntime<'a> {
                     true,
                 );
 
-                let v = bin
-                    .builder
+                bin.builder
                     .build_call(
                         bin.module.get_function("vector_new").unwrap(),
                         &[size.into(), elem_size.into(), init.into()],
@@ -1264,18 +1275,7 @@ pub trait TargetRuntime<'a> {
                     )
                     .try_as_basic_value()
                     .left()
-                    .unwrap();
-
-                bin.builder
-                    .build_pointer_cast(
-                        v.into_pointer_value(),
-                        bin.module
-                            .get_struct_type("struct.vector")
-                            .unwrap()
-                            .ptr_type(AddressSpace::Generic),
-                        "vector",
-                    )
-                    .into()
+                    .unwrap()
             }
             Expression::Add(_, _, unchecked, l, r) => {
                 let left = self
@@ -1341,7 +1341,7 @@ pub trait TargetRuntime<'a> {
                 )
                 .into()
             }
-            Expression::Divide(_, _, l, r) if !l.ty().is_signed_int() => {
+            Expression::UnsignedDivide(_, _, l, r) => {
                 let left = self
                     .expression(bin, l, vartab, function, ns)
                     .into_int_value();
@@ -1439,7 +1439,7 @@ pub trait TargetRuntime<'a> {
                     bin.builder.build_int_unsigned_div(left, right, "").into()
                 }
             }
-            Expression::Divide(_, _, l, r) => {
+            Expression::SignedDivide(_, _, l, r) => {
                 let left = self
                     .expression(bin, l, vartab, function, ns)
                     .into_int_value();
@@ -1585,7 +1585,7 @@ pub trait TargetRuntime<'a> {
                     bin.builder.build_int_signed_div(left, right, "").into()
                 }
             }
-            Expression::Modulo(_, _, l, r) if !l.ty().is_signed_int() => {
+            Expression::UnsignedModulo(_, _, l, r) => {
                 let left = self
                     .expression(bin, l, vartab, function, ns)
                     .into_int_value();
@@ -1683,7 +1683,7 @@ pub trait TargetRuntime<'a> {
                     bin.builder.build_int_unsigned_rem(left, right, "").into()
                 }
             }
-            Expression::Modulo(_, _, l, r) => {
+            Expression::SignedModulo(_, _, l, r) => {
                 let left = self
                     .expression(bin, l, vartab, function, ns)
                     .into_int_value();
@@ -1894,7 +1894,7 @@ pub trait TargetRuntime<'a> {
                     .build_int_compare(IntPredicate::NE, left, right, "")
                     .into()
             }
-            Expression::More(_, l, r) => {
+            Expression::SignedMore(_, l, r) | Expression::UnsignedMore(_, l, r) => {
                 if l.ty().is_address() {
                     self.compare_address(bin, l, r, IntPredicate::SGT, vartab, function, ns)
                         .into()
@@ -1908,7 +1908,7 @@ pub trait TargetRuntime<'a> {
 
                     bin.builder
                         .build_int_compare(
-                            if l.ty().is_signed_int() {
+                            if matches!(e, Expression::SignedMore(..)) {
                                 IntPredicate::SGT
                             } else {
                                 IntPredicate::UGT
@@ -1946,7 +1946,7 @@ pub trait TargetRuntime<'a> {
                         .into()
                 }
             }
-            Expression::Less(_, l, r) => {
+            Expression::SignedLess(_, l, r) | Expression::UnsignedLess(_, l, r) => {
                 if l.ty().is_address() {
                     self.compare_address(bin, l, r, IntPredicate::SLT, vartab, function, ns)
                         .into()
@@ -1960,7 +1960,7 @@ pub trait TargetRuntime<'a> {
 
                     bin.builder
                         .build_int_compare(
-                            if l.ty().is_signed_int() {
+                            if matches!(e, Expression::SignedLess(..)) {
                                 IntPredicate::SLT
                             } else {
                                 IntPredicate::ULT
@@ -2017,7 +2017,7 @@ pub trait TargetRuntime<'a> {
 
                 let value = bin.builder.build_load(ptr, "");
 
-                if ty.is_reference_type(ns) {
+                if ty.is_reference_type(ns) && !ty.is_fixed_reference_type() {
                     // if the pointer is null, it needs to be allocated
                     let allocation_needed = bin
                         .builder
@@ -2084,11 +2084,7 @@ pub trait TargetRuntime<'a> {
                     value
                 }
             }
-            Expression::StorageLoad(..) => {
-                // this should be covered by the Instr::LoadStorage instruction; if we reach this
-                // point the code generation is broken.
-                unreachable!();
-            }
+
             Expression::ZeroExt(_, t, e) => {
                 let e = self
                     .expression(bin, e, vartab, function, ns)
@@ -2161,8 +2157,7 @@ pub trait TargetRuntime<'a> {
                     "",
                 );
 
-                let v = bin
-                    .builder
+                bin.builder
                     .build_call(
                         bin.module.get_function("vector_new").unwrap(),
                         &[size.into(), elem_size.into(), init.into()],
@@ -2170,17 +2165,7 @@ pub trait TargetRuntime<'a> {
                     )
                     .try_as_basic_value()
                     .left()
-                    .unwrap();
-                bin.builder
-                    .build_pointer_cast(
-                        v.into_pointer_value(),
-                        bin.module
-                            .get_struct_type("struct.vector")
-                            .unwrap()
-                            .ptr_type(AddressSpace::Generic),
-                        "vector",
-                    )
-                    .into()
+                    .unwrap()
             }
             Expression::BytesCast(_, Type::DynamicBytes, Type::Bytes(n), e) => {
                 let array = self.expression(bin, e, vartab, function, ns);
@@ -2248,26 +2233,6 @@ pub trait TargetRuntime<'a> {
                     .into_int_value();
 
                 bin.builder.build_not(e, "").into()
-            }
-            Expression::Or(_, l, r) => {
-                let left = self
-                    .expression(bin, l, vartab, function, ns)
-                    .into_int_value();
-                let right = self
-                    .expression(bin, r, vartab, function, ns)
-                    .into_int_value();
-
-                bin.builder.build_or(left, right, "").into()
-            }
-            Expression::And(_, l, r) => {
-                let left = self
-                    .expression(bin, l, vartab, function, ns)
-                    .into_int_value();
-                let right = self
-                    .expression(bin, r, vartab, function, ns)
-                    .into_int_value();
-
-                bin.builder.build_and(left, right, "").into()
             }
             Expression::BitwiseOr(_, _, l, r) => {
                 let left = self
@@ -2339,7 +2304,7 @@ pub trait TargetRuntime<'a> {
 
                     self.storage_subscript(bin, function, ty, array, index, ns)
                         .into()
-                } else if elem_ty.builtin_struct(ns) != BuiltinStruct::None {
+                } else if elem_ty.is_builtin_struct() == Some(StructType::AccountInfo) {
                     let array = self
                         .expression(bin, a, vartab, function, ns)
                         .into_pointer_value();
@@ -2355,7 +2320,7 @@ pub trait TargetRuntime<'a> {
                 } else if ty.is_dynamic_memory() {
                     let array = self.expression(bin, a, vartab, function, ns);
 
-                    let ty = bin.llvm_var(elem_ty, ns);
+                    let ty = bin.llvm_field_ty(elem_ty, ns);
 
                     let mut array_index = self
                         .expression(bin, i, vartab, function, ns)
@@ -2408,7 +2373,7 @@ pub trait TargetRuntime<'a> {
                 }
             }
             Expression::StructMember(_, _, a, _)
-                if a.ty().builtin_struct(ns) == BuiltinStruct::AccountInfo =>
+                if a.ty().is_builtin_struct() == Some(StructType::AccountInfo) =>
             {
                 self.builtin(bin, e, vartab, function, ns)
             }
@@ -2507,14 +2472,21 @@ pub trait TargetRuntime<'a> {
                     let elemptr =
                         unsafe { bin.builder.build_gep(array, &ind, &format!("elemptr{}", i)) };
 
-                    bin.builder
-                        .build_store(elemptr, self.expression(bin, expr, vartab, function, ns));
+                    let elem = self.expression(bin, expr, vartab, function, ns);
+
+                    let elem = if expr.ty().is_fixed_reference_type() {
+                        bin.builder.build_load(elem.into_pointer_value(), "elem")
+                    } else {
+                        elem
+                    };
+
+                    bin.builder.build_store(elemptr, elem);
                 }
 
                 array.into()
             }
             Expression::AllocDynamicArray(_, ty, size, init) => {
-                if *ty == Type::Slice {
+                if matches!(ty, Type::Slice(_)) {
                     let init = init.as_ref().unwrap();
 
                     let data = bin.emit_global_string("const_string", init, true);
@@ -2524,14 +2496,14 @@ pub trait TargetRuntime<'a> {
                         .const_named_struct(&[
                             data.into(),
                             bin.context
-                                .i32_type()
+                                .custom_width_int_type(ns.target.ptr_size().into())
                                 .const_int(init.len() as u64, false)
                                 .into(),
                         ])
                         .into()
                 } else {
                     let elem = match ty {
-                        Type::Slice | Type::String | Type::DynamicBytes => Type::Bytes(1),
+                        Type::Slice(_) | Type::String | Type::DynamicBytes => Type::Bytes(1),
                         _ => ty.array_elem(),
                     };
 
@@ -2549,29 +2521,13 @@ pub trait TargetRuntime<'a> {
                 }
             }
             Expression::Builtin(_, _, Builtin::ArrayLength, args)
-                if args[0].ty().array_deref().builtin_struct(ns) == BuiltinStruct::None =>
+                if args[0].ty().array_deref().is_builtin_struct().is_none() =>
             {
                 let array = self.expression(bin, &args[0], vartab, function, ns);
 
                 bin.vector_len(array).into()
             }
-            Expression::Builtin(
-                _,
-                returns,
-                Builtin::ReadInt8
-                | Builtin::ReadInt16LE
-                | Builtin::ReadInt32LE
-                | Builtin::ReadInt64LE
-                | Builtin::ReadInt128LE
-                | Builtin::ReadInt256LE
-                | Builtin::ReadAddress
-                | Builtin::ReadUint16LE
-                | Builtin::ReadUint32LE
-                | Builtin::ReadUint64LE
-                | Builtin::ReadUint128LE
-                | Builtin::ReadUint256LE,
-                args,
-            ) => {
+            Expression::Builtin(_, returns, Builtin::ReadFromBuffer, args) => {
                 let v = self.expression(bin, &args[0], vartab, function, ns);
                 let offset = self
                     .expression(bin, &args[1], vartab, function, ns)
@@ -2682,8 +2638,7 @@ pub trait TargetRuntime<'a> {
                 let (left, left_len) = self.string_location(bin, l, vartab, function, ns);
                 let (right, right_len) = self.string_location(bin, r, vartab, function, ns);
 
-                let v = bin
-                    .builder
+                bin.builder
                     .build_call(
                         bin.module.get_function("concat").unwrap(),
                         &[left.into(), left_len.into(), right.into(), right_len.into()],
@@ -2691,18 +2646,7 @@ pub trait TargetRuntime<'a> {
                     )
                     .try_as_basic_value()
                     .left()
-                    .unwrap();
-
-                bin.builder
-                    .build_pointer_cast(
-                        v.into_pointer_value(),
-                        bin.module
-                            .get_struct_type("struct.vector")
-                            .unwrap()
-                            .ptr_type(AddressSpace::Generic),
-                        "vector",
-                    )
-                    .into()
+                    .unwrap()
             }
             Expression::ReturnData(_) => self.return_data(bin, function).into(),
             Expression::StorageArrayLength { array, elem_ty, .. } => {
@@ -2958,110 +2902,6 @@ pub trait TargetRuntime<'a> {
                     .build_int_truncate(quotient, res_ty, "quotient")
                     .into()
             }
-            Expression::ExternalFunction {
-                ty,
-                address,
-                function_no,
-                ..
-            } => {
-                let address = self
-                    .expression(bin, address, vartab, function, ns)
-                    .into_array_value();
-
-                let selector = ns.functions[*function_no].selector();
-
-                assert!(matches!(ty, Type::ExternalFunction { .. }));
-
-                let ty = bin.llvm_type(ty, ns);
-
-                let ef = bin
-                    .builder
-                    .build_call(
-                        bin.module.get_function("__malloc").unwrap(),
-                        &[ty.into_pointer_type()
-                            .get_element_type()
-                            .size_of()
-                            .unwrap()
-                            .const_cast(bin.context.i32_type(), false)
-                            .into()],
-                        "",
-                    )
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap()
-                    .into_pointer_value();
-
-                let ef =
-                    bin.builder
-                        .build_pointer_cast(ef, ty.into_pointer_type(), "function_type");
-
-                let address_member = unsafe {
-                    bin.builder.build_gep(
-                        ef,
-                        &[
-                            bin.context.i32_type().const_zero(),
-                            bin.context.i32_type().const_zero(),
-                        ],
-                        "address",
-                    )
-                };
-
-                bin.builder.build_store(address_member, address);
-
-                let selector_member = unsafe {
-                    bin.builder.build_gep(
-                        ef,
-                        &[
-                            bin.context.i32_type().const_zero(),
-                            bin.context.i32_type().const_int(1, false),
-                        ],
-                        "selector",
-                    )
-                };
-
-                bin.builder.build_store(
-                    selector_member,
-                    bin.context.i32_type().const_int(selector as u64, false),
-                );
-
-                ef.into()
-            }
-            Expression::Builtin(_, _, Builtin::FunctionSelector, args) => {
-                let ef = self
-                    .expression(bin, &args[0], vartab, function, ns)
-                    .into_pointer_value();
-
-                let selector_member = unsafe {
-                    bin.builder.build_gep(
-                        ef,
-                        &[
-                            bin.context.i32_type().const_zero(),
-                            bin.context.i32_type().const_int(1, false),
-                        ],
-                        "selector",
-                    )
-                };
-
-                bin.builder.build_load(selector_member, "selector")
-            }
-            Expression::Builtin(_, _, Builtin::ExternalFunctionAddress, args) => {
-                let ef = self
-                    .expression(bin, &args[0], vartab, function, ns)
-                    .into_pointer_value();
-
-                let selector_member = unsafe {
-                    bin.builder.build_gep(
-                        ef,
-                        &[
-                            bin.context.i32_type().const_zero(),
-                            bin.context.i32_type().const_zero(),
-                        ],
-                        "address",
-                    )
-                };
-
-                bin.builder.build_load(selector_member, "address")
-            }
             Expression::Builtin(_, _, hash @ Builtin::Ripemd160, args)
             | Expression::Builtin(_, _, hash @ Builtin::Keccak256, args)
             | Expression::Builtin(_, _, hash @ Builtin::Blake2_128, args)
@@ -3096,22 +2936,27 @@ pub trait TargetRuntime<'a> {
             Expression::FormatString(_, args) => {
                 self.format_string(bin, args, vartab, function, ns)
             }
-            Expression::Ternary(..)
-            | Expression::CheckingTrunc(..)
-            | Expression::RationalNumberLiteral(..)
-            | Expression::ConstantVariable(..)
-            | Expression::StorageVariable(..)
-            | Expression::PreDecrement(..)
-            | Expression::PostDecrement(..)
-            | Expression::PreIncrement(..)
-            | Expression::PostIncrement(..)
-            | Expression::Assign(..)
-            | Expression::InternalFunction { .. }
-            | Expression::InternalFunctionCall { .. }
-            | Expression::ExternalFunctionCall { .. }
-            | Expression::ExternalFunctionCallRaw { .. }
-            | Expression::Constructor { .. }
-            | Expression::InterfaceId(..)
+
+            Expression::AdvancePointer {
+                pointer,
+                bytes_offset,
+                ..
+            } => {
+                let pointer = if pointer.ty().is_dynamic_memory() {
+                    bin.vector_bytes(self.expression(bin, pointer, vartab, function, ns))
+                } else {
+                    self.expression(bin, pointer, vartab, function, ns)
+                        .into_pointer_value()
+                };
+                let offset = self
+                    .expression(bin, bytes_offset, vartab, function, ns)
+                    .into_int_value();
+                let advanced = unsafe { bin.builder.build_gep(pointer, &[offset], "adv_pointer") };
+
+                advanced.into()
+            }
+
+            Expression::RationalNumberLiteral(..)
             | Expression::List(..)
             | Expression::Undefined(..)
             | Expression::Poison
@@ -3187,7 +3032,7 @@ pub trait TargetRuntime<'a> {
     fn string_location(
         &self,
         bin: &Binary<'a>,
-        location: &StringLocation,
+        location: &StringLocation<Expression>,
         vartab: &HashMap<usize, Variable<'a>>,
         function: FunctionValue<'a>,
         ns: &Namespace,
@@ -3295,6 +3140,40 @@ pub trait TargetRuntime<'a> {
             );
 
             bin.builder.build_load(dest, "val")
+        } else if matches!(from, Type::Bool) && matches!(to, Type::Int(_) | Type::Uint(_)) {
+            bin.builder
+                .build_int_cast(
+                    val.into_int_value(),
+                    bin.llvm_type(to, ns).into_int_type(),
+                    "bool_to_int_cast",
+                )
+                .into()
+        } else if from.is_reference_type(ns) && matches!(to, Type::Uint(_)) {
+            bin.builder
+                .build_ptr_to_int(
+                    val.into_pointer_value(),
+                    bin.llvm_type(to, ns).into_int_type(),
+                    "ptr_to_int",
+                )
+                .into()
+        } else if matches!((from, to), (Type::DynamicBytes, Type::Slice(_))) {
+            let slice = bin.build_alloca(function, bin.llvm_type(to, ns), "slice");
+
+            let data = bin.vector_bytes(val);
+
+            let data_ptr = bin.builder.build_struct_gep(slice, 0, "data").unwrap();
+
+            bin.builder.build_store(data_ptr, data);
+
+            let len =
+                bin.builder
+                    .build_int_z_extend(bin.vector_len(val), bin.context.i64_type(), "len");
+
+            let len_ptr = bin.builder.build_struct_gep(slice, 1, "len").unwrap();
+
+            bin.builder.build_store(len_ptr, len);
+
+            bin.builder.build_load(slice, "slice")
         } else {
             val
         }
@@ -3309,6 +3188,75 @@ pub trait TargetRuntime<'a> {
         function: FunctionValue<'a>,
         ns: &Namespace,
     ) {
+        let dibuilder = &bin.dibuilder;
+        let compile_unit = &bin.compile_unit;
+        let file = compile_unit.get_file();
+        let mut di_func_scope: Option<DISubprogram<'_>> = None;
+
+        if bin.generate_debug_info {
+            let return_type = function.get_type().get_return_type();
+            match return_type {
+                None => {}
+                Some(return_type) => {
+                    let return_type_size = return_type.size_of().unwrap();
+                    let size = return_type_size.get_type().get_bit_width();
+                    let mut type_name = "size_".to_owned();
+                    type_name.push_str(&size.to_string());
+                    let di_flags = if cfg.public {
+                        inkwell::debug_info::DIFlagsConstants::PUBLIC
+                    } else {
+                        inkwell::debug_info::DIFlagsConstants::PRIVATE
+                    };
+
+                    let di_return_type = dibuilder
+                        .create_basic_type(&type_name, size as u64, 0x00, di_flags)
+                        .unwrap();
+                    let param_types = function.get_type().get_param_types();
+                    let di_param_types: Vec<DIType<'_>> = param_types
+                        .iter()
+                        .map(|typ| {
+                            let mut param_tname = "size_".to_owned();
+                            let param_size = typ.size_of().unwrap().get_type().get_bit_width();
+                            param_tname.push_str(&size.to_string());
+                            dibuilder
+                                .create_basic_type(&param_tname, param_size as u64, 0x00, di_flags)
+                                .unwrap()
+                                .as_type()
+                        })
+                        .collect();
+                    let di_func_type = dibuilder.create_subroutine_type(
+                        file,
+                        Some(di_return_type.as_type()),
+                        di_param_types.as_slice(),
+                        di_flags,
+                    );
+
+                    let func_loc = cfg.blocks[0].instr.first().unwrap().loc();
+                    let line_num = if let Loc::File(file_offset, offset, _) = func_loc {
+                        let (line, _) = ns.files[file_offset].offset_to_line_column(offset);
+                        line
+                    } else {
+                        0
+                    };
+
+                    di_func_scope = Some(dibuilder.create_function(
+                        compile_unit.as_debug_info_scope(),
+                        function.get_name().to_str().unwrap(),
+                        None,
+                        file,
+                        line_num.try_into().unwrap(),
+                        di_func_type,
+                        true,
+                        true,
+                        line_num.try_into().unwrap(),
+                        di_flags,
+                        false,
+                    ));
+                    function.set_subprogram(di_func_scope.unwrap());
+                }
+            }
+        }
+
         // recurse through basic blocks
         struct BasicBlock<'a> {
             bb: inkwell::basic_block::BasicBlock<'a>,
@@ -3338,7 +3286,7 @@ pub trait TargetRuntime<'a> {
 
             if let Some(ref cfg_phis) = cfg_bb.phis {
                 for v in cfg_phis {
-                    let ty = bin.llvm_var(&cfg.vars[v].ty, ns);
+                    let ty = bin.llvm_var_ty(&cfg.vars[v].ty, ns);
 
                     phis.insert(*v, bin.builder.build_phi(ty, &cfg.vars[v].id.name));
                 }
@@ -3424,6 +3372,21 @@ pub trait TargetRuntime<'a> {
             }
 
             for ins in &cfg.blocks[w.block_no].instr {
+                if bin.generate_debug_info {
+                    let debug_loc = ins.loc();
+                    if let Loc::File(file_offset, offset, _) = debug_loc {
+                        let (line, col) = ns.files[file_offset].offset_to_line_column(offset);
+                        let debug_loc = dibuilder.create_debug_location(
+                            bin.context,
+                            line as u32,
+                            col as u32,
+                            di_func_scope.unwrap().as_debug_info_scope(),
+                            None,
+                        );
+                        bin.builder
+                            .set_current_debug_location(bin.context, debug_loc);
+                    }
+                }
                 match ins {
                     Instr::Nop => (),
                     Instr::Return { value } if value.is_empty() => {
@@ -3475,8 +3438,8 @@ pub trait TargetRuntime<'a> {
                         bin.builder.position_at_end(pos);
                         bin.builder.build_unconditional_branch(bb.bb);
                     }
-                    Instr::Store { dest, pos } => {
-                        let value_ref = w.vars[pos].value;
+                    Instr::Store { dest, data } => {
+                        let value_ref = self.expression(bin, data, &w.vars, function, ns);
                         let dest_ref = self
                             .expression(bin, dest, &w.vars, function, ns)
                             .into_pointer_value();
@@ -3558,7 +3521,7 @@ pub trait TargetRuntime<'a> {
                             .expression(bin, storage, &w.vars, function, ns)
                             .into_int_value();
 
-                        self.storage_store(bin, ty, &mut slot, value, function, ns);
+                        self.storage_store(bin, ty, true, &mut slot, value, function, ns);
                     }
                     Instr::SetStorageBytes {
                         storage,
@@ -3615,41 +3578,18 @@ pub trait TargetRuntime<'a> {
                         array,
                         value,
                     } => {
-                        let a = w.vars[array].value.into_pointer_value();
-                        let len = unsafe {
-                            bin.builder.build_gep(
-                                a,
-                                &[
-                                    bin.context.i32_type().const_zero(),
-                                    bin.context.i32_type().const_zero(),
-                                ],
-                                "array_len",
-                            )
-                        };
-                        let a = bin.builder.build_pointer_cast(
-                            a,
-                            bin.context.i8_type().ptr_type(AddressSpace::Generic),
-                            "a",
-                        );
+                        let arr = w.vars[array].value;
+
                         let llvm_ty = bin.llvm_type(ty, ns);
+                        let elem_ty = ty.array_elem();
 
                         // Calculate total size for reallocation
-                        let elem_ty = match ty {
-                            Type::Array(..) => match bin.llvm_type(&ty.array_elem(), ns) {
-                                elem @ BasicTypeEnum::StructType(_) => {
-                                    // We don't store structs directly in the array, instead we store references to structs
-                                    elem.ptr_type(AddressSpace::Generic).as_basic_type_enum()
-                                }
-                                elem => elem,
-                            },
-                            Type::DynamicBytes => bin.context.i8_type().into(),
-                            _ => unreachable!(),
-                        };
-                        let elem_size = elem_ty
+                        let llvm_elem_ty = bin.llvm_field_ty(&elem_ty, ns);
+                        let elem_size = llvm_elem_ty
                             .size_of()
                             .unwrap()
                             .const_cast(bin.context.i32_type(), false);
-                        let len = bin.builder.build_load(len, "array_len").into_int_value();
+                        let len = bin.vector_len(arr);
                         let new_len = bin.builder.build_int_add(
                             len,
                             bin.context.i32_type().const_int(1, false),
@@ -3670,7 +3610,16 @@ pub trait TargetRuntime<'a> {
                             .builder
                             .build_call(
                                 bin.module.get_function("__realloc").unwrap(),
-                                &[a.into(), size.into()],
+                                &[
+                                    bin.builder
+                                        .build_pointer_cast(
+                                            arr.into_pointer_value(),
+                                            bin.context.i8_type().ptr_type(AddressSpace::Generic),
+                                            "a",
+                                        )
+                                        .into(),
+                                    size.into(),
+                                ],
                                 "",
                             )
                             .try_as_basic_value()
@@ -3699,11 +3648,17 @@ pub trait TargetRuntime<'a> {
                         let value = self.expression(bin, value, &w.vars, function, ns);
                         let elem_ptr = bin.builder.build_pointer_cast(
                             slot_ptr,
-                            elem_ty.ptr_type(AddressSpace::Generic),
+                            llvm_elem_ty.ptr_type(AddressSpace::Generic),
                             "element pointer",
                         );
+                        let value = if elem_ty.is_fixed_reference_type() {
+                            w.vars.get_mut(res).unwrap().value = elem_ptr.into();
+                            bin.builder.build_load(value.into_pointer_value(), "elem")
+                        } else {
+                            w.vars.get_mut(res).unwrap().value = value;
+                            value
+                        };
                         bin.builder.build_store(elem_ptr, value);
-                        w.vars.get_mut(res).unwrap().value = value;
 
                         // Update the len and size field of the vector struct
                         let len_ptr = unsafe {
@@ -3779,19 +3734,11 @@ pub trait TargetRuntime<'a> {
                         bin.builder.position_at_end(pop);
                         let llvm_ty = bin.llvm_type(ty, ns);
 
+                        let elem_ty = ty.array_elem();
+                        let llvm_elem_ty = bin.llvm_field_ty(&elem_ty, ns);
+
                         // Calculate total size for reallocation
-                        let elem_ty = match ty {
-                            Type::Array(..) => match bin.llvm_type(&ty.array_elem(), ns) {
-                                elem @ BasicTypeEnum::StructType(_) => {
-                                    // We don't store structs directly in the array, instead we store references to structs
-                                    elem.ptr_type(AddressSpace::Generic).as_basic_type_enum()
-                                }
-                                elem => elem,
-                            },
-                            Type::DynamicBytes => bin.context.i8_type().into(),
-                            _ => unreachable!(),
-                        };
-                        let elem_size = elem_ty
+                        let elem_size = llvm_elem_ty
                             .size_of()
                             .unwrap()
                             .const_cast(bin.context.i32_type(), false);
@@ -3824,11 +3771,15 @@ pub trait TargetRuntime<'a> {
                         };
                         let slot_ptr = bin.builder.build_pointer_cast(
                             slot_ptr,
-                            elem_ty.ptr_type(AddressSpace::Generic),
+                            llvm_elem_ty.ptr_type(AddressSpace::Generic),
                             "slot_ptr",
                         );
-                        let ret_val = bin.builder.build_load(slot_ptr, "");
-                        w.vars.get_mut(res).unwrap().value = ret_val;
+                        if elem_ty.is_fixed_reference_type() {
+                            w.vars.get_mut(res).unwrap().value = slot_ptr.into();
+                        } else {
+                            let ret_val = bin.builder.build_load(slot_ptr, "");
+                            w.vars.get_mut(res).unwrap().value = ret_val;
+                        }
 
                         // Reallocate and reassign the array pointer
                         let a = bin.builder.build_pointer_cast(
@@ -3923,7 +3874,7 @@ pub trait TargetRuntime<'a> {
                     }
                     Instr::Call {
                         res,
-                        call: InternalCallTy::Static(cfg_no),
+                        call: InternalCallTy::Static { cfg_no },
                         args,
                         ..
                     } => {
@@ -3939,13 +3890,13 @@ pub trait TargetRuntime<'a> {
                                 parms.push(if ns.target == Target::Solana {
                                     bin.build_alloca(
                                         function,
-                                        bin.llvm_var(&v.ty, ns),
+                                        bin.llvm_var_ty(&v.ty, ns),
                                         v.name_as_str(),
                                     )
                                     .into()
                                 } else {
                                     bin.builder
-                                        .build_alloca(bin.llvm_var(&v.ty, ns), v.name_as_str())
+                                        .build_alloca(bin.llvm_var_ty(&v.ty, ns), v.name_as_str())
                                         .into()
                                 });
                             }
@@ -4001,6 +3952,75 @@ pub trait TargetRuntime<'a> {
                     }
                     Instr::Call {
                         res,
+                        call: InternalCallTy::Builtin { ast_func_no },
+                        args,
+                        ..
+                    } => {
+                        let mut parms = args
+                            .iter()
+                            .map(|p| self.expression(bin, p, &w.vars, function, ns).into())
+                            .collect::<Vec<BasicMetadataValueEnum>>();
+
+                        let func = &ns.functions[*ast_func_no];
+
+                        if !res.is_empty() {
+                            for v in func.returns.iter() {
+                                parms.push(if ns.target == Target::Solana {
+                                    bin.build_alloca(
+                                        function,
+                                        bin.llvm_var_ty(&v.ty, ns),
+                                        v.name_as_str(),
+                                    )
+                                    .into()
+                                } else {
+                                    bin.builder
+                                        .build_alloca(bin.llvm_var_ty(&v.ty, ns), v.name_as_str())
+                                        .into()
+                                });
+                            }
+                        }
+
+                        let ret = self.builtin_function(bin, func, &parms, ns);
+
+                        let success = bin.builder.build_int_compare(
+                            IntPredicate::EQ,
+                            ret.into_int_value(),
+                            bin.return_values[&ReturnCode::Success],
+                            "success",
+                        );
+
+                        let success_block = bin.context.append_basic_block(function, "success");
+                        let bail_block = bin.context.append_basic_block(function, "bail");
+                        bin.builder
+                            .build_conditional_branch(success, success_block, bail_block);
+
+                        bin.builder.position_at_end(bail_block);
+
+                        bin.builder.build_return(Some(&ret));
+                        bin.builder.position_at_end(success_block);
+
+                        if !res.is_empty() {
+                            for (i, v) in func.returns.iter().enumerate() {
+                                let val = bin.builder.build_load(
+                                    parms[args.len() + i].into_pointer_value(),
+                                    v.name_as_str(),
+                                );
+
+                                let dest = w.vars[&res[i]].value;
+
+                                if dest.is_pointer_value()
+                                    && !(v.ty.is_reference_type(ns)
+                                        || matches!(v.ty, Type::ExternalFunction { .. }))
+                                {
+                                    bin.builder.build_store(dest.into_pointer_value(), val);
+                                } else {
+                                    w.vars.get_mut(&res[i]).unwrap().value = val;
+                                }
+                            }
+                        }
+                    }
+                    Instr::Call {
+                        res,
                         call: InternalCallTy::Dynamic(call_expr),
                         args,
                         ..
@@ -4019,17 +4039,18 @@ pub trait TargetRuntime<'a> {
                             .map(|p| self.expression(bin, p, &w.vars, function, ns).into())
                             .collect::<Vec<BasicMetadataValueEnum>>();
 
-                        // on Solana, we need to pass the accounts parameter around
-                        if let Some(parameters) = bin.parameters {
-                            parms.push(parameters.into());
-                        }
-
                         if !res.is_empty() {
                             for ty in returns.iter() {
                                 parms.push(
-                                    bin.build_alloca(function, bin.llvm_var(ty, ns), "").into(),
+                                    bin.build_alloca(function, bin.llvm_var_ty(ty, ns), "")
+                                        .into(),
                                 );
                             }
+                        }
+
+                        // on Solana, we need to pass the accounts parameter around
+                        if let Some(parameters) = bin.parameters {
+                            parms.push(parameters.into());
                         }
 
                         let callable = CallableValue::try_from(
@@ -4048,7 +4069,7 @@ pub trait TargetRuntime<'a> {
                         let success = bin.builder.build_int_compare(
                             IntPredicate::EQ,
                             ret.into_int_value(),
-                            bin.context.i32_type().const_zero(),
+                            bin.return_values[&ReturnCode::Success],
                             "success",
                         );
 
@@ -4146,6 +4167,8 @@ pub trait TargetRuntime<'a> {
                         value,
                         gas,
                         callty,
+                        accounts,
+                        seeds,
                     } => {
                         let gas = self
                             .expression(bin, gas, &w.vars, function, ns)
@@ -4153,12 +4176,14 @@ pub trait TargetRuntime<'a> {
                         let value = self
                             .expression(bin, value, &w.vars, function, ns)
                             .into_int_value();
+                        let payload_ty = payload.ty();
                         let payload = self.expression(bin, payload, &w.vars, function, ns);
 
                         let address = if let Some(address) = address {
                             let address = self.expression(bin, address, &w.vars, function, ns);
 
-                            let addr = bin.builder.build_array_alloca(
+                            let addr = bin.build_array_alloca(
+                                function,
                                 bin.context.i8_type(),
                                 bin.context
                                     .i32_type()
@@ -4180,6 +4205,113 @@ pub trait TargetRuntime<'a> {
                             None
                         };
 
+                        let accounts = if let Some(accounts) = accounts {
+                            let ty = accounts.ty();
+
+                            let expr = self.expression(bin, accounts, &w.vars, function, ns);
+
+                            if let Some(n) = ty.array_length() {
+                                let accounts = expr.into_pointer_value();
+                                let len =
+                                    bin.context.i32_type().const_int(n.to_u64().unwrap(), false);
+
+                                Some((accounts, len))
+                            } else {
+                                let addr = bin.vector_bytes(expr);
+                                let len = bin.vector_len(expr);
+                                Some((addr, len))
+                            }
+                        } else {
+                            None
+                        };
+
+                        let (payload_ptr, payload_len) = if payload_ty == Type::DynamicBytes {
+                            (bin.vector_bytes(payload), bin.vector_len(payload))
+                        } else {
+                            let ptr = payload.into_pointer_value();
+                            let len = ptr
+                                .get_type()
+                                .get_element_type()
+                                .size_of()
+                                .unwrap()
+                                .const_cast(bin.context.i32_type(), false);
+
+                            (ptr, len)
+                        };
+
+                        let seeds = if let Some(seeds) = seeds {
+                            let len = seeds.ty().array_length().unwrap().to_u64().unwrap();
+                            let seeds_ty = bin.llvm_type(
+                                &Type::Slice(Box::new(Type::Slice(Box::new(Type::Bytes(1))))),
+                                ns,
+                            );
+
+                            let output_seeds = bin.build_array_alloca(
+                                function,
+                                seeds_ty,
+                                bin.context.i64_type().const_int(len, false),
+                                "seeds",
+                            );
+
+                            if let Expression::ArrayLiteral(_, _, _, exprs) = seeds {
+                                for i in 0..len {
+                                    let val = self.expression(
+                                        bin,
+                                        &exprs[i as usize],
+                                        &w.vars,
+                                        function,
+                                        ns,
+                                    );
+
+                                    let seed_count = val
+                                        .get_type()
+                                        .into_pointer_type()
+                                        .get_element_type()
+                                        .into_array_type()
+                                        .len();
+
+                                    let dest = unsafe {
+                                        bin.builder.build_gep(
+                                            output_seeds,
+                                            &[
+                                                bin.context.i32_type().const_int(i, false),
+                                                bin.context.i32_type().const_zero(),
+                                            ],
+                                            "dest",
+                                        )
+                                    };
+
+                                    let val = bin.builder.build_pointer_cast(
+                                        val.into_pointer_value(),
+                                        dest.get_type().get_element_type().into_pointer_type(),
+                                        "seeds",
+                                    );
+
+                                    bin.builder.build_store(dest, val);
+
+                                    let dest = unsafe {
+                                        bin.builder.build_gep(
+                                            output_seeds,
+                                            &[
+                                                bin.context.i32_type().const_int(i, false),
+                                                bin.context.i32_type().const_int(1, false),
+                                            ],
+                                            "dest",
+                                        )
+                                    };
+
+                                    let val =
+                                        bin.context.i64_type().const_int(seed_count as u64, false);
+
+                                    bin.builder.build_store(dest, val);
+                                }
+                            }
+
+                            Some((output_seeds, bin.context.i64_type().const_int(len, false)))
+                        } else {
+                            None
+                        };
+
                         let success = match success {
                             Some(n) => Some(&mut w.vars.get_mut(n).unwrap().value),
                             None => None,
@@ -4189,11 +4321,13 @@ pub trait TargetRuntime<'a> {
                             bin,
                             function,
                             success,
-                            bin.vector_bytes(payload),
-                            bin.vector_len(payload),
+                            payload_ptr,
+                            payload_len,
                             address,
                             gas,
                             value,
+                            accounts,
+                            seeds,
                             callty.clone(),
                             ns,
                         );
@@ -4386,19 +4520,91 @@ pub trait TargetRuntime<'a> {
                         let offset = self
                             .expression(bin, offset, &w.vars, function, ns)
                             .into_int_value();
-                        let value = self.expression(bin, value, &w.vars, function, ns);
+                        let emit_value = self.expression(bin, value, &w.vars, function, ns);
 
                         let start = unsafe { bin.builder.build_gep(data, &[offset], "start") };
 
-                        let start = bin.builder.build_pointer_cast(
-                            start,
-                            value.get_type().ptr_type(AddressSpace::Generic),
-                            "start",
-                        );
+                        let is_bytes = if let Type::Bytes(n) = value.ty() {
+                            n
+                        } else {
+                            0
+                        };
 
-                        bin.builder.build_store(start, value);
+                        if is_bytes > 1 {
+                            let value_ptr = bin.build_alloca(
+                                function,
+                                emit_value.into_int_value().get_type(),
+                                &format!("bytes{}", is_bytes),
+                            );
+                            bin.builder
+                                .build_store(value_ptr, emit_value.into_int_value());
+                            bin.builder.build_call(
+                                bin.module.get_function("__leNtobeN").unwrap(),
+                                &[
+                                    bin.builder
+                                        .build_pointer_cast(
+                                            value_ptr,
+                                            bin.context.i8_type().ptr_type(AddressSpace::Generic),
+                                            "store",
+                                        )
+                                        .into(),
+                                    bin.builder
+                                        .build_pointer_cast(
+                                            start,
+                                            bin.context.i8_type().ptr_type(AddressSpace::Generic),
+                                            "dest",
+                                        )
+                                        .into(),
+                                    bin.context
+                                        .i32_type()
+                                        .const_int(is_bytes as u64, false)
+                                        .into(),
+                                ],
+                                "",
+                            );
+                        } else {
+                            let start = bin.builder.build_pointer_cast(
+                                start,
+                                emit_value.get_type().ptr_type(AddressSpace::Generic),
+                                "start",
+                            );
+
+                            bin.builder.build_store(start, emit_value);
+                        }
+                    }
+                    Instr::MemCopy {
+                        source: from,
+                        destination: to,
+                        bytes,
+                    } => {
+                        let src = if from.ty().is_dynamic_memory() {
+                            bin.vector_bytes(self.expression(bin, from, &w.vars, function, ns))
+                        } else {
+                            self.expression(bin, from, &w.vars, function, ns)
+                                .into_pointer_value()
+                        };
+
+                        let dest = self.expression(bin, to, &w.vars, function, ns);
+                        let size = self.expression(bin, bytes, &w.vars, function, ns);
+
+                        if matches!(bytes, Expression::NumberLiteral(..)) {
+                            let _ = bin.builder.build_memcpy(
+                                dest.into_pointer_value(),
+                                1,
+                                src,
+                                1,
+                                size.into_int_value(),
+                            );
+                        } else {
+                            bin.builder.build_call(
+                                bin.module.get_function("__memcpy").unwrap(),
+                                &[dest.into(), src.into(), size.into()],
+                                "",
+                            );
+                        }
                     }
                 }
+                bin.builder.unset_current_debug_location();
             }
         }
     }
@@ -4518,60 +4724,79 @@ pub trait TargetRuntime<'a> {
             return;
         }
 
-        let got_value = if bin.function_abort_value_transfers {
-            bin.context.bool_type().const_zero()
+        if ns.target == Target::Solana {
+            match fallback {
+                Some((cfg_no, _)) => {
+                    let args = if ns.target == Target::Solana {
+                        vec![function.get_last_param().unwrap().into()]
+                    } else {
+                        vec![]
+                    };
+
+                    bin.builder.build_call(functions[&cfg_no], &args, "");
+
+                    self.return_empty_abi(bin);
+                }
+                None => {
+                    self.return_code(bin, bin.context.i32_type().const_int(2, false));
+                }
+            }
         } else {
-            let value = self.value_transferred(bin, ns);
+            let got_value = if bin.function_abort_value_transfers {
+                bin.context.bool_type().const_zero()
+            } else {
+                let value = self.value_transferred(bin, ns);
 
-            bin.builder.build_int_compare(
-                IntPredicate::NE,
-                value,
-                bin.value_type(ns).const_zero(),
-                "is_value_transfer",
-            )
-        };
+                bin.builder.build_int_compare(
+                    IntPredicate::NE,
+                    value,
+                    bin.value_type(ns).const_zero(),
+                    "is_value_transfer",
+                )
+            };
 
-        let fallback_block = bin.context.append_basic_block(function, "fallback");
-        let receive_block = bin.context.append_basic_block(function, "receive");
+            let fallback_block = bin.context.append_basic_block(function, "fallback");
+            let receive_block = bin.context.append_basic_block(function, "receive");
 
-        bin.builder
-            .build_conditional_branch(got_value, receive_block, fallback_block);
+            bin.builder
+                .build_conditional_branch(got_value, receive_block, fallback_block);
 
-        bin.builder.position_at_end(fallback_block);
+            bin.builder.position_at_end(fallback_block);
 
-        match fallback {
-            Some((cfg_no, _)) => {
-                let args = if ns.target == Target::Solana {
-                    vec![function.get_last_param().unwrap().into()]
-                } else {
-                    vec![]
-                };
+            match fallback {
+                Some((cfg_no, _)) => {
+                    let args = if ns.target == Target::Solana {
+                        vec![function.get_last_param().unwrap().into()]
+                    } else {
+                        vec![]
+                    };
 
-                bin.builder.build_call(functions[&cfg_no], &args, "");
+                    bin.builder.build_call(functions[&cfg_no], &args, "");
 
-                self.return_empty_abi(bin);
+                    self.return_empty_abi(bin);
+                }
+                None => {
+                    self.return_code(bin, bin.context.i32_type().const_int(2, false));
+                }
             }
-            None => {
-                self.return_code(bin, bin.context.i32_type().const_int(2, false));
-            }
-        }
 
-        bin.builder.position_at_end(receive_block);
+            bin.builder.position_at_end(receive_block);
 
-        match receive {
-            Some((cfg_no, _)) => {
-                let args = if ns.target == Target::Solana {
-                    vec![function.get_last_param().unwrap().into()]
-                } else {
-                    vec![]
-                };
+            match receive {
+                Some((cfg_no, _)) => {
+                    let args = if ns.target == Target::Solana {
+                        vec![function.get_last_param().unwrap().into()]
+                    } else {
+                        vec![]
+                    };
 
-                bin.builder.build_call(functions[&cfg_no], &args, "");
+                    bin.builder.build_call(functions[&cfg_no], &args, "");
 
-                self.return_empty_abi(bin);
-            }
-            None => {
-                self.return_code(bin, bin.context.i32_type().const_int(2, false));
+                    self.return_empty_abi(bin);
+                }
+                None => {
+                    self.return_code(bin, bin.context.i32_type().const_int(2, false));
+                }
             }
         }
     }
@@ -5554,1125 +5779,19 @@ pub trait TargetRuntime<'a> {
             .into_int_value()
     }
 }
-pub struct Binary<'a> {
-    pub name: String,
-    pub module: Module<'a>,
-    pub runtime: Option<Box<Binary<'a>>>,
-    target: Target,
-    function_abort_value_transfers: bool,
-    constructor_abort_value_transfers: bool,
-    math_overflow_check: bool,
-    builder: Builder<'a>,
-    context: &'a Context,
-    functions: HashMap<usize, FunctionValue<'a>>,
-    code: RefCell<Vec<u8>>,
-    opt: OptimizationLevel,
-    code_size: RefCell<Option<IntValue<'a>>>,
-    selector: GlobalValue<'a>,
-    calldata_data: GlobalValue<'a>,
-    calldata_len: GlobalValue<'a>,
-    scratch_len: Option<GlobalValue<'a>>,
-    scratch: Option<GlobalValue<'a>>,
-    parameters: Option<PointerValue<'a>>,
-    return_values: HashMap<ReturnCode, IntValue<'a>>,
-}
 
 #[derive(PartialEq, Eq, Hash)]
-enum ReturnCode {
+pub(crate) enum ReturnCode {
     Success,
     FunctionSelectorInvalid,
     AbiEncodingInvalid,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum Generate {
     Object,
     Assembly,
     Linked,
-}
-
-impl<'a> Binary<'a> {
-    /// Build the LLVM IR for a single contract
-    pub fn build(
-        context: &'a Context,
-        contract: &'a Contract,
-        ns: &'a Namespace,
-        filename: &'a str,
-        opt: OptimizationLevel,
-        math_overflow_check: bool,
-    ) -> Self {
-        match ns.target {
-            Target::Substrate { .. } => substrate::SubstrateTarget::build(
-                context,
-                contract,
-                ns,
-                filename,
-                opt,
-                math_overflow_check,
-            ),
-            Target::Ewasm => {
-                ewasm::EwasmTarget::build(context, contract, ns, filename, opt, math_overflow_check)
-            }
-            Target::Solana => solana::SolanaTarget::build(
-                context,
-                contract,
-                ns,
-                filename,
-                opt,
-                math_overflow_check,
-            ),
-        }
-    }
-
-    /// Build the LLVM IR for a set of contracts in a single namespace
-    pub fn build_bundle(
-        context: &'a Context,
-        namespaces: &'a [Namespace],
-        filename: &str,
-        opt: OptimizationLevel,
-        math_overflow_check: bool,
-    ) -> Self {
-        assert!(namespaces.iter().all(|ns| ns.target == Target::Solana));
-
-        solana::SolanaTarget::build_bundle(context, namespaces, filename, opt, math_overflow_check)
-    }
-
-    /// Compile the bin and return the code as bytes. The result is
-    /// cached, since this function can be called multiple times (e.g. one for
-    /// each time a bin of this type is created).
-    /// Pass our module to llvm for optimization and compilation
-    pub fn code(&self, generate: Generate) -> Result<Vec<u8>, String> {
-        // return cached result if available
-        if !self.code.borrow().is_empty() {
-            return Ok(self.code.borrow().clone());
-        }
-
-        match self.opt {
-            OptimizationLevel::Default | OptimizationLevel::Aggressive => {
-                let pass_manager = PassManager::create(());
-
-                pass_manager.add_promote_memory_to_register_pass();
-                pass_manager.add_function_inlining_pass();
-                pass_manager.add_global_dce_pass();
-                pass_manager.add_constant_merge_pass();
-
-                pass_manager.run_on(&self.module);
-            }
-            _ => {}
-        }
-
-        let target = inkwell::targets::Target::from_name(self.target.llvm_target_name()).unwrap();
-
-        let target_machine = target
-            .create_target_machine(
-                &self.target.llvm_target_triple(),
-                "",
-                self.target.llvm_features(),
-                self.opt,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .unwrap();
-
-        loop {
-            // we need to loop here to support ewasm deployer. It needs to know the size
-            // of itself. Note that in webassembly, the constants are LEB128 encoded so
-            // patching the length might actually change the length. So we need to loop
-            // until it is right.
-
-            // The correct solution is to make ewasm less insane.
-            match target_machine.write_to_memory_buffer(
-                &self.module,
-                if generate == Generate::Assembly {
-                    FileType::Assembly
-                } else {
-                    FileType::Object
-                },
-            ) {
-                Ok(out) => {
-                    let slice = out.as_slice();
-
-                    if generate == Generate::Linked {
-                        let bs = link(slice, &self.name, self.target);
-
-                        if !self.patch_code_size(bs.len() as u64) {
-                            self.code.replace(bs.to_vec());
-
-                            return Ok(bs.to_vec());
-                        }
-                    } else {
-                        return Ok(slice.to_vec());
-                    }
-                }
-                Err(s) => {
-                    return Err(s.to_string());
-                }
-            }
-        }
-    }
-
-    /// Mark all functions as internal unless they're in the export_list. This helps the
-    /// llvm globaldce pass eliminate unnecessary functions and reduce the wasm output.
-    fn internalize(&self, export_list: &[&str]) {
-        let mut func = self.module.get_first_function();
-
-        // FIXME: these functions are called from code generated by lowering into wasm,
-        // so eliminating them now will cause link errors. Either we should prevent these
-        // calls from being done in the first place or do dce at link time
-        let mut export_list = export_list.to_vec();
-        export_list.push("__ashlti3");
-        export_list.push("__lshrti3");
-        export_list.push("__ashrti3");
-
-        while let Some(f) = func {
-            let name = f.get_name().to_str().unwrap();
-
-            if !name.starts_with("llvm.")
-                && export_list.iter().all(|e| {
-                    // symbols may get renamed foo.1 or foo.2, also export those
-                    if let Some(tail) = name.strip_prefix(e) {
-                        if let Some(no) = tail.strip_prefix('.') {
-                            no.parse::<u32>().is_ok()
-                        } else {
-                            tail.is_empty()
-                        }
-                    } else {
-                        false
-                    }
-                })
-            {
-                f.set_linkage(Linkage::Internal);
-            }
-
-            func = f.get_next_function();
-        }
-    }
-
-    pub fn bitcode(&self, path: &Path) {
-        self.module.write_bitcode_to_path(path);
-    }
-
-    pub fn dump_llvm(&self, path: &Path) -> Result<(), String> {
-        if let Err(s) = self.module.print_to_file(path) {
-            return Err(s.to_string());
-        }
-
-        Ok(())
-    }
-
-    pub fn new(
-        context: &'a Context,
-        target: Target,
-        name: &str,
-        filename: &str,
-        opt: OptimizationLevel,
-        math_overflow_check: bool,
-        runtime: Option<Box<Binary<'a>>>,
-    ) -> Self {
-        LLVM_INIT.get_or_init(|| {
-            inkwell::targets::Target::initialize_webassembly(&Default::default());
-            inkwell::targets::Target::initialize_bpf(&Default::default());
-        });
-
-        let triple = target.llvm_target_triple();
-        let module = context.create_module(name);
-
-        module.set_triple(&triple);
-        module.set_source_file_name(filename);
-
-        // stdlib
-        let intr = load_stdlib(context, &target);
-        module.link_in_module(intr).unwrap();
-
-        let selector =
-            module.add_global(context.i32_type(), Some(AddressSpace::Generic), "selector");
-        selector.set_linkage(Linkage::Internal);
-        selector.set_initializer(&context.i32_type().const_zero());
-
-        let calldata_len = module.add_global(
-            context.i32_type(),
-            Some(AddressSpace::Generic),
-            "calldata_len",
-        );
-        calldata_len.set_linkage(Linkage::Internal);
-        calldata_len.set_initializer(&context.i32_type().const_zero());
-
-        let calldata_data = module.add_global(
-            context.i8_type().ptr_type(AddressSpace::Generic),
-            Some(AddressSpace::Generic),
-            "calldata_data",
-        );
-        calldata_data.set_linkage(Linkage::Internal);
-        calldata_data.set_initializer(
-            &context
-                .i8_type()
-                .ptr_type(AddressSpace::Generic)
-                .const_zero(),
-        );
-
-        let mut return_values = HashMap::new();
-
-        return_values.insert(ReturnCode::Success, context.i32_type().const_zero());
-        return_values.insert(
-            ReturnCode::FunctionSelectorInvalid,
-            context.i32_type().const_int(3, false),
-        );
-        return_values.insert(
-            ReturnCode::AbiEncodingInvalid,
-            context.i32_type().const_int(2, false),
-        );
-
-        Binary {
-            name: name.to_owned(),
-            module,
-            runtime,
-            function_abort_value_transfers: false,
-            constructor_abort_value_transfers: false,
-            math_overflow_check,
-            builder: context.create_builder(),
-            context,
-            target,
-            functions: HashMap::new(),
-            code: RefCell::new(Vec::new()),
-            opt,
-            code_size: RefCell::new(None),
-            selector,
-            calldata_data,
-            calldata_len,
-            scratch: None,
-            scratch_len: None,
-            parameters: None,
-            return_values,
-        }
-    }
-
-    /// Set flags for early aborts if a value transfer is done and no function/constructor can handle it
-    pub fn set_early_value_aborts(&mut self, contract: &Contract, ns: &Namespace) {
-        // if there is no payable function, fallback or receive then abort all value transfers at the top
-        // note that receive() is always payable so this just checkes for presence.
-        self.function_abort_value_transfers = !contract.functions.iter().any(|function_no| {
-            let f = &ns.functions[*function_no];
-            !f.is_constructor() && f.is_payable()
-        });
-
-        self.constructor_abort_value_transfers = !contract.functions.iter().any(|function_no| {
-            let f = &ns.functions[*function_no];
-            f.is_constructor() && f.is_payable()
-        });
-    }
-
-    /// llvm value type, as in chain currency (usually 128 bits int)
-    fn value_type(&self, ns: &Namespace) -> IntType<'a> {
-        self.context
-            .custom_width_int_type(ns.value_length as u32 * 8)
-    }
-
-    /// llvm address type
-    fn address_type(&self, ns: &Namespace) -> ArrayType<'a> {
-        self.context.i8_type().array_type(ns.address_length as u32)
-    }
-
-    /// Creates global string in the llvm module with initializer
-    ///
-    fn emit_global_string(&self, name: &str, data: &[u8], constant: bool) -> PointerValue<'a> {
-        let ty = self.context.i8_type().array_type(data.len() as u32);
-
-        let gv = self
-            .module
-            .add_global(ty, Some(AddressSpace::Generic), name);
-
-        gv.set_linkage(Linkage::Internal);
-
-        gv.set_initializer(&self.context.const_string(data, false));
-
-        if constant {
-            gv.set_constant(true);
-            gv.set_unnamed_addr(true);
-        }
-
-        self.builder.build_pointer_cast(
-            gv.as_pointer_value(),
-            self.context.i8_type().ptr_type(AddressSpace::Generic),
-            name,
-        )
-    }
-
-    /// Wrapper for alloca. Ensures that the alloca is done on the first basic block.
-    /// If alloca is not on the first basic block, llvm will get to llvm_unreachable
-    /// for the BPF target.
-    fn build_alloca<T: BasicType<'a>>(
-        &self,
-        function: inkwell::values::FunctionValue<'a>,
-        ty: T,
-        name: &str,
-    ) -> PointerValue<'a> {
-        let entry = function
-            .get_first_basic_block()
-            .expect("function missing entry block");
-        let current = self.builder.get_insert_block().unwrap();
-
-        if let Some(instr) = &entry.get_first_instruction() {
-            self.builder.position_before(instr);
-        } else {
-            // if there is no instruction yet, then nothing was built
-            self.builder.position_at_end(entry);
-        }
-
-        let res = self.builder.build_alloca(ty, name);
-
-        self.builder.position_at_end(current);
-
-        res
-    }
-
-    fn build_array_alloca<T: BasicType<'a>>(
-        &self,
-        function: inkwell::values::FunctionValue<'a>,
-        ty: T,
-        length: IntValue<'a>,
-        name: &str,
-    ) -> PointerValue<'a> {
-        let entry = function
-            .get_first_basic_block()
-            .expect("function missing entry block");
-        let current = self.builder.get_insert_block().unwrap();
-
-        if let Some(instr) = entry.get_first_instruction() {
-            self.builder.position_before(&instr);
-        } else {
-            self.builder.position_at_end(entry);
-        }
-
-        let res = self.builder.build_array_alloca(ty, length, name);
-
-        self.builder.position_at_end(current);
-
-        res
-    }
-
-    /// Emit a loop from `from` to `to`. The closure exists to insert the body of the loop; the closure
-    /// gets the loop variable passed to it as an IntValue, and a userdata PointerValue
-    pub fn emit_static_loop_with_pointer<F>(
-        &self,
-        function: FunctionValue,
-        from: IntValue<'a>,
-        to: IntValue<'a>,
-        data_ref: &mut PointerValue<'a>,
-        mut insert_body: F,
-    ) where
-        F: FnMut(IntValue<'a>, &mut PointerValue<'a>),
-    {
-        let body = self.context.append_basic_block(function, "body");
-        let done = self.context.append_basic_block(function, "done");
-        let entry = self.builder.get_insert_block().unwrap();
-
-        self.builder.build_unconditional_branch(body);
-        self.builder.position_at_end(body);
-
-        let loop_ty = from.get_type();
-        let loop_phi = self.builder.build_phi(loop_ty, "index");
-        let data_phi = self.builder.build_phi(data_ref.get_type(), "data");
-        let mut data = data_phi.as_basic_value().into_pointer_value();
-
-        let loop_var = loop_phi.as_basic_value().into_int_value();
-
-        // add loop body
-        insert_body(loop_var, &mut data);
-
-        let next = self
-            .builder
-            .build_int_add(loop_var, loop_ty.const_int(1, false), "next_index");
-
-        let comp = self
-            .builder
-            .build_int_compare(IntPredicate::ULT, next, to, "loop_cond");
-        self.builder.build_conditional_branch(comp, body, done);
-
-        let body = self.builder.get_insert_block().unwrap();
-        loop_phi.add_incoming(&[(&from, entry), (&next, body)]);
-        data_phi.add_incoming(&[(&*data_ref, entry), (&data, body)]);
-
-        self.builder.position_at_end(done);
-
-        *data_ref = data;
-    }
-
-    /// Emit a loop from `from` to `to`. The closure exists to insert the body of the loop; the closure
-    /// gets the loop variable passed to it as an IntValue, and a userdata IntValue
-    pub fn emit_static_loop_with_int<F>(
-        &self,
-        function: FunctionValue,
-        from: IntValue<'a>,
-        to: IntValue<'a>,
-        data_ref: &mut IntValue<'a>,
-        mut insert_body: F,
-    ) where
-        F: FnMut(IntValue<'a>, &mut IntValue<'a>),
-    {
-        let body = self.context.append_basic_block(function, "body");
-        let done = self.context.append_basic_block(function, "done");
-        let entry = self.builder.get_insert_block().unwrap();
-
-        self.builder.build_unconditional_branch(body);
-        self.builder.position_at_end(body);
-
-        let loop_ty = from.get_type();
-        let loop_phi = self.builder.build_phi(loop_ty, "index");
-        let data_phi = self.builder.build_phi(data_ref.get_type(), "data");
-        let mut data = data_phi.as_basic_value().into_int_value();
-
-        let loop_var = loop_phi.as_basic_value().into_int_value();
-
-        // add loop body
-        insert_body(loop_var, &mut data);
-
-        let next = self
-            .builder
-            .build_int_add(loop_var, loop_ty.const_int(1, false), "next_index");
-
-        let comp = self
-            .builder
-            .build_int_compare(IntPredicate::ULT, next, to, "loop_cond");
-        self.builder.build_conditional_branch(comp, body, done);
-
-        let body = self.builder.get_insert_block().unwrap();
-        loop_phi.add_incoming(&[(&from, entry), (&next, body)]);
-        data_phi.add_incoming(&[(&*data_ref, entry), (&data, body)]);
-
-        self.builder.position_at_end(done);
-
-        *data_ref = data;
-    }
-
-    /// Emit a loop from `from` to `to`, checking the condition _before_ the body.
-    pub fn emit_loop_cond_first_with_int<F>(
-        &self,
-        function: FunctionValue,
-        from: IntValue<'a>,
-        to: IntValue<'a>,
-        data_ref: &mut IntValue<'a>,
-        mut insert_body: F,
-    ) where
-        F: FnMut(IntValue<'a>, &mut IntValue<'a>),
-    {
-        let cond = self.context.append_basic_block(function, "cond");
-        let body = self.context.append_basic_block(function, "body");
-        let done = self.context.append_basic_block(function, "done");
-        let entry = self.builder.get_insert_block().unwrap();
-
-        self.builder.build_unconditional_branch(cond);
-        self.builder.position_at_end(cond);
-
-        let loop_ty = from.get_type();
-        let loop_phi = self.builder.build_phi(loop_ty, "index");
-        let data_phi = self.builder.build_phi(data_ref.get_type(), "data");
-        let mut data = data_phi.as_basic_value().into_int_value();
-
-        let loop_var = loop_phi.as_basic_value().into_int_value();
-
-        let next = self
-            .builder
-            .build_int_add(loop_var, loop_ty.const_int(1, false), "next_index");
-
-        let comp = self
-            .builder
-            .build_int_compare(IntPredicate::ULT, loop_var, to, "loop_cond");
-        self.builder.build_conditional_branch(comp, body, done);
-
-        self.builder.position_at_end(body);
-        // add loop body
-        insert_body(loop_var, &mut data);
-
-        let body = self.builder.get_insert_block().unwrap();
-
-        loop_phi.add_incoming(&[(&from, entry), (&next, body)]);
-        data_phi.add_incoming(&[(&*data_ref, entry), (&data, body)]);
-
-        self.builder.build_unconditional_branch(cond);
-
-        self.builder.position_at_end(done);
-
-        *data_ref = data_phi.as_basic_value().into_int_value();
-    }
-
-    /// Emit a loop from `from` to `to`, checking the condition _before_ the body.
-    pub fn emit_loop_cond_first_with_pointer<F>(
-        &self,
-        function: FunctionValue,
-        from: IntValue<'a>,
-        to: IntValue<'a>,
-        data_ref: &mut PointerValue<'a>,
-        mut insert_body: F,
-    ) where
-        F: FnMut(IntValue<'a>, &mut PointerValue<'a>),
-    {
-        let cond = self.context.append_basic_block(function, "cond");
-        let body = self.context.append_basic_block(function, "body");
-        let done = self.context.append_basic_block(function, "done");
-        let entry = self.builder.get_insert_block().unwrap();
-
-        self.builder.build_unconditional_branch(cond);
-        self.builder.position_at_end(cond);
-
-        let loop_ty = from.get_type();
-        let loop_phi = self.builder.build_phi(loop_ty, "index");
-        let data_phi = self.builder.build_phi(data_ref.get_type(), "data");
-        let mut data = data_phi.as_basic_value().into_pointer_value();
-
-        let loop_var = loop_phi.as_basic_value().into_int_value();
-
-        let next = self
-            .builder
-            .build_int_add(loop_var, loop_ty.const_int(1, false), "next_index");
-
-        let comp = self
-            .builder
-            .build_int_compare(IntPredicate::ULT, loop_var, to, "loop_cond");
-        self.builder.build_conditional_branch(comp, body, done);
-
-        self.builder.position_at_end(body);
-        // add loop body
-        insert_body(loop_var, &mut data);
-
-        let body = self.builder.get_insert_block().unwrap();
-
-        loop_phi.add_incoming(&[(&from, entry), (&next, body)]);
-        data_phi.add_incoming(&[(&*data_ref, entry), (&data, body)]);
-
-        self.builder.build_unconditional_branch(cond);
-
-        self.builder.position_at_end(done);
-
-        *data_ref = data_phi.as_basic_value().into_pointer_value();
-    }
-
-    /// Convert a BigInt number to llvm const value
-    fn number_literal(&self, bits: u32, n: &BigInt, _ns: &Namespace) -> IntValue<'a> {
-        let ty = self.context.custom_width_int_type(bits);
-        let s = n.to_string();
-
-        ty.const_int_from_string(&s, StringRadix::Decimal).unwrap()
-    }
-
-    /// Emit function prototype
-    fn function_type(&self, params: &[Type], returns: &[Type], ns: &Namespace) -> FunctionType<'a> {
-        // function parameters
-        let mut args = params
-            .iter()
-            .map(|ty| self.llvm_var(ty, ns).into())
-            .collect::<Vec<BasicMetadataTypeEnum>>();
-
-        // add return values
-        for ty in returns {
-            args.push(if ty.is_reference_type(ns) && !ty.is_contract_storage() {
-                self.llvm_type(ty, ns)
-                    .ptr_type(AddressSpace::Generic)
-                    .ptr_type(AddressSpace::Generic)
-                    .into()
-            } else {
-                self.llvm_type(ty, ns)
-                    .ptr_type(AddressSpace::Generic)
-                    .into()
-            });
-        }
-
-        // On Solana, we need to pass around the accounts
-        if ns.target == Target::Solana {
-            args.push(
-                self.module
-                    .get_struct_type("struct.SolParameters")
-                    .unwrap()
-                    .ptr_type(AddressSpace::Generic)
-                    .into(),
-            );
-        }
-
-        // Solana return type should be 64 bit, 32 bit on wasm
-        self.return_values[&ReturnCode::Success]
-            .get_type()
-            .fn_type(&args, false)
-    }
-
-    // Create the llvm intrinsic for counting leading zeros
-    pub fn llvm_ctlz(&self, bit: u32) -> FunctionValue<'a> {
-        let name = format!("llvm.ctlz.i{}", bit);
-        let ty = self.context.custom_width_int_type(bit);
-
-        if let Some(f) = self.module.get_function(&name) {
-            return f;
-        }
-
-        self.module.add_function(
-            &name,
-            ty.fn_type(&[ty.into(), self.context.bool_type().into()], false),
-            None,
-        )
-    }
-
-    // Create the llvm intrinsic for bswap
-    pub fn llvm_bswap(&self, bit: u32) -> FunctionValue<'a> {
-        let name = format!("llvm.bswap.i{}", bit);
-        let ty = self.context.custom_width_int_type(bit);
-
-        if let Some(f) = self.module.get_function(&name) {
-            return f;
-        }
-
-        self.module
-            .add_function(&name, ty.fn_type(&[ty.into()], false), None)
-    }
-
-    // Create the llvm intrinsic for overflows
-    pub fn llvm_overflow(
-        &self,
-        ret_ty: BasicTypeEnum<'a>,
-        ty: IntType<'a>,
-        signed: bool,
-        op: BinaryOp,
-    ) -> FunctionValue<'a> {
-        let bit = ty.get_bit_width();
-        let name = format!(
-            "llvm.{}{}.with.overflow.i{}",
-            if signed { "s" } else { "u" },
-            op,
-            bit,
-        );
-
-        if let Some(f) = self.module.get_function(&name) {
-            return f;
-        }
-
-        self.module
-            .add_function(&name, ret_ty.fn_type(&[ty.into(), ty.into()], false), None)
-    }
-
-    /// Return the llvm type for a variable holding the type, not the type itself
-    fn llvm_var(&self, ty: &Type, ns: &Namespace) -> BasicTypeEnum<'a> {
-        let llvm_ty = self.llvm_type(ty, ns);
-        match ty.deref_memory() {
-            Type::Struct(_) | Type::Array(..) | Type::DynamicBytes | Type::String => {
-                llvm_ty.ptr_type(AddressSpace::Generic).as_basic_type_enum()
-            }
-            _ => llvm_ty,
-        }
-    }
-
-    /// Default empty value
-    fn default_value(&self, ty: &Type, ns: &Namespace) -> BasicValueEnum<'a> {
-        let llvm_ty = self.llvm_var(ty, ns);
-
-        // const_zero() on BasicTypeEnum yet. Should be coming to inkwell soon
-        if llvm_ty.is_pointer_type() {
-            llvm_ty.into_pointer_type().const_null().into()
-        } else if llvm_ty.is_array_type() {
-            self.address_type(ns).const_zero().into()
-        } else {
-            llvm_ty.into_int_type().const_zero().into()
-        }
-    }
-
-    /// Return the llvm type for the resolved type.
-    fn llvm_type(&self, ty: &Type, ns: &Namespace) -> BasicTypeEnum<'a> {
-        if ty.builtin_struct(ns) == BuiltinStruct::AccountInfo {
-            return self
-                .module
-                .get_struct_type("struct.SolAccountInfo")
-                .unwrap()
-                .into();
-        } else {
-            match ty {
-                Type::Bool => BasicTypeEnum::IntType(self.context.bool_type()),
-                Type::Int(n) | Type::Uint(n) => {
-                    BasicTypeEnum::IntType(self.context.custom_width_int_type(*n as u32))
-                }
-                Type::Value => BasicTypeEnum::IntType(
-                    self.context
-                        .custom_width_int_type(ns.value_length as u32 * 8),
-                ),
-                Type::Contract(_) | Type::Address(_) => {
-                    BasicTypeEnum::ArrayType(self.address_type(ns))
-                }
-                Type::Bytes(n) => {
-                    BasicTypeEnum::IntType(self.context.custom_width_int_type(*n as u32 * 8))
-                }
-                Type::Enum(n) => self.llvm_type(&ns.enums[*n].ty, ns),
-                Type::String | Type::DynamicBytes => {
-                    self.module.get_struct_type("struct.vector").unwrap().into()
-                }
-                Type::Array(base_ty, dims) => {
-                    let ty = self.llvm_var(base_ty, ns);
-
-                    let mut dims = dims.iter();
-
-                    let mut aty = match dims.next().unwrap() {
-                        Some(d) => ty.array_type(d.to_u32().unwrap()),
-                        None => {
-                            return self.module.get_struct_type("struct.vector").unwrap().into()
-                        }
-                    };
-
-                    for dim in dims {
-                        match dim {
-                            Some(d) => aty = aty.array_type(d.to_u32().unwrap()),
-                            None => {
-                                return self.module.get_struct_type("struct.vector").unwrap().into()
-                            }
-                        }
-                    }
-
-                    BasicTypeEnum::ArrayType(aty)
-                }
-                Type::Struct(n) => self
-                    .context
-                    .struct_type(
-                        &ns.structs[*n]
-                            .fields
-                            .iter()
-                            .map(|f| self.llvm_var(&f.ty, ns))
-                            .collect::<Vec<BasicTypeEnum>>(),
-                        false,
-                    )
-                    .as_basic_type_enum(),
-                Type::Mapping(..) => unreachable!(),
-                Type::Ref(r) => self
-                    .llvm_type(r, ns)
-                    .ptr_type(AddressSpace::Generic)
-                    .as_basic_type_enum(),
-                Type::StorageRef(..) => self.llvm_type(&ns.storage_type(), ns),
-                Type::InternalFunction {
-                    params, returns, ..
-                } => {
-                    let ftype = self.function_type(params, returns, ns);
-
-                    BasicTypeEnum::PointerType(ftype.ptr_type(AddressSpace::Generic))
-                }
-                Type::ExternalFunction { .. } => {
-                    let address = self.llvm_type(&Type::Address(false), ns);
-                    let selector = self.llvm_type(&Type::Uint(32), ns);
-
-                    BasicTypeEnum::PointerType(
-                        self.context
-                            .struct_type(&[address, selector], false)
-                            .ptr_type(AddressSpace::Generic),
-                    )
-                }
-                Type::Slice => BasicTypeEnum::StructType(
-                    self.context.struct_type(
-                        &[
-                            self.context
-                                .i8_type()
-                                .ptr_type(AddressSpace::Generic)
-                                .into(),
-                            self.context.i32_type().into(),
-                        ],
-                        false,
-                    ),
-                ),
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    /// ewasm deployer needs to know what its own code size is, so we compile once to
-    /// get the size, patch in the value and then recompile.
-    fn patch_code_size(&self, code_size: u64) -> bool {
-        let current_size = {
-            let current_size_opt = self.code_size.borrow();
-
-            if let Some(current_size) = *current_size_opt {
-                if code_size == current_size.get_zero_extended_constant().unwrap() {
-                    return false;
-                }
-
-                current_size
-            } else {
-                return false;
-            }
-        };
-
-        let new_size = self.context.i32_type().const_int(code_size, false);
-
-        current_size.replace_all_uses_with(new_size);
-
-        self.code_size.replace(Some(new_size));
-
-        true
-    }
-
-    /// Allocate vector
-    fn vector_new(
-        &self,
-        size: IntValue<'a>,
-        elem_size: IntValue<'a>,
-        init: Option<&Vec<u8>>,
-    ) -> PointerValue<'a> {
-        if let Some(init) = init {
-            if init.is_empty() {
-                return self
-                    .module
-                    .get_struct_type("struct.vector")
-                    .unwrap()
-                    .ptr_type(AddressSpace::Generic)
-                    .const_null();
-            }
-        }
-
-        let init = match init {
-            None => self.builder.build_int_to_ptr(
-                self.context.i32_type().const_all_ones(),
-                self.context.i8_type().ptr_type(AddressSpace::Generic),
-                "invalid",
-            ),
-            Some(s) => self.emit_global_string("const_string", s, true),
-        };
-
-        let v = self
-            .builder
-            .build_call(
-                self.module.get_function("vector_new").unwrap(),
-                &[size.into(), elem_size.into(), init.into()],
-                "",
-            )
-            .try_as_basic_value()
-            .left()
-            .unwrap();
-
-        self.builder.build_pointer_cast(
-            v.into_pointer_value(),
-            self.module
-                .get_struct_type("struct.vector")
-                .unwrap()
-                .ptr_type(AddressSpace::Generic),
-            "vector",
-        )
-    }
-
-    /// Number of element in a vector
-    fn vector_len(&self, vector: BasicValueEnum<'a>) -> IntValue<'a> {
-        if vector.is_struct_value() {
-            // slice
-            let slice = vector.into_struct_value();
-
-            self.builder
-                .build_extract_value(slice, 1, "slice_len")
-                .unwrap()
-                .into_int_value()
-        } else {
-            let struct_ty = vector
-                .into_pointer_value()
-                .get_type()
-                .get_element_type()
-                .into_struct_type();
-            let name = struct_ty.get_name().unwrap();
-
-            if name == CStr::from_bytes_with_nul(b"struct.SolAccountInfo\0").unwrap() {
-                // load the data pointer
-                let data = self
-                    .builder
-                    .build_load(
-                        self.builder
-                            .build_struct_gep(vector.into_pointer_value(), 3, "data")
-                            .unwrap(),
-                        "data",
-                    )
-                    .into_pointer_value();
-
-                // get the offset of the return data
-                let header_ptr = self.builder.build_pointer_cast(
-                    data,
-                    self.context.i32_type().ptr_type(AddressSpace::Generic),
-                    "header_ptr",
-                );
-
-                let data_len_ptr = unsafe {
-                    self.builder.build_gep(
-                        header_ptr,
-                        &[self.context.i64_type().const_int(1, false)],
-                        "data_len_ptr",
-                    )
-                };
-
-                self.builder
-                    .build_load(data_len_ptr, "len")
-                    .into_int_value()
-            } else {
-                // field 0 is the length
-                let vector = vector.into_pointer_value();
-
-                let len = unsafe {
-                    self.builder.build_gep(
-                        vector,
-                        &[
-                            self.context.i32_type().const_zero(),
-                            self.context.i32_type().const_zero(),
-                        ],
-                        "vector_len",
-                    )
-                };
-
-                self.builder
-                    .build_select(
-                        self.builder.build_is_null(vector, "vector_is_null"),
-                        self.context.i32_type().const_zero(),
-                        self.builder.build_load(len, "vector_len").into_int_value(),
-                        "length",
-                    )
-                    .into_int_value()
-            }
-        }
-    }
-
-    /// Return the pointer to the actual bytes in the vector
-    fn vector_bytes(&self, vector: BasicValueEnum<'a>) -> PointerValue<'a> {
-        if vector.is_struct_value() {
-            // slice
-            let slice = vector.into_struct_value();
-
-            self.builder
-                .build_extract_value(slice, 0, "slice_data")
-                .unwrap()
-                .into_pointer_value()
-        } else {
-            let data = unsafe {
-                self.builder.build_gep(
-                    vector.into_pointer_value(),
-                    &[
-                        self.context.i32_type().const_zero(),
-                        self.context.i32_type().const_int(2, false),
-                    ],
-                    "data",
-                )
-            };
-
-            self.builder.build_pointer_cast(
-                data,
-                self.context.i8_type().ptr_type(AddressSpace::Generic),
-                "data",
-            )
-        }
-    }
-
-    /// Dereference an array
-    fn array_subscript(
-        &self,
-        array_ty: &Type,
-        array: PointerValue<'a>,
-        index: IntValue<'a>,
-        ns: &Namespace,
-    ) -> PointerValue<'a> {
-        match array_ty {
-            Type::Array(_, dim) => {
-                if dim[0].is_some() {
-                    // fixed size array
-                    unsafe {
-                        self.builder.build_gep(
-                            array,
-                            &[self.context.i32_type().const_zero(), index],
-                            "index_access",
-                        )
-                    }
-                } else {
-                    let elem_ty = array_ty.array_deref();
-                    let llvm_elem_ty = self.llvm_var(&elem_ty, ns);
-
-                    // dynamic length array or vector
-                    let index = self.builder.build_int_mul(
-                        index,
-                        llvm_elem_ty
-                            .into_pointer_type()
-                            .get_element_type()
-                            .size_of()
-                            .unwrap()
-                            .const_cast(self.context.i32_type(), false),
-                        "",
-                    );
-
-                    let elem = unsafe {
-                        self.builder.build_gep(
-                            array,
-                            &[
-                                self.context.i32_type().const_zero(),
-                                self.context.i32_type().const_int(2, false),
-                                index,
-                            ],
-                            "index_access",
-                        )
-                    };
-
-                    self.builder
-                        .build_pointer_cast(elem, llvm_elem_ty.into_pointer_type(), "elem")
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-static BPF_IR: [&[u8]; 5] = [
-    include_bytes!("../../stdlib/bpf/stdlib.bc"),
-    include_bytes!("../../stdlib/bpf/bigint.bc"),
-    include_bytes!("../../stdlib/bpf/format.bc"),
-    include_bytes!("../../stdlib/bpf/solana.bc"),
-    include_bytes!("../../stdlib/bpf/ripemd160.bc"),
-];
-
-static WASM_IR: [&[u8]; 4] = [
-    include_bytes!("../../stdlib/wasm/stdlib.bc"),
-    include_bytes!("../../stdlib/wasm/wasmheap.bc"),
-    include_bytes!("../../stdlib/wasm/bigint.bc"),
-    include_bytes!("../../stdlib/wasm/format.bc"),
-];
-
-static RIPEMD160_IR: &[u8] = include_bytes!("../../stdlib/wasm/ripemd160.bc");
-static SUBSTRATE_IR: &[u8] = include_bytes!("../../stdlib/wasm/substrate.bc");
-
-/// Return the stdlib as parsed llvm module. The solidity standard library is hardcoded into
-/// the solang library
-fn load_stdlib<'a>(context: &'a Context, target: &Target) -> Module<'a> {
-    if *target == Target::Solana {
-        let memory = MemoryBuffer::create_from_memory_range(BPF_IR[0], "bpf_bc");
-
-        let module = Module::parse_bitcode_from_buffer(&memory, context).unwrap();
-
-        for bc in BPF_IR.iter().skip(1) {
-            let memory = MemoryBuffer::create_from_memory_range(bc, "bpf_bc");
-
-            module
-                .link_in_module(Module::parse_bitcode_from_buffer(&memory, context).unwrap())
-                .unwrap();
-        }
-
-        return module;
-    }
-
-    let memory = MemoryBuffer::create_from_memory_range(WASM_IR[0], "wasm_bc");
-
-    let module = Module::parse_bitcode_from_buffer(&memory, context).unwrap();
-
-    for bc in WASM_IR.iter().skip(1) {
-        let memory = MemoryBuffer::create_from_memory_range(bc, "wasm_bc");
-
-        module
-            .link_in_module(Module::parse_bitcode_from_buffer(&memory, context).unwrap())
-            .unwrap();
-    }
-
-    if let Target::Substrate { .. } = *target {
-        let memory = MemoryBuffer::create_from_memory_range(SUBSTRATE_IR, "substrate");
-
-        module
-            .link_in_module(Module::parse_bitcode_from_buffer(&memory, context).unwrap())
-            .unwrap();
-
-        // substrate does not provide ripemd160
-        let memory = MemoryBuffer::create_from_memory_range(RIPEMD160_IR, "ripemd160");
-
-        module
-            .link_in_module(Module::parse_bitcode_from_buffer(&memory, context).unwrap())
-            .unwrap();
-    }
-
-    module
 }
 
 impl Target {

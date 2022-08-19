@@ -1,6 +1,7 @@
-use crate::{build_solidity, no_errors};
-use parity_scale_codec::{Decode, Encode};
+// SPDX-License-Identifier: Apache-2.0
 
+use crate::build_solidity;
+use parity_scale_codec::{Decode, Encode};
 use solang::{file_resolver::FileResolver, Target};
 use std::ffi::OsStr;
 
@@ -24,7 +25,7 @@ fn emit() {
     assert_eq!(event.topics.len(), 0);
     assert_eq!(event.data, (0u8, true).encode());
 
-    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[derive(Debug, PartialEq, Eq, Encode, Decode)]
     struct Foo(u8, bool, u32);
 
     let mut runtime = build_solidity(
@@ -89,7 +90,7 @@ fn event_imported() {
     let ns =
         solang::parse_and_resolve(OsStr::new("a.sol"), &mut cache, Target::default_substrate());
 
-    no_errors(ns.diagnostics);
+    assert!(!ns.diagnostics.any_errors());
 
     let mut cache = FileResolver::new();
 
@@ -120,7 +121,7 @@ fn event_imported() {
     let ns =
         solang::parse_and_resolve(OsStr::new("a.sol"), &mut cache, Target::default_substrate());
 
-    no_errors(ns.diagnostics);
+    assert!(!ns.diagnostics.any_errors());
 
     let mut cache = FileResolver::new();
 
@@ -151,7 +152,7 @@ fn event_imported() {
     let ns =
         solang::parse_and_resolve(OsStr::new("a.sol"), &mut cache, Target::default_substrate());
 
-    no_errors(ns.diagnostics);
+    assert!(!ns.diagnostics.any_errors());
 
     let mut cache = FileResolver::new();
 
@@ -180,5 +181,5 @@ fn event_imported() {
     let ns =
         solang::parse_and_resolve(OsStr::new("a.sol"), &mut cache, Target::default_substrate());
 
-    no_errors(ns.diagnostics);
+    assert!(!ns.diagnostics.any_errors());
 }

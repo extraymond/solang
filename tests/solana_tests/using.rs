@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 
 #[test]
@@ -27,8 +29,8 @@ fn using_for_contracts() {
         }"#,
     );
 
-    runtime.constructor("C", &[], 0);
-    runtime.function("test", &[], &[], 0, None);
+    runtime.constructor("C", &[]);
+    runtime.function("test", &[], &[], None);
 
     assert_eq!(runtime.logs, "Hello");
 
@@ -70,8 +72,8 @@ fn using_for_contracts() {
         }"#,
     );
 
-    runtime.constructor("foo", &[], 0);
-    runtime.function("test", &[], &[], 0, None);
+    runtime.constructor("foo", &[]);
+    runtime.function("test", &[], &[], None);
 
     assert_eq!(runtime.logs, "X libX contractx:2");
 }

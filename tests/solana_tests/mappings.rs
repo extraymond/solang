@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{account_new, build_solidity};
 use ethabi::{ethereum_types::U256, Token};
 
@@ -22,7 +24,7 @@ fn simple_mapping() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     for i in 0..10 {
         vm.function(
@@ -32,25 +34,24 @@ fn simple_mapping() {
                 Token::Uint(U256::from(300331 + i)),
             ],
             &[],
-            0,
             None,
         );
     }
 
     for i in 0..10 {
-        let returns = vm.function("get", &[Token::Uint(U256::from(102 + i))], &[], 0, None);
+        let returns = vm.function("get", &[Token::Uint(U256::from(102 + i))], &[], None);
 
         assert_eq!(returns, vec![Token::Uint(U256::from(300331 + i))]);
     }
 
-    let returns = vm.function("get", &[Token::Uint(U256::from(101))], &[], 0, None);
+    let returns = vm.function("get", &[Token::Uint(U256::from(101))], &[], None);
 
     assert_eq!(returns, vec![Token::Uint(U256::from(0))]);
 
-    vm.function("rm", &[Token::Uint(U256::from(104))], &[], 0, None);
+    vm.function("rm", &[Token::Uint(U256::from(104))], &[], None);
 
     for i in 0..10 {
-        let returns = vm.function("get", &[Token::Uint(U256::from(102 + i))], &[], 0, None);
+        let returns = vm.function("get", &[Token::Uint(U256::from(102 + i))], &[], None);
 
         if 102 + i != 104 {
             assert_eq!(returns, vec![Token::Uint(U256::from(300331 + i))]);
@@ -90,14 +91,14 @@ fn less_simple_mapping() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "set_string",
         &[
             Token::Uint(U256::from(12313132131321312311213131u128)),
             Token::String(String::from("This is a string which should be a little longer than 32 bytes so we the the abi encoder")),
-        ], &[], 0, None
+        ], &[], None
     );
 
     vm.function(
@@ -107,7 +108,6 @@ fn less_simple_mapping() {
             Token::Int(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -115,7 +115,6 @@ fn less_simple_mapping() {
         "get",
         &[Token::Uint(U256::from(12313132131321312311213131u128))],
         &[],
-        0,
         None,
     );
 
@@ -158,14 +157,14 @@ fn string_mapping() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "set_string",
         &[
             Token::String(String::from("a")),
             Token::String(String::from("This is a string which should be a little longer than 32 bytes so we the the abi encoder")),
-        ], &[],0, None
+        ], &[], None
     );
 
     vm.function(
@@ -175,11 +174,10 @@ fn string_mapping() {
             Token::Int(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
-    let returns = vm.function("get", &[Token::String(String::from("a"))], &[], 0, None);
+    let returns = vm.function("get", &[Token::String(String::from("a"))], &[], None);
 
     assert_eq!(
         returns,
@@ -213,7 +211,7 @@ fn contract_mapping() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     let index = Token::FixedBytes(account_new().to_vec());
 
@@ -222,19 +220,19 @@ fn contract_mapping() {
         &[
             index.clone(),
             Token::String(String::from("This is a string which should be a little longer than 32 bytes so we the the abi encoder")),
-        ], &[],0, None
+        ], &[], None
     );
 
-    let returns = vm.function("get", &[index.clone()], &[], 0, None);
+    let returns = vm.function("get", &[index.clone()], &[], None);
 
     assert_eq!(
         returns,
         vec![Token::String(String::from("This is a string which should be a little longer than 32 bytes so we the the abi encoder"))]
     );
 
-    vm.function("rm", &[index.clone()], &[], 0, None);
+    vm.function("rm", &[index.clone()], &[], None);
 
-    let returns = vm.function("get", &[index], &[], 0, None);
+    let returns = vm.function("get", &[index], &[], None);
 
     assert_eq!(returns, vec![Token::String(String::from(""))]);
 }
@@ -252,7 +250,7 @@ fn mapping_in_mapping() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "set",
@@ -262,7 +260,6 @@ fn mapping_in_mapping() {
             Token::FixedBytes(vec![0x98]),
         ],
         &[],
-        0,
         None,
     );
 
@@ -273,7 +270,6 @@ fn mapping_in_mapping() {
             Token::Int(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -286,7 +282,6 @@ fn mapping_in_mapping() {
             Token::Int(U256::from(103)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -299,7 +294,6 @@ fn mapping_in_mapping() {
             Token::Int(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -336,14 +330,14 @@ fn sparse_array() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "set_string",
         &[
             Token::Uint(U256::from(909090909)),
             Token::String(String::from("This is a string which should be a little longer than 32 bytes so we the the abi encoder")),
-        ], &[],0, None
+        ], &[], None
     );
 
     vm.function(
@@ -353,11 +347,10 @@ fn sparse_array() {
             Token::Int(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
-    let returns = vm.function("get", &[Token::Uint(U256::from(909090909))], &[], 0, None);
+    let returns = vm.function("get", &[Token::Uint(U256::from(909090909))], &[], None);
 
     assert_eq!(
         returns,
@@ -398,14 +391,14 @@ fn massive_sparse_array() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "set_string",
         &[
             Token::Uint(U256::from(786868768768678687686877u128)),
             Token::String(String::from("This is a string which should be a little longer than 32 bytes so we the the abi encoder")),
-        ], &[],0, None
+        ], &[], None
     );
 
     vm.function(
@@ -415,7 +408,6 @@ fn massive_sparse_array() {
             Token::Int(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -423,7 +415,6 @@ fn massive_sparse_array() {
         "get",
         &[Token::Uint(U256::from(786868768768678687686877u128))],
         &[],
-        0,
         None,
     );
 
@@ -470,18 +461,17 @@ fn mapping_in_dynamic_array() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "setNumber",
         &[Token::Int(U256::from(2147483647))],
         &[],
-        0,
         None,
     );
 
-    vm.function("push", &[], &[], 0, None);
-    vm.function("push", &[], &[], 0, None);
+    vm.function("push", &[], &[], None);
+    vm.function("push", &[], &[], None);
 
     for array_no in 0..2 {
         for i in 0..10 {
@@ -493,7 +483,6 @@ fn mapping_in_dynamic_array() {
                     Token::Uint(U256::from(300331 + i)),
                 ],
                 &[],
-                0,
                 None,
             );
         }
@@ -508,7 +497,6 @@ fn mapping_in_dynamic_array() {
                     Token::Uint(U256::from(102 + i + array_no * 500)),
                 ],
                 &[],
-                0,
                 None,
             );
 
@@ -520,7 +508,6 @@ fn mapping_in_dynamic_array() {
         "map",
         &[Token::Uint(U256::from(0)), Token::Uint(U256::from(101))],
         &[],
-        0,
         None,
     );
 
@@ -530,7 +517,6 @@ fn mapping_in_dynamic_array() {
         "rm",
         &[Token::Uint(U256::from(0)), Token::Uint(U256::from(104))],
         &[],
-        0,
         None,
     );
 
@@ -539,7 +525,6 @@ fn mapping_in_dynamic_array() {
             "map",
             &[Token::Uint(U256::from(0)), Token::Uint(U256::from(102 + i))],
             &[],
-            0,
             None,
         );
 
@@ -550,20 +535,20 @@ fn mapping_in_dynamic_array() {
         }
     }
 
-    let returns = vm.function("length", &[], &[], 0, None);
+    let returns = vm.function("length", &[], &[], None);
     assert_eq!(returns, vec![Token::Uint(U256::from(2))]);
 
-    vm.function("pop", &[], &[], 0, None);
+    vm.function("pop", &[], &[], None);
 
-    let returns = vm.function("length", &[], &[], 0, None);
+    let returns = vm.function("length", &[], &[], None);
     assert_eq!(returns, vec![Token::Uint(U256::from(1))]);
 
-    vm.function("pop", &[], &[], 0, None);
+    vm.function("pop", &[], &[], None);
 
-    let returns = vm.function("length", &[], &[], 0, None);
+    let returns = vm.function("length", &[], &[], None);
     assert_eq!(returns, vec![Token::Uint(U256::from(0))]);
 
-    let returns = vm.function("number", &[], &[], 0, None);
+    let returns = vm.function("number", &[], &[], None);
 
     assert_eq!(returns, vec![Token::Int(U256::from(2147483647))]);
 }
@@ -606,18 +591,17 @@ fn mapping_in_struct_in_dynamic_array() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "setNumber",
         &[Token::Int(U256::from(2147483647))],
         &[],
-        0,
         None,
     );
 
-    vm.function("push", &[], &[], 0, None);
-    vm.function("push", &[], &[], 0, None);
+    vm.function("push", &[], &[], None);
+    vm.function("push", &[], &[], None);
 
     for array_no in 0..2 {
         for i in 0..10 {
@@ -629,7 +613,6 @@ fn mapping_in_struct_in_dynamic_array() {
                     Token::Uint(U256::from(300331 + i)),
                 ],
                 &[],
-                0,
                 None,
             );
         }
@@ -644,7 +627,6 @@ fn mapping_in_struct_in_dynamic_array() {
                     Token::Uint(U256::from(102 + i + array_no * 500)),
                 ],
                 &[],
-                0,
                 None,
             );
 
@@ -656,7 +638,6 @@ fn mapping_in_struct_in_dynamic_array() {
         "get",
         &[Token::Uint(U256::from(0)), Token::Uint(U256::from(101))],
         &[],
-        0,
         None,
     );
 
@@ -666,7 +647,6 @@ fn mapping_in_struct_in_dynamic_array() {
         "rm",
         &[Token::Uint(U256::from(0)), Token::Uint(U256::from(104))],
         &[],
-        0,
         None,
     );
 
@@ -675,7 +655,6 @@ fn mapping_in_struct_in_dynamic_array() {
             "get",
             &[Token::Uint(U256::from(0)), Token::Uint(U256::from(102 + i))],
             &[],
-            0,
             None,
         );
 
@@ -686,10 +665,115 @@ fn mapping_in_struct_in_dynamic_array() {
         }
     }
 
-    vm.function("pop", &[], &[], 0, None);
-    vm.function("pop", &[], &[], 0, None);
+    vm.function("pop", &[], &[], None);
+    vm.function("pop", &[], &[], None);
 
-    let returns = vm.function("number", &[], &[], 0, None);
+    let returns = vm.function("number", &[], &[], None);
 
     assert_eq!(returns, vec![Token::Int(U256::from(2147483647))]);
+}
+
+#[test]
+fn mapping_delete() {
+    let mut vm = build_solidity(
+        r#"
+contract DeleteTest {
+
+    struct data_struct  {
+        address addr1;
+	    address addr2;
+    }
+
+    mapping(uint => data_struct) example;
+
+    function addData() public  {
+        data_struct dt = data_struct({addr1: address(this), addr2: msg.sender});
+        uint id = 1;
+        example[id] = dt;
+    }
+
+    function deltest() external {
+        uint id = 1;
+        delete example[id];
+    }
+
+    function get() public view returns (data_struct calldata) {
+        uint id = 1;
+        return example[id];
+    }
+
+}
+        "#,
+    );
+
+    vm.constructor("DeleteTest", &[]);
+    let _ = vm.function("addData", &[], &[], None);
+    let _ = vm.function("deltest", &[], &[], None);
+    let returns = vm.function("get", &[], &[], None);
+    assert_eq!(
+        returns,
+        vec![Token::Tuple(vec![
+            Token::FixedBytes(vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0
+            ]),
+            Token::FixedBytes(vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0
+            ])
+        ])],
+    );
+}
+
+#[test]
+fn mapping_within_struct() {
+    let mut vm = build_solidity(
+        r#"
+contract CrowdFunding {
+    struct Funder {
+        address addr;
+        uint amount;
+    }
+
+    struct Campaign {
+        mapping(uint => Funder)[2] arr_mp;
+        mapping (uint => Funder) funders;
+    }
+
+    uint numCampaigns;
+    mapping (uint => Campaign) campaigns;
+
+
+function newCampaign() public returns (uint campaignID) {
+    campaignID = numCampaigns++;
+    Campaign storage _campaign = campaigns[campaignID];
+    _campaign.funders[0] = Funder(msg.sender, 100);
+    _campaign.arr_mp[1][0] = Funder(msg.sender, 105);
+}
+
+function getAmt() public view returns (uint) {
+    Campaign storage _campaign = campaigns[numCampaigns - 1];
+    return _campaign.funders[0].amount;
+}
+
+function getArrAmt() public view returns (uint) {
+    Campaign storage _campaign = campaigns[numCampaigns - 1];
+    return _campaign.arr_mp[1][0].amount;
+}
+
+}
+        "#,
+    );
+
+    vm.constructor("CrowdFunding", &[]);
+
+    let ret = vm.function("newCampaign", &[], &[], None);
+
+    assert_eq!(ret, vec![Token::Uint(U256::from(0))]);
+
+    let ret = vm.function("getAmt", &[], &[], None);
+    assert_eq!(ret, vec![Token::Uint(U256::from(100))]);
+
+    let ret = vm.function("getArrAmt", &[], &[], None);
+    assert_eq!(ret, vec![Token::Uint(U256::from(105))]);
 }

@@ -1,22 +1,23 @@
-//! Solidity file parser
+// SPDX-License-Identifier: Apache-2.0
 
+//! Solidity file parser
+use crate::pt::CodeLocation;
+use diagnostics::Diagnostic;
 use lalrpop_util::ParseError;
 
-pub use diagnostics::Diagnostic;
-
 pub mod diagnostics;
-mod doc;
-pub mod lexer;
+pub mod doccomment;
+mod lexer;
 pub mod pt;
 #[cfg(test)]
 mod test;
 
 #[allow(clippy::all)]
-pub mod solidity {
+mod solidity {
     include!(concat!(env!("OUT_DIR"), "/solidity.rs"));
 }
 
-/// Parse soldiity file content
+/// Parse solidity file
 pub fn parse(
     src: &str,
     file_no: usize,
@@ -40,15 +41,15 @@ pub fn parse(
             } => Diagnostic::parser_error(
                 pt::Loc::File(file_no, l, r),
                 format!(
-                    "unrecognised token `{}', expected {}",
+                    "unrecognised token '{}', expected {}",
                     token,
                     expected.join(", ")
                 ),
             ),
-            ParseError::User { error } => Diagnostic::parser_error(*error.loc(), error.to_string()),
+            ParseError::User { error } => Diagnostic::parser_error(error.loc(), error.to_string()),
             ParseError::ExtraToken { token } => Diagnostic::parser_error(
                 pt::Loc::File(file_no, token.0, token.2),
-                format!("extra token `{}' encountered", token.0),
+                format!("extra token '{}' encountered", token.0),
             ),
             ParseError::UnrecognizedEOF { location, expected } => Diagnostic::parser_error(
                 pt::Loc::File(file_no, location, location),
@@ -60,8 +61,4 @@ pub fn parse(
     } else {
         Ok((s.unwrap(), comments))
     }
-}
-
-pub fn box_option<T>(o: Option<T>) -> Option<Box<T>> {
-    o.map(Box::new)
 }

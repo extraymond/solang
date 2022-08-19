@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use solang::sema::ast;
 use solang::sema::builtin;
 
@@ -7,5 +9,5 @@ fn builtin_prototype() {
 
     assert_eq!(p.namespace, Some("block"));
     assert_eq!(p.name, "timestamp");
-    assert!(p.args.is_empty());
+    assert!(p.params.is_empty());
 }

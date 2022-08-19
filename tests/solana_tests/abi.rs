@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 
 #[test]
@@ -35,11 +37,11 @@ fn packed() {
         }"#,
     );
 
-    vm.constructor("bar", &[], 0);
+    vm.constructor("bar", &[]);
 
-    vm.function("test", &[], &[], 0, None);
-    vm.function("test2", &[], &[], 0, None);
-    vm.function("test3", &[], &[], 0, None);
+    vm.function("test", &[], &[], None);
+    vm.function("test2", &[], &[], None);
+    vm.function("test3", &[], &[], None);
 }
 
 #[test]
@@ -54,9 +56,9 @@ fn inherited() {
         }"#,
     );
 
-    vm.constructor("bar", &[], 0);
+    vm.constructor("bar", &[]);
 
-    vm.function("test", &[], &[], 0, None);
+    vm.function("test", &[], &[], None);
 
     let mut vm = build_solidity(
         r#"
@@ -67,7 +69,7 @@ fn inherited() {
             }"#,
     );
 
-    vm.constructor("bar", &[], 0);
+    vm.constructor("bar", &[]);
 
-    vm.function("test", &[], &[], 0, None);
+    vm.function("test", &[], &[], None);
 }

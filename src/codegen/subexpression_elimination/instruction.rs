@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::codegen::cfg::Instr;
 use crate::codegen::subexpression_elimination::common_subexpression_tracker::CommonSubExpressionTracker;
 use crate::codegen::subexpression_elimination::AvailableExpression;
 use crate::codegen::subexpression_elimination::{AvailableExpressionSet, AvailableVariable};
-use crate::sema::ast::Expression;
+use crate::codegen::Expression;
 
 impl AvailableExpressionSet {
     /// Check if we can add the expressions of an instruction to the graph
@@ -14,7 +16,6 @@ impl AvailableExpressionSet {
     ) {
         match instr {
             Instr::BranchCond { cond: expr, .. }
-            | Instr::Store { dest: expr, .. }
             | Instr::LoadStorage { storage: expr, .. }
             | Instr::ClearStorage { storage: expr, .. }
             | Instr::Print { expr }
@@ -37,6 +38,7 @@ impl AvailableExpressionSet {
                         node.available_variable = AvailableVariable::Available(*res, *loc);
                     }
                 }
+                cst.invalidate_mapped_variable(res);
                 self.kill(*res);
             }
 
@@ -44,9 +46,17 @@ impl AvailableExpressionSet {
                 let _ = self.gen_expression(expr, ave, cst);
             }
 
-            Instr::SetStorage { value, storage, .. } => {
-                let _ = self.gen_expression(value, ave, cst);
-                let _ = self.gen_expression(storage, ave, cst);
+            Instr::SetStorage {
+                value: item_1,
+                storage: item_2,
+                ..
+            }
+            | Instr::Store {
+                dest: item_1,
+                data: item_2,
+            } => {
+                let _ = self.gen_expression(item_1, ave, cst);
+                let _ = self.gen_expression(item_2, ave, cst);
             }
             Instr::PushStorage { value, storage, .. } => {
                 if let Some(value) = value {
@@ -102,9 +112,18 @@ impl AvailableExpressionSet {
                 payload,
                 value,
                 gas,
-                ..
+                accounts,
+                seeds,
+                callty: _,
+                success: _,
             } => {
                 if let Some(expr) = address {
+                    let _ = self.gen_expression(expr, ave, cst);
+                }
+                if let Some(expr) = accounts {
+                    let _ = self.gen_expression(expr, ave, cst);
+                }
+                if let Some(expr) = seeds {
                     let _ = self.gen_expression(expr, ave, cst);
                 }
                 let _ = self.gen_expression(payload, ave, cst);
@@ -133,6 +152,16 @@ impl AvailableExpressionSet {
                 let _ = self.gen_expression(buf, ave, cst);
                 let _ = self.gen_expression(offset, ave, cst);
                 let _ = self.gen_expression(value, ave, cst);
+            }
+
+            Instr::MemCopy {
+                source: from,
+                destination: to,
+                bytes,
+            } => {
+                let _ = self.gen_expression(from, ave, cst);
+                let _ = self.gen_expression(to, ave, cst);
+                let _ = self.gen_expression(bytes, ave, cst);
             }
 
             Instr::AssertFailure { expr: None }
@@ -193,9 +222,9 @@ impl AvailableExpressionSet {
                 false_block: *false_block,
             },
 
-            Instr::Store { dest, pos } => Instr::Store {
+            Instr::Store { dest, data } => Instr::Store {
                 dest: self.regenerate_expression(dest, ave, cst).1,
-                pos: *pos,
+                data: self.regenerate_expression(data, ave, cst).1,
             },
 
             Instr::AssertFailure { expr: Some(exp) } => Instr::AssertFailure {
@@ -307,6 +336,8 @@ impl AvailableExpressionSet {
             Instr::ExternalCall {
                 success,
                 address,
+                accounts,
+                seeds,
                 payload,
                 value,
                 gas,
@@ -316,9 +347,19 @@ impl AvailableExpressionSet {
                     .as_ref()
                     .map(|expr| self.regenerate_expression(expr, ave, cst).1);
 
+                let new_accounts = accounts
+                    .as_ref()
+                    .map(|expr| self.regenerate_expression(expr, ave, cst).1);
+
+                let new_seeds = seeds
+                    .as_ref()
+                    .map(|expr| self.regenerate_expression(expr, ave, cst).1);
+
                 Instr::ExternalCall {
                     success: *success,
                     address: new_address,
+                    accounts: new_accounts,
+                    seeds: new_seeds,
                     payload: self.regenerate_expression(payload, ave, cst).1,
                     value: self.regenerate_expression(value, ave, cst).1,
                     gas: self.regenerate_expression(gas, ave, cst).1,
@@ -372,6 +413,22 @@ impl AvailableExpressionSet {
                     .map(|v| self.regenerate_expression(v, ave, cst).1)
                     .collect::<Vec<Expression>>(),
                 topic_tys: topic_tys.clone(),
+            },
+
+            Instr::MemCopy {
+                source: from,
+                destination: to,
+                bytes,
+            } => Instr::MemCopy {
+                source: self.regenerate_expression(from, ave, cst).1,
+                destination: self.regenerate_expression(to, ave, cst).1,
+                bytes: self.regenerate_expression(bytes, ave, cst).1,
+            },
+
+            Instr::WriteBuffer { buf, offset, value } => Instr::WriteBuffer {
+                buf: self.regenerate_expression(buf, ave, cst).1,
+                offset: self.regenerate_expression(offset, ave, cst).1,
+                value: self.regenerate_expression(value, ave, cst).1,
             },
 
             _ => instr.clone(),

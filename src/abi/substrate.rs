@@ -1,5 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Parity Substrate style ABIs/Abi
-use crate::parser::pt;
 use crate::sema::ast;
 use crate::sema::tags::render;
 use contract_metadata::*;
@@ -11,6 +12,7 @@ use num_traits::ToPrimitive;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use solang_parser::pt;
 use std::convert::TryInto;
 
 #[cfg(feature = "ink_compat")]
@@ -32,30 +34,30 @@ impl Abi {
     }
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 pub struct ArrayDef {
     array: Array,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 pub struct Array {
     len: usize,
     #[serde(rename = "type")]
     ty: usize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 pub struct SequenceDef {
     sequence: Sequence,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 pub struct Sequence {
     #[serde(rename = "type")]
     ty: usize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 enum Type {
     Builtin { def: PrimitiveDef },
@@ -65,44 +67,44 @@ enum Type {
     Enum { path: Vec<String>, def: EnumDef },
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct BuiltinType {
     id: String,
     def: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct EnumVariant {
     name: String,
     discriminant: usize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct EnumDef {
     variant: Enum,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct Enum {
     variants: Vec<EnumVariant>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct Composite {
     composite: StructFields,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct StructFields {
     fields: Vec<StructField>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct PrimitiveDef {
     primitive: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct StructField {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -343,8 +345,7 @@ pub fn metadata(contract_no: usize, code: &[u8], ns: &ast::Namespace) -> Value {
 
     #[cfg(feature = "ink_compat")]
     {
-        let (registry, storage, spec) =
-            gen_project(contract_no, ns).expect("unable to generate project");
+        let (registry, storage, spec) = gen_project(contract_no, &ns);
 
         let value = serde_json::json!({
             "types": registry.types(),
@@ -500,7 +501,7 @@ fn gen_abi(contract_no: usize, ns: &ast::Namespace) -> Abi {
                             .returns
                             .iter()
                             .map(|f| StructField {
-                                name: f.name.as_ref().map(|id| id.name.to_owned()),
+                                name: f.id.as_ref().map(|id| id.name.to_owned()),
                                 ty: ty_to_abi(&f.ty, ns, &mut abi).ty,
                             })
                             .collect();
@@ -570,7 +571,7 @@ fn ty_to_abi(ty: &ast::Type, ns: &ast::Namespace, registry: &mut Abi) -> ParamTy
             let mut param_ty = ty_to_abi(ty, ns, registry);
 
             for d in dims {
-                if let Some(d) = d {
+                if let ast::ArrayLength::Fixed(d) = d {
                     param_ty = ParamType {
                         ty: registry.builtin_array_type(param_ty.ty, d.to_usize().unwrap()),
                         display_name: vec![],
@@ -587,6 +588,7 @@ fn ty_to_abi(ty: &ast::Type, ns: &ast::Namespace, registry: &mut Abi) -> ParamTy
         }
         ast::Type::StorageRef(_, ty) => ty_to_abi(ty, ns, registry),
         ast::Type::Ref(ty) => ty_to_abi(ty, ns, registry),
+        ast::Type::UserType(no) => ty_to_abi(&ns.user_types[*no].ty, ns, registry),
         ast::Type::Bool | ast::Type::Uint(_) | ast::Type::Int(_) => {
             let scalety = match ty {
                 ast::Type::Bool => "bool".into(),
@@ -614,14 +616,14 @@ fn ty_to_abi(ty: &ast::Type, ns: &ast::Namespace, registry: &mut Abi) -> ParamTy
                 display_name: vec!["AccountId".to_owned()],
             }
         }
-        ast::Type::Struct(n) => {
-            let mut display_name = vec![ns.structs[*n].name.to_owned()];
+        ast::Type::Struct(struct_type) => {
+            let mut display_name = vec![struct_type.definition(ns).name.to_owned()];
 
-            if let Some(contract_name) = &ns.structs[*n].contract {
+            if let Some(contract_name) = &struct_type.definition(ns).contract {
                 display_name.insert(0, contract_name.to_owned());
             }
 
-            let def = &ns.structs[*n];
+            let def = struct_type.definition(ns);
             let fields = def
                 .fields
                 .iter()

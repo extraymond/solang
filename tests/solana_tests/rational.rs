@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 use ethabi::ethereum_types::U256;
 
@@ -18,13 +20,13 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(4))]);
 
-    let returns = vm.function("test2", &[], &[], 0, None);
+    let returns = vm.function("test2", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(4))]);
 
@@ -38,9 +40,9 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(5))]);
 
@@ -54,9 +56,9 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(24))]);
 
@@ -70,9 +72,9 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(0))]);
 
@@ -86,9 +88,9 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(4))]);
 
@@ -101,9 +103,9 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(3))]);
 
@@ -116,9 +118,9 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[], &[], 0, None);
+    let returns = vm.function("test", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(15600))]);
 
@@ -131,13 +133,12 @@ fn rational() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     let returns = vm.function(
         "test",
         &[ethabi::Token::Uint(U256::from(982451653))],
         &[],
-        0,
         None,
     );
 

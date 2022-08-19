@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::Options;
 use crate::codegen::{cfg::ControlFlowGraph, vartable::Vartable, OptimizationLevel};
 use crate::sema::ast::{Expression, Function, Namespace};
@@ -76,3 +78,5 @@ pub fn should_remove_variable(pos: &usize, func: &Function, opt: &Options) -> bo
 
     false
 }
+
+// TODO: unused variables should remove Yul assignments!

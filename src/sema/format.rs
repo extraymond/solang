@@ -1,7 +1,11 @@
-use super::ast::{Diagnostic, Expression, FormatArg, Namespace, Type};
-use super::expression::{cast, expression, ExprContext, ResolveTo};
+// SPDX-License-Identifier: Apache-2.0
+
+use super::ast::{Diagnostic, Expression, FormatArg, Namespace, RetrieveType, Type};
+use super::expression::{expression, ExprContext, ResolveTo};
 use super::symtable::Symtable;
-use crate::parser::pt;
+use crate::sema::diagnostics::Diagnostics;
+use solang_parser::pt;
+use solang_parser::pt::CodeLocation;
 
 use std::iter::Peekable;
 use std::slice::Iter;
@@ -18,7 +22,7 @@ pub fn string_format(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     // first resolve the arguments. We can't say anything about the format string if the args are broken
     let mut resolved_args = Vec::new();
@@ -28,7 +32,10 @@ pub fn string_format(
 
         let ty = expr.ty();
 
-        resolved_args.push(cast(&arg.loc(), expr, ty.deref_any(), true, ns, diagnostics).unwrap());
+        resolved_args.push(
+            expr.cast(&arg.loc(), ty.deref_any(), true, ns, diagnostics)
+                .unwrap(),
+        );
     }
 
     let mut format_iterator = FormatIterator::new(literals).peekable();
@@ -42,7 +49,7 @@ pub fn string_format(
                 // ok, let's skip over it
                 format_iterator.next();
             } else {
-                diagnostics.push(Diagnostic::error(loc, String::from("unmatched ‘}’")));
+                diagnostics.push(Diagnostic::error(loc, String::from("unmatched '}'")));
                 return Err(());
             }
         }
@@ -131,7 +138,7 @@ pub fn string_format(
 fn parse_format_specifier(
     loc: pt::Loc,
     format_iterator: &mut Peekable<FormatIterator>,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<FormatArg, ()> {
     let mut last_loc = loc;
     let arg;
@@ -155,7 +162,7 @@ fn parse_format_specifier(
                 Some((loc, ch)) => {
                     diagnostics.push(Diagnostic::error(
                         loc,
-                        format!("unexpected format char ‘{}’", ch),
+                        format!("unexpected format char '{}'", ch),
                     ));
                     return Err(());
                 }
@@ -173,14 +180,14 @@ fn parse_format_specifier(
                 Some((loc, ch)) => {
                     diagnostics.push(Diagnostic::error(
                         loc,
-                        format!("unexpected format char ‘{:}’, expected closing ‘}}’", ch),
+                        format!("unexpected format char '{:}', expected closing '}}'", ch),
                     ));
                     Err(())
                 }
                 None => {
                     diagnostics.push(Diagnostic::error(
                         last_loc,
-                        String::from("missing closing ‘}’"),
+                        String::from("missing closing '}'"),
                     ));
                     Err(())
                 }
@@ -189,14 +196,14 @@ fn parse_format_specifier(
         Some((loc, ch)) => {
             diagnostics.push(Diagnostic::error(
                 loc,
-                format!("unexpected format char ‘{}’", ch),
+                format!("unexpected format char '{}'", ch),
             ));
             Err(())
         }
         None => {
             diagnostics.push(Diagnostic::error(
                 last_loc,
-                String::from("missing closing ‘}’"),
+                String::from("missing closing '}'"),
             ));
             Err(())
         }

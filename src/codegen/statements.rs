@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use num_bigint::BigInt;
 use std::collections::LinkedList;
 
@@ -10,17 +12,22 @@ use super::{
 use crate::codegen::unused_variable::{
     should_remove_assignment, should_remove_variable, SideEffectsCheckParameters,
 };
-use crate::parser::pt;
+use crate::codegen::yul::inline_assembly_cfg;
+use crate::codegen::Expression;
+use crate::sema::ast;
+use crate::sema::ast::RetrieveType;
 use crate::sema::ast::{
-    Builtin, CallTy, DestructureField, Expression, Function, Namespace, Parameter, Statement,
-    TryCatch, Type,
+    ArrayLength, CallTy, DestructureField, Function, Namespace, Parameter, Statement, TryCatch,
+    Type,
 };
-use crate::sema::expression::cast;
+use crate::sema::Recurse;
 use num_traits::Zero;
+use solang_parser::pt;
+use solang_parser::pt::CodeLocation;
 use tiny_keccak::{Hasher, Keccak};
 
 /// Resolve a statement, which might be a block of statements or an entire body of a function
-pub fn statement(
+pub(crate) fn statement(
     stmt: &Statement,
     func: &Function,
     cfg: &mut ControlFlowGraph,
@@ -59,19 +66,54 @@ pub fn statement(
                     vartab,
                     opt,
                 };
-
                 //If we remove the assignment, we must keep expressions that have side effects
                 init.recurse(&mut params, process_side_effects_expressions);
                 return;
             }
 
-            let expr = expression(init, cfg, contract_no, Some(func), ns, vartab, opt);
+            let mut expression = expression(init, cfg, contract_no, Some(func), ns, vartab, opt);
+
+            // Let's check if the declaration is a declaration of a dynamic array
+            if let Expression::AllocDynamicArray(
+                loc_dyn_arr,
+                ty_dyn_arr @ Type::Array(..),
+                size,
+                opt,
+            ) = expression
+            {
+                let temp_res = vartab.temp_name("array_length", &Type::Uint(32));
+
+                cfg.add(
+                    vartab,
+                    Instr::Set {
+                        loc: *loc,
+                        res: temp_res,
+                        expr: *size,
+                    },
+                );
+                // If expression is an AllocDynamic array, replace the expression with AllocDynamicArray(_,_,tempvar,_) to avoid inserting size twice in the cfg
+                expression = Expression::AllocDynamicArray(
+                    loc_dyn_arr,
+                    ty_dyn_arr,
+                    Box::new(Expression::Variable(*loc, Type::Uint(32), temp_res)),
+                    opt,
+                );
+                cfg.array_lengths_temps.insert(*pos, temp_res);
+            } else if let Expression::Variable(_, _, res) = &expression {
+                // If declaration happens with an existing array, check if the size of the array is known.
+                // If the size of the right hand side is known (is in the array_length_map), make the left hand side track it
+                // Now, we will have two keys in the map that point to the same temporary variable
+                if let Some(to_add) = cfg.array_lengths_temps.clone().get(res) {
+                    cfg.array_lengths_temps.insert(*pos, *to_add);
+                }
+            }
+
             cfg.add(
                 vartab,
                 Instr::Set {
                     loc: *loc,
                     res: *pos,
-                    expr,
+                    expr: expression,
                 },
             );
         }
@@ -89,6 +131,22 @@ pub fn statement(
                     expr: Expression::Undefined(param.ty.clone()),
                 },
             );
+            // Handling arrays without size, defaulting the initial size with zero
+
+            if matches!(param.ty, Type::Array(..)) {
+                let num =
+                    Expression::NumberLiteral(pt::Loc::Codegen, Type::Uint(32), BigInt::zero());
+                let temp_res = vartab.temp_name("array_length", &Type::Uint(32));
+                cfg.add(
+                    vartab,
+                    Instr::Set {
+                        loc: *loc,
+                        res: temp_res,
+                        expr: num,
+                    },
+                );
+                cfg.array_lengths_temps.insert(*pos, temp_res);
+            }
         }
         Statement::Return(_, expr) => {
             if let Some(return_instr) = return_override {
@@ -96,12 +154,12 @@ pub fn statement(
             } else {
                 match expr {
                     None => cfg.add(vartab, Instr::Return { value: Vec::new() }),
-                    Some(expr) => returns(expr, cfg, contract_no, func, ns, vartab, loops, opt),
+                    Some(expr) => returns(expr, cfg, contract_no, func, ns, vartab, opt),
                 }
             }
         }
         Statement::Expression(_, reachable, expr) => {
-            if let Expression::Assign(_, _, left, right) = &expr {
+            if let ast::Expression::Assign(_, _, left, right) = &expr {
                 if should_remove_assignment(ns, left, func, opt) {
                     let mut params = SideEffectsCheckParameters {
                         cfg,
@@ -116,6 +174,7 @@ pub fn statement(
                     if !reachable {
                         cfg.add(vartab, Instr::Unreachable);
                     }
+
                     return;
                 }
             }
@@ -191,7 +250,7 @@ pub fn statement(
 
             cfg.set_basic_block(body);
 
-            vartab.new_dirty_tracker(ns.next_id);
+            vartab.new_dirty_tracker();
             loops.new_scope(end, cond);
 
             let mut body_reachable = true;
@@ -259,7 +318,7 @@ pub fn statement(
 
             cfg.set_basic_block(body);
 
-            vartab.new_dirty_tracker(ns.next_id);
+            vartab.new_dirty_tracker();
             loops.new_scope(end, cond);
 
             let mut body_reachable = true;
@@ -331,7 +390,7 @@ pub fn statement(
                 },
             );
 
-            vartab.new_dirty_tracker(ns.next_id);
+            vartab.new_dirty_tracker();
 
             let mut body_reachable = true;
 
@@ -439,7 +498,7 @@ pub fn statement(
             // continue goes to next
             loops.new_scope(end_block, next_block);
 
-            vartab.new_dirty_tracker(ns.next_id);
+            vartab.new_dirty_tracker();
 
             let mut body_reachable = true;
 
@@ -499,7 +558,7 @@ pub fn statement(
             cfg.set_phis(cond_block, set);
         }
         Statement::Destructure(_, fields, expr) => {
-            destructure(fields, expr, cfg, contract_no, func, ns, vartab, loops, opt)
+            destructure(fields, expr, cfg, contract_no, func, ns, vartab, opt)
         }
         Statement::TryCatch(_, _, try_stmt) => try_catch(
             try_stmt,
@@ -541,10 +600,10 @@ pub fn statement(
                     match ty {
                         Type::String | Type::DynamicBytes => {
                             let e = expression(
-                                &Expression::Builtin(
+                                &ast::Expression::Builtin(
                                     pt::Loc::Codegen,
                                     vec![Type::Bytes(32)],
-                                    Builtin::Keccak256,
+                                    ast::Builtin::Keccak256,
                                     vec![arg.clone()],
                                 ),
                                 cfg,
@@ -561,14 +620,14 @@ pub fn statement(
                         Type::Struct(_) | Type::Array(..) => {
                             // We should have an AbiEncodePackedPad
                             let e = expression(
-                                &Expression::Builtin(
+                                &ast::Expression::Builtin(
                                     pt::Loc::Codegen,
                                     vec![Type::Bytes(32)],
-                                    Builtin::Keccak256,
-                                    vec![Expression::Builtin(
+                                    ast::Builtin::Keccak256,
+                                    vec![ast::Expression::Builtin(
                                         pt::Loc::Codegen,
                                         vec![Type::DynamicBytes],
-                                        Builtin::AbiEncodePacked,
+                                        ast::Builtin::AbiEncodePacked,
                                         vec![arg.clone()],
                                     )],
                                 ),
@@ -622,15 +681,15 @@ pub fn statement(
             }
         }
 
-        Statement::AssemblyBlock(_) => {
-            unimplemented!("Assembly block codegen not yet ready");
+        Statement::Assembly(inline_assembly, ..) => {
+            inline_assembly_cfg(inline_assembly, contract_no, ns, cfg, vartab, opt);
         }
     }
 }
 
 /// Generate if-then-no-else
 fn if_then(
-    cond: &Expression,
+    cond: &ast::Expression,
     then_stmt: &[Statement],
     func: &Function,
     cfg: &mut ControlFlowGraph,
@@ -658,7 +717,7 @@ fn if_then(
 
     cfg.set_basic_block(then);
 
-    vartab.new_dirty_tracker(ns.next_id);
+    vartab.new_dirty_tracker();
 
     let mut reachable = true;
 
@@ -690,7 +749,7 @@ fn if_then(
 
 /// Generate if-then-else
 fn if_then_else(
-    cond: &Expression,
+    cond: &ast::Expression,
     then_stmt: &[Statement],
     else_stmt: &[Statement],
     func: &Function,
@@ -721,7 +780,7 @@ fn if_then_else(
     // then
     cfg.set_basic_block(then);
 
-    vartab.new_dirty_tracker(ns.next_id);
+    vartab.new_dirty_tracker();
 
     let mut then_reachable = true;
 
@@ -778,20 +837,19 @@ fn if_then_else(
 }
 
 fn returns(
-    expr: &Expression,
+    expr: &ast::Expression,
     cfg: &mut ControlFlowGraph,
     contract_no: usize,
     func: &Function,
     ns: &Namespace,
     vartab: &mut Vartable,
-    loops: &mut LoopScopes,
     opt: &Options,
 ) {
     // Can only be another function call without returns
     let uncast_values = match expr {
         // Explicitly recurse for ternary expressions.
         // `return a ? b : c` is transformed into pseudo code `a ? return b : return c`
-        Expression::Ternary(_, _, cond, left, right) => {
+        ast::Expression::Ternary(_, _, cond, left, right) => {
             let cond = expression(cond, cfg, contract_no, Some(func), ns, vartab, opt);
 
             let left_block = cfg.new_basic_block("left".to_string());
@@ -806,29 +864,40 @@ fn returns(
                 },
             );
 
-            vartab.new_dirty_tracker(ns.next_id);
+            vartab.new_dirty_tracker();
 
             cfg.set_basic_block(left_block);
-            returns(left, cfg, contract_no, func, ns, vartab, loops, opt);
+            returns(left, cfg, contract_no, func, ns, vartab, opt);
 
             cfg.set_basic_block(right_block);
-            returns(right, cfg, contract_no, func, ns, vartab, loops, opt);
+            returns(right, cfg, contract_no, func, ns, vartab, opt);
 
             return;
         }
 
-        Expression::Builtin(_, _, Builtin::AbiDecode, _)
-        | Expression::InternalFunctionCall { .. }
-        | Expression::ExternalFunctionCall { .. }
-        | Expression::ExternalFunctionCallRaw { .. } => {
+        ast::Expression::Builtin(_, _, ast::Builtin::AbiDecode, _)
+        | ast::Expression::InternalFunctionCall { .. }
+        | ast::Expression::ExternalFunctionCall { .. }
+        | ast::Expression::ExternalFunctionCallRaw { .. } => {
             emit_function_call(expr, contract_no, cfg, Some(func), ns, vartab, opt)
         }
 
-        Expression::List(_, exprs) => exprs.clone(),
+        ast::Expression::List(_, exprs) => exprs
+            .iter()
+            .map(|e| expression(e, cfg, contract_no, Some(func), ns, vartab, opt))
+            .collect::<Vec<Expression>>(),
 
         // Can be any other expression
         _ => {
-            vec![expr.clone()]
+            vec![expression(
+                expr,
+                cfg,
+                contract_no,
+                Some(func),
+                ns,
+                vartab,
+                opt,
+            )]
         }
     };
 
@@ -836,12 +905,7 @@ fn returns(
         .returns
         .iter()
         .zip(uncast_values.into_iter())
-        .map(|(left, right)| {
-            let right = cast(&left.loc, right, &left.ty, true, ns, &mut Vec::new())
-                .expect("sema should have checked cast");
-            // casts to StorageLoad generate LoadStorage instructions
-            expression(&right, cfg, contract_no, Some(func), ns, vartab, opt)
-        })
+        .map(|(left, right)| cast_and_try_load(&right.loc(), &right, &left.ty, ns, cfg, vartab))
         .collect();
 
     cfg.add(vartab, Instr::Return { value: cast_values });
@@ -849,16 +913,15 @@ fn returns(
 
 fn destructure(
     fields: &[DestructureField],
-    expr: &Expression,
+    expr: &ast::Expression,
     cfg: &mut ControlFlowGraph,
     contract_no: usize,
     func: &Function,
     ns: &Namespace,
     vartab: &mut Vartable,
-    loops: &mut LoopScopes,
     opt: &Options,
 ) {
-    if let Expression::Ternary(_, _, cond, left, right) = expr {
+    if let ast::Expression::Ternary(_, _, cond, left, right) = expr {
         let cond = expression(cond, cfg, contract_no, Some(func), ns, vartab, opt);
 
         let left_block = cfg.new_basic_block("left".to_string());
@@ -874,27 +937,17 @@ fn destructure(
             },
         );
 
-        vartab.new_dirty_tracker(ns.next_id);
+        vartab.new_dirty_tracker();
 
         cfg.set_basic_block(left_block);
 
-        destructure(fields, left, cfg, contract_no, func, ns, vartab, loops, opt);
+        destructure(fields, left, cfg, contract_no, func, ns, vartab, opt);
 
         cfg.add(vartab, Instr::Branch { block: done_block });
 
         cfg.set_basic_block(right_block);
 
-        destructure(
-            fields,
-            right,
-            cfg,
-            contract_no,
-            func,
-            ns,
-            vartab,
-            loops,
-            opt,
-        );
+        destructure(fields, right, cfg, contract_no, func, ns, vartab, opt);
 
         cfg.add(vartab, Instr::Branch { block: done_block });
 
@@ -906,7 +959,7 @@ fn destructure(
     }
 
     let mut values = match expr {
-        Expression::List(_, exprs) => {
+        ast::Expression::List(_, exprs) => {
             let mut values = Vec::new();
 
             for expr in exprs {
@@ -937,11 +990,7 @@ fn destructure(
                 // nothing to do
             }
             DestructureField::VariableDecl(res, param) => {
-                // the resolver did not cast the expression
-                let expr = cast(&param.loc, right, &param.ty, true, ns, &mut Vec::new())
-                    .expect("sema should have checked cast");
-                // casts to StorageLoad generate LoadStorage instructions
-                let expr = expression(&expr, cfg, contract_no, Some(func), ns, vartab, opt);
+                let expr = cast_and_try_load(&param.loc, &right, &param.ty, ns, cfg, vartab);
 
                 if should_remove_variable(res, func, opt) {
                     continue;
@@ -957,29 +1006,57 @@ fn destructure(
                 );
             }
             DestructureField::Expression(left) => {
-                // the resolver did not cast the expression
-                let loc = left.loc();
-
-                let expr = cast(
-                    &loc,
-                    right,
-                    left.ty().deref_any(),
-                    true,
-                    ns,
-                    &mut Vec::new(),
-                )
-                .expect("sema should have checked cast");
-                // casts to StorageLoad generate LoadStorage instructions
-                let expr = expression(&expr, cfg, contract_no, Some(func), ns, vartab, opt);
+                let expr = cast_and_try_load(&left.loc(), &right, &left.ty(), ns, cfg, vartab);
 
                 if should_remove_assignment(ns, left, func, opt) {
                     continue;
                 }
 
-                assign_single(left, &expr, cfg, contract_no, Some(func), ns, vartab, opt);
+                assign_single(left, expr, cfg, contract_no, Some(func), ns, vartab, opt);
             }
         }
     }
+}
+
+/// During a destructure statement, sema only checks if the cast is possible. During codegen, we
+/// perform the real cast and add an instruction to the CFG to load a value from the storage if want it.
+/// The existing codegen cast function does not manage the CFG, so the loads must be done here.
+fn cast_and_try_load(
+    loc: &pt::Loc,
+    expr: &Expression,
+    to_ty: &Type,
+    ns: &Namespace,
+    cfg: &mut ControlFlowGraph,
+    vartab: &mut Vartable,
+) -> Expression {
+    let casted_expr = expr.cast(to_ty, ns);
+
+    if let Type::StorageRef(_, ty) = casted_expr.ty() {
+        if let Expression::Subscript(_, _, ty, ..) = &casted_expr {
+            if ty.is_storage_bytes() {
+                return casted_expr;
+            }
+        }
+
+        if matches!(to_ty, Type::StorageRef(..)) {
+            // If we want a storage reference, there is no need to load from storage
+            return casted_expr;
+        }
+
+        let anonymous_no = vartab.temp_anonymous(&ty);
+        cfg.add(
+            vartab,
+            Instr::LoadStorage {
+                res: anonymous_no,
+                ty: (*ty).clone(),
+                storage: casted_expr,
+            },
+        );
+
+        return Expression::Variable(*loc, (*ty).clone(), anonymous_no);
+    }
+
+    casted_expr
 }
 
 /// Resolve try catch statement
@@ -1008,12 +1085,11 @@ fn try_catch(
     let finally_block = cfg.new_basic_block("finally".to_string());
 
     match &try_stmt.expr {
-        Expression::ExternalFunctionCall {
+        ast::Expression::ExternalFunctionCall {
             loc,
             function,
             args,
-            value,
-            gas,
+            call_args,
             ..
         } => {
             if let Type::ExternalFunction {
@@ -1021,12 +1097,12 @@ fn try_catch(
                 ..
             } = function.ty()
             {
-                let value = if let Some(value) = value {
+                let value = if let Some(value) = &call_args.value {
                     expression(value, cfg, callee_contract_no, Some(func), ns, vartab, opt)
                 } else {
                     Expression::NumberLiteral(pt::Loc::Codegen, Type::Value, BigInt::zero())
                 };
-                let gas = if let Some(gas) = gas {
+                let gas = if let Some(gas) = &call_args.gas {
                     expression(gas, cfg, callee_contract_no, Some(func), ns, vartab, opt)
                 } else {
                     default_gas(ns)
@@ -1050,19 +1126,9 @@ fn try_catch(
                     .map(|a| expression(a, cfg, callee_contract_no, Some(func), ns, vartab, opt))
                     .collect();
 
-                let selector = Expression::Builtin(
-                    *loc,
-                    vec![Type::Bytes(4)],
-                    Builtin::FunctionSelector,
-                    vec![function.clone()],
-                );
+                let selector = function.external_function_selector();
 
-                let address = Expression::Builtin(
-                    *loc,
-                    vec![Type::Address(false)],
-                    Builtin::ExternalFunctionAddress,
-                    vec![function],
-                );
+                let address = function.external_function_address();
 
                 let payload = Expression::AbiEncode {
                     loc: *loc,
@@ -1076,6 +1142,8 @@ fn try_catch(
                     Instr::ExternalCall {
                         success: Some(success),
                         address: Some(address),
+                        accounts: None,
+                        seeds: None,
                         payload,
                         value,
                         gas,
@@ -1108,11 +1176,12 @@ fn try_catch(
                         .iter()
                         .map(|ty| Parameter {
                             ty: ty.clone(),
-                            name: None,
-                            ty_loc: pt::Loc::Codegen,
+                            id: None,
+                            ty_loc: Some(pt::Loc::Codegen),
                             loc: pt::Loc::Codegen,
                             indexed: false,
                             readonly: false,
+                            recursive: false,
                         })
                         .collect();
 
@@ -1132,14 +1201,11 @@ fn try_catch(
                 unimplemented!();
             }
         }
-        Expression::Constructor {
+        ast::Expression::Constructor {
             contract_no,
             constructor_no,
             args,
-            value,
-            gas,
-            salt,
-            space,
+            call_args,
             ..
         } => {
             let address_res = match try_stmt.returns.get(0) {
@@ -1147,19 +1213,20 @@ fn try_catch(
                 _ => vartab.temp_anonymous(&Type::Contract(*contract_no)),
             };
 
-            let value = value.as_ref().map(|value| {
+            let value = call_args.value.as_ref().map(|value| {
                 expression(value, cfg, callee_contract_no, Some(func), ns, vartab, opt)
             });
 
-            let gas = if let Some(gas) = gas {
+            let gas = if let Some(gas) = &call_args.gas {
                 expression(gas, cfg, callee_contract_no, Some(func), ns, vartab, opt)
             } else {
                 default_gas(ns)
             };
-            let salt = salt
+            let salt = call_args
+                .salt
                 .as_ref()
                 .map(|salt| expression(salt, cfg, callee_contract_no, Some(func), ns, vartab, opt));
-            let space = space.as_ref().map(|space| {
+            let space = call_args.space.as_ref().map(|space| {
                 expression(space, cfg, callee_contract_no, Some(func), ns, vartab, opt)
             });
 
@@ -1197,7 +1264,7 @@ fn try_catch(
         _ => unreachable!(),
     }
 
-    vartab.new_dirty_tracker(ns.next_id);
+    vartab.new_dirty_tracker();
 
     let mut finally_reachable = true;
 
@@ -1343,22 +1410,22 @@ impl LoopScopes {
         LoopScopes(LinkedList::new())
     }
 
-    fn new_scope(&mut self, break_bb: usize, continue_bb: usize) {
+    pub(crate) fn new_scope(&mut self, break_bb: usize, continue_bb: usize) {
         self.0.push_front(LoopScope {
             break_bb,
             continue_bb,
         })
     }
 
-    fn leave_scope(&mut self) -> LoopScope {
+    pub(crate) fn leave_scope(&mut self) -> LoopScope {
         self.0.pop_front().expect("should be in loop scope")
     }
 
-    fn do_break(&mut self) -> usize {
+    pub(crate) fn do_break(&mut self) -> usize {
         self.0.front().unwrap().break_bb
     }
 
-    fn do_continue(&mut self) -> usize {
+    pub(crate) fn do_continue(&mut self) -> usize {
         self.0.front().unwrap().continue_bb
     }
 }
@@ -1380,9 +1447,9 @@ impl Type {
                 Some(Expression::BytesLiteral(pt::Loc::Codegen, self.clone(), l))
             }
             Type::Enum(e) => ns.enums[*e].ty.default(ns),
-            Type::Struct(struct_no) => {
+            Type::Struct(struct_ty) => {
                 // make sure all our fields have default values
-                for field in &ns.structs[*struct_no].fields {
+                for field in &struct_ty.definition(ns).fields {
                     field.ty.default(ns)?;
                 }
 
@@ -1422,7 +1489,7 @@ impl Type {
             Type::Array(ty, dims) => {
                 ty.default(ns)?;
 
-                if dims[0].is_none() {
+                if dims.last() == Some(&ArrayLength::Dynamic) {
                     Some(Expression::AllocDynamicArray(
                         pt::Loc::Codegen,
                         self.clone(),
@@ -1474,15 +1541,15 @@ impl Namespace {
 /// processes them.
 /// They must be added to the cfg event if we remove the assignment
 pub fn process_side_effects_expressions(
-    exp: &Expression,
+    exp: &ast::Expression,
     ctx: &mut SideEffectsCheckParameters,
 ) -> bool {
     match &exp {
-        Expression::InternalFunctionCall { .. }
-        | Expression::ExternalFunctionCall { .. }
-        | Expression::ExternalFunctionCallRaw { .. }
-        | Expression::Constructor { .. }
-        | Expression::Assign(..) => {
+        ast::Expression::InternalFunctionCall { .. }
+        | ast::Expression::ExternalFunctionCall { .. }
+        | ast::Expression::ExternalFunctionCallRaw { .. }
+        | ast::Expression::Constructor { .. }
+        | ast::Expression::Assign(..) => {
             let _ = expression(
                 exp,
                 ctx.cfg,
@@ -1495,28 +1562,28 @@ pub fn process_side_effects_expressions(
             false
         }
 
-        Expression::Builtin(_, _, builtin_type, _) => match &builtin_type {
-            Builtin::PayableSend
-            | Builtin::ArrayPush
-            | Builtin::ArrayPop
+        ast::Expression::Builtin(_, _, builtin_type, _) => match &builtin_type {
+            ast::Builtin::PayableSend
+            | ast::Builtin::ArrayPush
+            | ast::Builtin::ArrayPop
             // PayableTransfer, Revert, Require and SelfDestruct do not occur inside an expression
             // for they return no value. They should not bother the unused variable elimination.
-            | Builtin::PayableTransfer
-            | Builtin::Revert
-            | Builtin::Require
-            | Builtin::SelfDestruct
-            | Builtin::WriteInt8
-            | Builtin::WriteInt16LE
-            | Builtin::WriteInt32LE
-            | Builtin::WriteInt64LE
-            | Builtin::WriteInt128LE
-            | Builtin::WriteInt256LE
-            | Builtin::WriteUint16LE
-            | Builtin::WriteUint32LE
-            | Builtin::WriteUint64LE
-            | Builtin::WriteUint128LE
-            | Builtin::WriteUint256LE
-            | Builtin::WriteAddress => {
+            | ast::Builtin::PayableTransfer
+            | ast::Builtin::Revert
+            | ast::Builtin::Require
+            | ast::Builtin::SelfDestruct
+            | ast::Builtin::WriteInt8
+            | ast::Builtin::WriteInt16LE
+            | ast::Builtin::WriteInt32LE
+            | ast::Builtin::WriteInt64LE
+            | ast::Builtin::WriteInt128LE
+            | ast::Builtin::WriteInt256LE
+            | ast::Builtin::WriteUint16LE
+            | ast::Builtin::WriteUint32LE
+            | ast::Builtin::WriteUint64LE
+            | ast::Builtin::WriteUint128LE
+            | ast::Builtin::WriteUint256LE
+            | ast::Builtin::WriteAddress => {
                 let _ = expression(exp, ctx.cfg, ctx.contract_no, ctx.func, ctx.ns, ctx.vartab, ctx.opt);
                 false
             }

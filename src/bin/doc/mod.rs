@@ -1,12 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use handlebars::Handlebars;
 use serde::Serialize;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
 
-use solang::parser::pt;
 use solang::sema::ast;
-use solang::sema::contracts::visit_bases;
+use solang_parser::pt;
 
 #[derive(Serialize)]
 struct Field<'a> {
@@ -337,7 +338,7 @@ pub fn generate_docs(outdir: &str, files: &[ast::Namespace], verbose: bool) {
                 })
                 .collect();
 
-            let bases = visit_bases(contract_no, file);
+            let bases = file.contract_bases(contract_no);
 
             let mut base_variables = Vec::new();
             let mut base_functions = Vec::new();
@@ -476,7 +477,7 @@ Values: {{field}}
 
     if verbose {
         println!(
-            "debug: writing documentation to ‘{}’",
+            "debug: writing documentation to '{}'",
             filename.to_string_lossy()
         );
     }

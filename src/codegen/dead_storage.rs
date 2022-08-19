@@ -1,19 +1,44 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::cfg::{BasicBlock, ControlFlowGraph, Instr};
-use crate::parser::pt::Loc;
-use crate::sema::ast::{Expression, Namespace};
+use crate::codegen::Expression;
+use crate::sema::ast::{Namespace, RetrieveType, Type};
+use solang_parser::pt::Loc;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-struct InstrDef {
-    pub block_no: usize,
-    pub instr_no: usize,
+enum Definition {
+    Undefined,
+    Instr {
+        block_no: usize,
+        instr_no: usize,
+        assignment_no: usize,
+    },
 }
+
+impl fmt::Display for Definition {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Definition::Undefined => {
+                write!(f, "undef")
+            }
+            Definition::Instr {
+                block_no,
+                instr_no,
+                assignment_no,
+            } => {
+                write!(f, "({}, {}, {})", block_no, instr_no, assignment_no)
+            }
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Transfer {
     Gen {
-        def: InstrDef,
+        def: Definition,
         var_no: usize,
     },
     Copy {
@@ -24,7 +49,7 @@ enum Transfer {
         var_no: usize,
     },
     Store {
-        def: InstrDef,
+        def: Definition,
         expr: Option<Expression>,
     },
 }
@@ -33,7 +58,7 @@ impl fmt::Display for Transfer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Transfer::Gen { def, var_no } => {
-                write!(f, "Gen %{} = ({}, {})", var_no, def.block_no, def.instr_no)
+                write!(f, "Gen %{} = {}", var_no, def)
             }
             Transfer::Copy { var_no, src } => {
                 write!(f, "Copy %{} from %{}", var_no, src)
@@ -42,20 +67,16 @@ impl fmt::Display for Transfer {
                 write!(f, "Kill %{}", var_no)
             }
             Transfer::Store { def, expr } => {
-                write!(
-                    f,
-                    "Storage: {:?} at ({}, {})",
-                    expr, def.block_no, def.instr_no
-                )
+                write!(f, "Storage: {:?} at {}", expr, def)
             }
         }
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ReachingDefs {
-    vars: HashMap<usize, HashMap<InstrDef, Option<Expression>>>,
-    stores: Vec<(InstrDef, Expression)>,
+    vars: HashMap<usize, HashMap<Definition, Option<Expression>>>,
+    stores: Vec<(Definition, Expression)>,
 }
 
 type BlockVars = HashMap<usize, Vec<ReachingDefs>>;
@@ -92,8 +113,21 @@ fn reaching_definitions(cfg: &mut ControlFlowGraph) -> (Vec<Vec<Vec<Transfer>>>,
         let mut vars = if let Some(vars) = block_vars.get(&block_no) {
             vars[0].clone()
         } else {
+            debug_assert_eq!(block_no, 0);
+
+            // On entry all variables should be undefined
+            let mut vars: HashMap<usize, HashMap<Definition, Option<Expression>>> = HashMap::new();
+
+            for var_no in cfg.vars.keys() {
+                let mut defs = HashMap::new();
+
+                defs.insert(Definition::Undefined, None);
+
+                vars.insert(*var_no, defs);
+            }
+
             ReachingDefs {
-                vars: HashMap::new(),
+                vars,
                 stores: Vec::new(),
             }
         };
@@ -147,16 +181,23 @@ fn instr_transfers(block_no: usize, block: &BasicBlock) -> Vec<Vec<Transfer>> {
     let mut transfers = Vec::new();
 
     for (instr_no, instr) in block.instr.iter().enumerate() {
-        let def = InstrDef { block_no, instr_no };
-
+        let def = Definition::Instr {
+            block_no,
+            instr_no,
+            assignment_no: 0,
+        };
         let set_var = |var_nos: &[usize]| {
             let mut transfer = Vec::new();
 
-            for var_no in var_nos.iter() {
+            for (assignment_no, var_no) in var_nos.iter().enumerate() {
                 transfer.insert(0, Transfer::Kill { var_no: *var_no });
 
                 transfer.push(Transfer::Gen {
-                    def,
+                    def: Definition::Instr {
+                        block_no,
+                        instr_no,
+                        assignment_no,
+                    },
                     var_no: *var_no,
                 });
             }
@@ -363,14 +404,14 @@ fn apply_transfers(
 
                     for (var_no, def) in vars.vars.iter() {
                         for def in def.keys() {
-                            if let Some((_, storage)) = get_storage_definition(def, cfg) {
+                            if let Some(storage_def) = get_storage_definition(def, cfg) {
                                 if let Some(expr) = expr {
                                     let storage_vars = get_vars_at(def, block_vars);
 
                                     if expression_compare(
                                         expr,
                                         vars,
-                                        storage,
+                                        storage_def.slot,
                                         &storage_vars,
                                         cfg,
                                         block_vars,
@@ -490,20 +531,21 @@ pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
                         if defs.len() == 1 {
                             let (def, _) = defs.iter().next().unwrap();
 
-                            if let Some((other, def_storage)) = get_storage_definition(def, cfg) {
+                            if let Some(storage_def) = get_storage_definition(def, cfg) {
                                 let def_vars = get_vars_at(def, &block_vars);
 
                                 if expression_compare(
                                     storage,
                                     vars,
-                                    def_storage,
+                                    storage_def.slot,
                                     &def_vars,
                                     cfg,
                                     &block_vars,
                                 ) == ExpressionCmp::Equal
-                                    && other != *res
+                                    && storage_def.var_no != *res
+                                    && ty == storage_def.ty
                                 {
-                                    found = Some(other);
+                                    found = Some(var_no);
                                     break;
                                 }
                             }
@@ -514,7 +556,7 @@ pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
                         cfg.blocks[block_no].instr[instr_no] = Instr::Set {
                             loc: Loc::Codegen,
                             res: *res,
-                            expr: Expression::Variable(Loc::Codegen, ty.clone(), var_no),
+                            expr: Expression::Variable(Loc::Codegen, ty.clone(), *var_no),
                         };
                     } else {
                         for (def, expr) in &vars.stores {
@@ -546,7 +588,11 @@ pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
                 Instr::SetStorage { .. }
                 | Instr::SetStorageBytes { .. }
                 | Instr::ClearStorage { .. } => {
-                    let def = InstrDef { block_no, instr_no };
+                    let def = Definition::Instr {
+                        block_no,
+                        instr_no,
+                        assignment_no: 0,
+                    };
 
                     // add an entry if there is not one there already
                     redundant_stores.entry(def).or_insert(true);
@@ -571,43 +617,93 @@ pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
     // remove all stores which are marked as still redundant
     for (def, redundant) in &redundant_stores {
         if *redundant {
-            cfg.blocks[def.block_no].instr[def.instr_no] = Instr::Nop;
+            if let Definition::Instr {
+                block_no, instr_no, ..
+            } = def
+            {
+                // Function calls should never be eliminated from the CFG, as they might have side effects
+                // In addition, AbiDecode might fail and halt the execution.
+                if !matches!(
+                    cfg.blocks[*block_no].instr[*instr_no],
+                    Instr::Call { .. } | Instr::AbiDecode { .. }
+                ) {
+                    cfg.blocks[*block_no].instr[*instr_no] = Instr::Nop;
+                }
+            }
         }
     }
+}
+
+struct StorageDef<'a> {
+    var_no: usize,
+    slot: &'a Expression,
+    ty: &'a Type,
 }
 
 fn get_storage_definition<'a>(
-    def: &InstrDef,
+    def: &Definition,
     cfg: &'a ControlFlowGraph,
-) -> Option<(usize, &'a Expression)> {
-    match &cfg.blocks[def.block_no].instr[def.instr_no] {
-        Instr::LoadStorage { storage, res, .. } => Some((*res, storage)),
-        _ => None,
-    }
-}
-
-fn get_definition<'a>(def: &InstrDef, cfg: &'a ControlFlowGraph) -> Option<&'a Expression> {
-    match &cfg.blocks[def.block_no].instr[def.instr_no] {
-        Instr::LoadStorage { storage, .. } => Some(storage),
-        Instr::Set { expr, .. } => Some(expr),
-        _ => None,
-    }
-}
-
-fn get_vars_at(def: &InstrDef, block_vars: &BlockVars) -> ReachingDefs {
-    let vars = if let Some(vars) = block_vars.get(&def.block_no) {
-        vars[def.instr_no].clone()
-    } else {
-        ReachingDefs {
-            vars: HashMap::new(),
-            stores: Vec::new(),
+) -> Option<StorageDef<'a>> {
+    if let Definition::Instr {
+        block_no, instr_no, ..
+    } = def
+    {
+        match &cfg.blocks[*block_no].instr[*instr_no] {
+            Instr::LoadStorage {
+                storage, res, ty, ..
+            } => Some(StorageDef {
+                var_no: *res,
+                slot: storage,
+                ty,
+            }),
+            _ => None,
         }
-    };
-
-    vars
+    } else {
+        None
+    }
 }
 
-#[derive(PartialEq, Copy, Clone, Debug)]
+fn get_definition<'a>(
+    def: &Definition,
+    cfg: &'a ControlFlowGraph,
+) -> Option<(&'a Expression, Type)> {
+    if let Definition::Instr {
+        block_no, instr_no, ..
+    } = def
+    {
+        match &cfg.blocks[*block_no].instr[*instr_no] {
+            Instr::LoadStorage { storage, ty, .. } => Some((storage, ty.clone())),
+            Instr::Set { expr, .. } => Some((expr, expr.ty())),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn get_vars_at(def: &Definition, block_vars: &BlockVars) -> ReachingDefs {
+    match def {
+        Definition::Instr {
+            block_no, instr_no, ..
+        } => {
+            let vars = if let Some(vars) = block_vars.get(block_no) {
+                vars[*instr_no].clone()
+            } else {
+                ReachingDefs {
+                    vars: HashMap::new(),
+                    stores: Vec::new(),
+                }
+            };
+
+            vars
+        }
+        Definition::Undefined => {
+            unreachable!("cannot get reaching definitions for undefined");
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 enum ExpressionCmp {
     Equal,
     NotEqual,
@@ -702,18 +798,24 @@ fn expression_compare(
                 let right = right.iter().next().unwrap();
 
                 match (get_definition(left.0, cfg), get_definition(right.0, cfg)) {
-                    (Some(left_expr), Some(right_expr)) => {
+                    (Some((left_expr, left_ty)), Some((right_expr, right_ty))) => {
                         let left_vars = get_vars_at(left.0, block_vars);
                         let right_vars = get_vars_at(right.0, block_vars);
 
-                        expression_compare(
+                        let cmp = expression_compare(
                             left_expr,
                             &left_vars,
                             right_expr,
                             &right_vars,
                             cfg,
                             block_vars,
-                        )
+                        );
+
+                        if cmp == ExpressionCmp::Equal && left_ty != right_ty {
+                            ExpressionCmp::Unknown
+                        } else {
+                            cmp
+                        }
                     }
                     _ => ExpressionCmp::Unknown,
                 }

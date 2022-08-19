@@ -1,40 +1,36 @@
-use num_bigint::BigInt;
-use num_bigint::Sign;
-use num_traits::FromPrimitive;
-use num_traits::Num;
-use num_traits::One;
-use num_traits::Pow;
-use num_traits::ToPrimitive;
-use num_traits::Zero;
-use std::cmp;
-use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
-use std::ops::{Add, Shl, Sub};
+// SPDX-License-Identifier: Apache-2.0
 
 use super::address::to_hexstr_eip55;
 use super::ast::{
-    Builtin, BuiltinStruct, CallTy, Diagnostic, Expression, Function, Mutability, Namespace,
-    StringLocation, Symbol, Type,
+    ArrayLength, Builtin, CallArgs, CallTy, Diagnostic, Expression, Function, Mutability,
+    Namespace, RetrieveType, StringLocation, StructType, Symbol, Type,
 };
 use super::builtin;
-use super::contracts::{is_base, visit_bases};
+use super::contracts::is_base;
+use super::diagnostics::Diagnostics;
 use super::eval::eval_const_number;
 use super::eval::eval_const_rational;
 use super::format::string_format;
-use super::symtable::Symtable;
-use crate::parser::pt;
+use super::{symtable::Symtable, using};
 use crate::sema::unused_variable::{
     assigned_variable, check_function_call, check_var_usage_expression, used_variable,
 };
 use crate::Target;
 use base58::{FromBase58, FromBase58Error};
+use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
+use num_traits::{FromPrimitive, Num, One, Pow, ToPrimitive, Zero};
+use solang_parser::pt::{self, CodeLocation, Loc};
+use std::{
+    cmp,
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+    ops::{Add, Mul, Shl, Sub},
+    str::FromStr,
+};
 
-impl Expression {
-    /// Return the type for this expression. This assumes the expression has a single value,
-    /// panics will occur otherwise
-    pub fn ty(&self) -> Type {
+impl RetrieveType for Expression {
+    fn ty(&self) -> Type {
         match self {
             Expression::BoolLiteral(..)
             | Expression::More(..)
@@ -47,9 +43,8 @@ impl Expression {
             | Expression::NotEqual(..)
             | Expression::Not(..)
             | Expression::StringCompare(..) => Type::Bool,
-            Expression::AbiEncode { .. } | Expression::CodeLiteral(..) => Type::DynamicBytes,
+            Expression::CodeLiteral(..) => Type::DynamicBytes,
             Expression::StringConcat(_, ty, ..)
-            | Expression::FunctionArg(_, ty, _)
             | Expression::BytesLiteral(_, ty, _)
             | Expression::NumberLiteral(_, ty, _)
             | Expression::RationalNumberLiteral(_, ty, _)
@@ -88,7 +83,6 @@ impl Expression {
             | Expression::PreDecrement(_, ty, ..)
             | Expression::PostIncrement(_, ty, ..)
             | Expression::PostDecrement(_, ty, ..)
-            | Expression::Keccak256(_, ty, _)
             | Expression::Assign(_, ty, ..) => ty.clone(),
             Expression::Subscript(_, ty, ..) => ty.clone(),
             Expression::StorageArrayLength { ty, .. } => ty.clone(),
@@ -107,22 +101,19 @@ impl Expression {
                 list[0].ty()
             }
             Expression::Constructor { contract_no, .. } => Type::Contract(*contract_no),
-            Expression::Poison => unreachable!(),
             Expression::InterfaceId(..) => Type::Bytes(4),
             Expression::FormatString(..) => Type::String,
             // codegen Expressions
-            Expression::ReturnData(_) => Type::DynamicBytes,
             Expression::InternalFunction { ty, .. } => ty.clone(),
             Expression::ExternalFunction { ty, .. } => ty.clone(),
-            Expression::Undefined(ty) => ty.clone(),
-            // We do not know the type for functions
-            Expression::InternalFunctionCfg(_) => Type::Unreachable,
         }
     }
+}
 
+impl Expression {
     /// Is this expression 0
-    fn const_zero(&self, contract_no: Option<usize>, ns: &Namespace) -> bool {
-        if let Ok((_, value)) = eval_const_number(self, contract_no, ns) {
+    fn const_zero(&self, ns: &Namespace) -> bool {
+        if let Ok((_, value)) = eval_const_number(self, ns) {
             value == BigInt::zero()
         } else {
             false
@@ -140,6 +131,979 @@ impl Expression {
             _ => vec![self.ty()],
         }
     }
+
+    /// Cast from one type to another, which also automatically derefs any Type::Ref() type.
+    /// if the cast is explicit (e.g. bytes32(bar) then implicit should be set to false.
+    pub fn cast(
+        &self,
+        loc: &pt::Loc,
+        to: &Type,
+        implicit: bool,
+        ns: &Namespace,
+        diagnostics: &mut Diagnostics,
+    ) -> Result<Expression, ()> {
+        let from = self.ty();
+        if &from == to {
+            return Ok(self.clone());
+        }
+
+        if from == Type::Unresolved || *to == Type::Unresolved {
+            return Ok(self.clone());
+        }
+
+        // First of all, if we have a ref then derefence it
+        if let Type::Ref(r) = &from {
+            return if r.is_fixed_reference_type() {
+                // A struct/fixed array *value* is simply the type, e.g. Type::Struct(_)
+                // An assignable struct value, e.g. member of another struct, is Type::Ref(Type:Struct(_)).
+                // However, the underlying types are identical: simply a pointer.
+                //
+                // So a Type::Ref(Type::Struct(_)) can be cast to Type::Struct(_).
+                //
+                // The Type::Ref(..) just means it can be used as an l-value and assigned
+                // a new value, unlike say, a struct literal.
+                if r.as_ref() == to {
+                    Ok(self.clone())
+                } else {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "conversion from {} to {} not possible",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                }
+            } else {
+                Expression::Load(*loc, r.as_ref().clone(), Box::new(self.clone())).cast(
+                    loc,
+                    to,
+                    implicit,
+                    ns,
+                    diagnostics,
+                )
+            };
+        }
+
+        // If it's a storage reference then load the value. The expr is the storage slot
+        if let Type::StorageRef(_, r) = from {
+            if let Expression::Subscript(_, _, ty, ..) = self {
+                if ty.is_storage_bytes() {
+                    return Ok(self.clone());
+                }
+            }
+
+            return Expression::StorageLoad(*loc, *r, Box::new(self.clone())).cast(
+                loc,
+                to,
+                implicit,
+                ns,
+                diagnostics,
+            );
+        }
+
+        // Special case: when converting literal sign can change if it fits
+        match (self, &from, to) {
+            (&Expression::NumberLiteral(_, _, ref n), p, &Type::Uint(to_len))
+                if p.is_primitive() =>
+            {
+                return if n.sign() == Sign::Minus {
+                    if implicit {
+                        diagnostics.push(Diagnostic::cast_error(
+                            *loc,
+                            format!(
+                                "implicit conversion cannot change negative number to '{}'",
+                                to.to_string(ns)
+                            ),
+                        ));
+                        Err(())
+                    } else {
+                        // Convert to little endian so most significant bytes are at the end; that way
+                        // we can simply resize the vector to the right size
+                        let mut bs = n.to_signed_bytes_le();
+
+                        bs.resize(to_len as usize / 8, 0xff);
+                        Ok(Expression::NumberLiteral(
+                            *loc,
+                            Type::Uint(to_len),
+                            BigInt::from_bytes_le(Sign::Plus, &bs),
+                        ))
+                    }
+                } else if n.bits() >= to_len as u64 {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion would truncate from '{}' to '{}'",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::NumberLiteral(
+                        *loc,
+                        Type::Uint(to_len),
+                        n.clone(),
+                    ))
+                };
+            }
+            (&Expression::NumberLiteral(_, _, ref n), p, &Type::Int(to_len))
+                if p.is_primitive() =>
+            {
+                return if n.bits() >= to_len as u64 {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion would truncate from '{}' to '{}'",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::NumberLiteral(
+                        *loc,
+                        Type::Int(to_len),
+                        n.clone(),
+                    ))
+                };
+            }
+            (&Expression::NumberLiteral(_, _, ref n), p, &Type::Bytes(to_len))
+                if p.is_primitive() =>
+            {
+                // round up the number of bits to bytes
+                let bytes = (n.bits() + 7) / 8;
+                return if n.sign() == Sign::Minus {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "negative number cannot be converted to type '{}'",
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if n.sign() == Sign::Plus && bytes != to_len as u64 {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "number of {} bytes cannot be converted to type '{}'",
+                            bytes,
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::NumberLiteral(
+                        *loc,
+                        Type::Bytes(to_len),
+                        n.clone(),
+                    ))
+                };
+            }
+            (&Expression::NumberLiteral(_, _, ref n), p, &Type::Address(payable))
+                if p.is_primitive() =>
+            {
+                // note: negative values are allowed
+                return if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        String::from("implicit conversion from int to address not allowed"),
+                    ));
+                    Err(())
+                } else if n.bits() > ns.address_length as u64 * 8 {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "number larger than possible in {} byte address",
+                            ns.address_length,
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::NumberLiteral(
+                        *loc,
+                        Type::Address(payable),
+                        n.clone(),
+                    ))
+                };
+            }
+            // Literal strings can be implicitly lengthened
+            (&Expression::BytesLiteral(_, _, ref bs), p, &Type::Bytes(to_len))
+                if p.is_primitive() =>
+            {
+                return if bs.len() > to_len as usize && implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion would truncate from '{}' to '{}'",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    let mut bs = bs.to_owned();
+
+                    // Add zero's at the end as needed
+                    bs.resize(to_len as usize, 0);
+
+                    Ok(Expression::BytesLiteral(*loc, Type::Bytes(to_len), bs))
+                };
+            }
+            (&Expression::BytesLiteral(loc, _, ref init), _, &Type::DynamicBytes)
+            | (&Expression::BytesLiteral(loc, _, ref init), _, &Type::String) => {
+                return Ok(Expression::AllocDynamicArray(
+                    loc,
+                    to.clone(),
+                    Box::new(Expression::NumberLiteral(
+                        loc,
+                        Type::Uint(32),
+                        BigInt::from(init.len()),
+                    )),
+                    Some(init.clone()),
+                ));
+            }
+            (&Expression::NumberLiteral(_, _, ref n), _, &Type::Rational) => {
+                return Ok(Expression::RationalNumberLiteral(
+                    *loc,
+                    Type::Rational,
+                    BigRational::from(n.clone()),
+                ));
+            }
+
+            (
+                &Expression::ArrayLiteral(..),
+                Type::Array(from_ty, from_dims),
+                Type::Array(to_ty, to_dims),
+            ) => {
+                if from_ty == to_ty
+                    && from_dims.len() == to_dims.len()
+                    && from_dims.len() == 1
+                    && matches!(to_dims.last().unwrap(), ArrayLength::Dynamic)
+                {
+                    return Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())));
+                }
+            }
+
+            _ => (),
+        };
+
+        self.cast_types(loc, &from, to, implicit, ns, diagnostics)
+    }
+
+    fn cast_types(
+        &self,
+        loc: &pt::Loc,
+        from: &Type,
+        to: &Type,
+        implicit: bool,
+        ns: &Namespace,
+        diagnostics: &mut Diagnostics,
+    ) -> Result<Expression, ()> {
+        let address_bits = ns.address_length as u16 * 8;
+
+        #[allow(clippy::comparison_chain)]
+        match (&from, &to) {
+            // Solana builtin AccountMeta struct wants a pointer to an address for the pubkey field,
+            // not an address. For this specific field we have a special Expression::GetRef() which
+            // gets the pointer to an address
+            (Type::Address(_), Type::Ref(to)) if matches!(to.as_ref(), Type::Address(..)) => {
+                Ok(Expression::GetRef(
+                    *loc,
+                    Type::Ref(Box::new(from.clone())),
+                    Box::new(self.clone()),
+                ))
+            }
+            (Type::Uint(from_width), Type::Enum(enum_no))
+            | (Type::Int(from_width), Type::Enum(enum_no)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion from {} to {} not allowed",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    return Err(());
+                }
+
+                let enum_ty = &ns.enums[*enum_no];
+
+                // TODO would be help to have current contract to resolve contract constants
+                if let Ok((_, big_number)) = eval_const_number(self, ns) {
+                    if let Some(number) = big_number.to_usize() {
+                        if enum_ty.values.values().any(|(_, v)| *v == number) {
+                            return Ok(Expression::NumberLiteral(
+                                self.loc(),
+                                to.clone(),
+                                big_number,
+                            ));
+                        }
+                    }
+
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "enum {} has no value with ordinal {}",
+                            to.to_string(ns),
+                            big_number
+                        ),
+                    ));
+                    return Err(());
+                }
+
+                let to_width = enum_ty.ty.bits(ns);
+
+                // TODO needs runtime checks
+                match from_width.cmp(&to_width) {
+                    Ordering::Greater => {
+                        Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                    Ordering::Less => Ok(Expression::ZeroExt(
+                        *loc,
+                        to.clone(),
+                        Box::new(self.clone()),
+                    )),
+                    Ordering::Equal => {
+                        Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                }
+            }
+            (Type::Enum(enum_no), Type::Uint(to_width))
+            | (Type::Enum(enum_no), Type::Int(to_width)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion from {} to {} not allowed",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    return Err(());
+                }
+                let enum_ty = &ns.enums[*enum_no];
+                let from_width = enum_ty.ty.bits(ns);
+
+                match from_width.cmp(to_width) {
+                    Ordering::Greater => {
+                        Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                    Ordering::Less => Ok(Expression::ZeroExt(
+                        *loc,
+                        to.clone(),
+                        Box::new(self.clone()),
+                    )),
+                    Ordering::Equal => {
+                        Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                }
+            }
+            (Type::Bytes(1), Type::Uint(8)) | (Type::Uint(8), Type::Bytes(1)) => Ok(self.clone()),
+            (Type::Uint(from_len), Type::Uint(to_len)) => match from_len.cmp(to_len) {
+                Ordering::Greater => {
+                    if implicit {
+                        diagnostics.push(Diagnostic::cast_error(
+                            *loc,
+                            format!(
+                                "implicit conversion would truncate from {} to {}",
+                                from.to_string(ns),
+                                to.to_string(ns)
+                            ),
+                        ));
+                        Err(())
+                    } else {
+                        Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                }
+                Ordering::Less => Ok(Expression::ZeroExt(
+                    *loc,
+                    to.clone(),
+                    Box::new(self.clone()),
+                )),
+                Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone()))),
+            },
+            (Type::Int(from_len), Type::Int(to_len)) => match from_len.cmp(to_len) {
+                Ordering::Greater => {
+                    if implicit {
+                        diagnostics.push(Diagnostic::cast_error(
+                            *loc,
+                            format!(
+                                "implicit conversion would truncate from {} to {}",
+                                from.to_string(ns),
+                                to.to_string(ns)
+                            ),
+                        ));
+                        Err(())
+                    } else {
+                        Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                }
+                Ordering::Less => Ok(Expression::SignExt(
+                    *loc,
+                    to.clone(),
+                    Box::new(self.clone()),
+                )),
+                Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone()))),
+            },
+            (Type::Uint(from_len), Type::Int(to_len)) if to_len > from_len => Ok(
+                Expression::ZeroExt(*loc, to.clone(), Box::new(self.clone())),
+            ),
+            (Type::Int(from_len), Type::Uint(to_len)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion would change sign from {} to {}",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if from_len > to_len {
+                    Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                } else if from_len < to_len {
+                    Ok(Expression::SignExt(
+                        *loc,
+                        to.clone(),
+                        Box::new(self.clone()),
+                    ))
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            (Type::Uint(from_len), Type::Int(to_len)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion would change sign from {} to {}",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if from_len > to_len {
+                    Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                } else if from_len < to_len {
+                    Ok(Expression::ZeroExt(
+                        *loc,
+                        to.clone(),
+                        Box::new(self.clone()),
+                    ))
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // Casting value to uint
+            (Type::Value, Type::Uint(to_len)) => {
+                let from_len = ns.value_length * 8;
+                let to_len = *to_len as usize;
+
+                match from_len.cmp(&to_len) {
+                    Ordering::Greater => {
+                        if implicit {
+                            diagnostics.push(Diagnostic::cast_error(
+                                *loc,
+                                format!(
+                                    "implicit conversion would truncate from {} to {}",
+                                    from.to_string(ns),
+                                    to.to_string(ns)
+                                ),
+                            ));
+                            Err(())
+                        } else {
+                            Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                        }
+                    }
+                    Ordering::Less => Ok(Expression::SignExt(
+                        *loc,
+                        to.clone(),
+                        Box::new(self.clone()),
+                    )),
+                    Ordering::Equal => {
+                        Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                }
+            }
+            (Type::Value, Type::Int(to_len)) => {
+                let from_len = ns.value_length * 8;
+                let to_len = *to_len as usize;
+
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion would change sign from {} to {}",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if from_len > to_len {
+                    Ok(Expression::Trunc(*loc, to.clone(), Box::new(self.clone())))
+                } else if from_len < to_len {
+                    Ok(Expression::ZeroExt(
+                        *loc,
+                        to.clone(),
+                        Box::new(self.clone()),
+                    ))
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // Casting value to uint
+            (Type::Uint(from_len), Type::Value) => {
+                let from_len = *from_len as usize;
+                let to_len = ns.value_length * 8;
+
+                match from_len.cmp(&to_len) {
+                    Ordering::Greater => {
+                        diagnostics.push(Diagnostic::cast_warning(
+                            *loc,
+                            format!(
+                                "conversion truncates {} to {}, as value is type {} on target {}",
+                                from.to_string(ns),
+                                to.to_string(ns),
+                                Type::Value.to_string(ns),
+                                ns.target
+                            ),
+                        ));
+
+                        Ok(Expression::CheckingTrunc(
+                            *loc,
+                            to.clone(),
+                            Box::new(self.clone()),
+                        ))
+                    }
+                    Ordering::Less => Ok(Expression::SignExt(
+                        *loc,
+                        to.clone(),
+                        Box::new(self.clone()),
+                    )),
+                    Ordering::Equal => {
+                        Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                    }
+                }
+            }
+            // Casting int to address
+            (Type::Uint(from_len), Type::Address(_)) | (Type::Int(from_len), Type::Address(_)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion from {} to address not allowed",
+                            from.to_string(ns)
+                        ),
+                    ));
+
+                    Err(())
+                } else {
+                    // cast integer it to integer of the same size of address with sign ext etc
+                    let address_to_int = if from.is_signed_int() {
+                        Type::Int(address_bits)
+                    } else {
+                        Type::Uint(address_bits)
+                    };
+
+                    let expr = if *from_len > address_bits {
+                        Expression::Trunc(*loc, address_to_int, Box::new(self.clone()))
+                    } else if *from_len < address_bits {
+                        if from.is_signed_int() {
+                            Expression::ZeroExt(*loc, address_to_int, Box::new(self.clone()))
+                        } else {
+                            Expression::SignExt(*loc, address_to_int, Box::new(self.clone()))
+                        }
+                    } else {
+                        self.clone()
+                    };
+
+                    // Now cast integer to address
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
+                }
+            }
+            // Casting address to int
+            (Type::Address(_), Type::Uint(to_len)) | (Type::Address(_), Type::Int(to_len)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion to {} from {} not allowed",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+
+                    Err(())
+                } else {
+                    // first convert address to int/uint
+                    let address_to_int = if to.is_signed_int() {
+                        Type::Int(address_bits)
+                    } else {
+                        Type::Uint(address_bits)
+                    };
+
+                    let expr = Expression::Cast(*loc, address_to_int, Box::new(self.clone()));
+                    // now resize int to request size with sign extension etc
+                    if *to_len < address_bits {
+                        Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
+                    } else if *to_len > address_bits {
+                        if to.is_signed_int() {
+                            Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr)))
+                        } else {
+                            Ok(Expression::SignExt(*loc, to.clone(), Box::new(expr)))
+                        }
+                    } else {
+                        Ok(expr)
+                    }
+                }
+            }
+            // Lengthing or shorting a fixed bytes array
+            (Type::Bytes(from_len), Type::Bytes(to_len)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion would truncate from {} to {}",
+                            from.to_string(ns),
+                            to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if to_len > from_len {
+                    let shift = (to_len - from_len) * 8;
+
+                    Ok(Expression::ShiftLeft(
+                        *loc,
+                        to.clone(),
+                        Box::new(Expression::ZeroExt(
+                            self.loc(),
+                            to.clone(),
+                            Box::new(self.clone()),
+                        )),
+                        Box::new(Expression::NumberLiteral(
+                            *loc,
+                            Type::Uint(*to_len as u16 * 8),
+                            BigInt::from_u8(shift).unwrap(),
+                        )),
+                    ))
+                } else {
+                    let shift = (from_len - to_len) * 8;
+
+                    Ok(Expression::Trunc(
+                        *loc,
+                        to.clone(),
+                        Box::new(Expression::ShiftRight(
+                            self.loc(),
+                            from.clone(),
+                            Box::new(self.clone()),
+                            Box::new(Expression::NumberLiteral(
+                                self.loc(),
+                                Type::Uint(*from_len as u16 * 8),
+                                BigInt::from_u8(shift).unwrap(),
+                            )),
+                            false,
+                        )),
+                    ))
+                }
+            }
+            (Type::Rational, Type::Uint(_) | Type::Int(_) | Type::Value) => {
+                match eval_const_rational(self, ns) {
+                    Ok((_, big_number)) => {
+                        if big_number.is_integer() {
+                            return Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())));
+                        }
+
+                        diagnostics.push(Diagnostic::cast_error(
+                            *loc,
+                            format!(
+                                "conversion to {} from {} not allowed",
+                                to.to_string(ns),
+                                from.to_string(ns)
+                            ),
+                        ));
+
+                        Err(())
+                    }
+                    Err(diag) => {
+                        diagnostics.push(diag);
+                        Err(())
+                    }
+                }
+            }
+            (Type::Uint(_) | Type::Int(_) | Type::Value, Type::Rational) => {
+                Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+            }
+            (Type::Bytes(_), Type::DynamicBytes) | (Type::DynamicBytes, Type::Bytes(_)) => Ok(
+                Expression::BytesCast(*loc, from.clone(), to.clone(), Box::new(self.clone())),
+            ),
+            // Explicit conversion from bytesN to int/uint only allowed with expliciy
+            // cast and if it is the same size (i.e. no conversion required)
+            (Type::Bytes(from_len), Type::Uint(to_len))
+            | (Type::Bytes(from_len), Type::Int(to_len)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if *from_len as u16 * 8 != *to_len {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // Explicit conversion to bytesN from int/uint only allowed with expliciy
+            // cast and if it is the same size (i.e. no conversion required)
+            (Type::Uint(from_len), Type::Bytes(to_len))
+            | (Type::Int(from_len), Type::Bytes(to_len)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if *to_len as u16 * 8 != *from_len {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // Explicit conversion from bytesN to address only allowed with expliciy
+            // cast and if it is the same size (i.e. no conversion required)
+            (Type::Bytes(from_len), Type::Address(_)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if *from_len as usize != ns.address_length {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // Explicit conversion between contract and address is allowed
+            (Type::Address(false), Type::Address(true))
+            | (Type::Address(_), Type::Contract(_))
+            | (Type::Contract(_), Type::Address(_)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // Conversion between contracts is allowed if it is a base
+            (Type::Contract(contract_no_from), Type::Contract(contract_no_to)) => {
+                if implicit && !is_base(*contract_no_to, *contract_no_from, ns) {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion not allowed since {} is not a base contract of {}",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // conversion from address payable to address is implicitly allowed (not vice versa)
+            (Type::Address(true), Type::Address(false)) => {
+                Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+            }
+            // Explicit conversion to bytesN from int/uint only allowed with expliciy
+            // cast and if it is the same size (i.e. no conversion required)
+            (Type::Address(_), Type::Bytes(to_len)) => {
+                if implicit {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "implicit conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if *to_len as usize != ns.address_length {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "conversion to {} from {} not allowed",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            (Type::String, Type::DynamicBytes) | (Type::DynamicBytes, Type::String)
+                if !implicit =>
+            {
+                Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+            }
+            // string conversions
+            // (Type::Bytes(_), Type::String) => Ok(Expression::Cast(self.loc(), to.clone(), Box::new(self.clone()))),
+            /*
+            (Type::String, Type::Bytes(to_len)) => {
+                if let Expression::BytesLiteral(_, from_str) = self {
+                    if from_str.len() > to_len as usize {
+                        diagnostics.push(Output::type_error(
+                            self.loc(),
+                            format!(
+                                "string of {} bytes is too long to fit into {}",
+                                from_str.len(),
+                                to.to_string(ns)
+                            ),
+                        ));
+                        return Err(());
+                    }
+                }
+                Ok(Expression::Cast(self.loc(), to.clone(), Box::new(self.clone()))
+            }
+            */
+            (Type::Void, _) => {
+                diagnostics.push(Diagnostic::cast_error(
+                    self.loc(),
+                    "function or method does not return a value".to_string(),
+                ));
+                Err(())
+            }
+            (
+                Type::ExternalFunction {
+                    params: from_params,
+                    mutability: from_mutablity,
+                    returns: from_returns,
+                },
+                Type::ExternalFunction {
+                    params: to_params,
+                    mutability: to_mutablity,
+                    returns: to_returns,
+                },
+            )
+            | (
+                Type::InternalFunction {
+                    params: from_params,
+                    mutability: from_mutablity,
+                    returns: from_returns,
+                },
+                Type::InternalFunction {
+                    params: to_params,
+                    mutability: to_mutablity,
+                    returns: to_returns,
+                },
+            ) => {
+                if from_params != to_params {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "function arguments do not match in conversion from '{}' to '{}'",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if from_returns != to_returns {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "function returns do not match in conversion from '{}' to '{}'",
+                            to.to_string(ns),
+                            from.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if !compatible_mutability(from_mutablity, to_mutablity) {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "function mutability not compatible in conversion from '{}' to '{}'",
+                            from.to_string(ns),
+                            to.to_string(ns),
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+                }
+            }
+            // Match any array with ArrayLength::AnyFixed if is it fixed for that dimension, and the
+            // element type and other dimensions also match
+            (Type::Array(from_elem, from_dim), Type::Array(to_elem, to_dim))
+                if from_elem == to_elem
+                    && from_dim.len() == to_dim.len()
+                    && from_dim.iter().zip(to_dim.iter()).all(|(f, t)| {
+                        f == t || matches!((f, t), (ArrayLength::Fixed(_), ArrayLength::AnyFixed))
+                    }) =>
+            {
+                Ok(self.clone())
+            }
+            (Type::DynamicBytes, Type::Slice(ty)) if ty.as_ref() == &Type::Bytes(1) => {
+                Ok(Expression::Cast(*loc, to.clone(), Box::new(self.clone())))
+            }
+            _ => {
+                diagnostics.push(Diagnostic::cast_error(
+                    *loc,
+                    format!(
+                        "conversion from {} to {} not possible",
+                        from.to_string(ns),
+                        to.to_string(ns)
+                    ),
+                ));
+                Err(())
+            }
+        }
+    }
 }
 
 /// Unescape a string literal
@@ -147,7 +1111,7 @@ pub(crate) fn unescape(
     literal: &str,
     start: usize,
     file_no: usize,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Vec<u8> {
     let mut s: Vec<u8> = Vec::new();
     let mut indeces = literal.char_indices();
@@ -251,7 +1215,7 @@ fn coerce(
     r: &Type,
     r_loc: &pt::Loc,
     ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Type, ()> {
     let l = match l {
         Type::Ref(ty) => ty,
@@ -283,7 +1247,7 @@ fn get_int_length(
     l_loc: &pt::Loc,
     allow_bytes: bool,
     ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<(u16, bool), ()> {
     match l {
         Type::Uint(n) => Ok((*n, false)),
@@ -297,10 +1261,10 @@ fn get_int_length(
             ));
             Err(())
         }
-        Type::Struct(n) => {
+        Type::Struct(str_ty) => {
             diagnostics.push(Diagnostic::error(
                 *l_loc,
-                format!("type struct {} not allowed", ns.structs[*n]),
+                format!("type struct {} not allowed", str_ty.definition(ns)),
             ));
             Err(())
         }
@@ -323,7 +1287,7 @@ fn get_int_length(
     }
 }
 
-fn coerce_number(
+pub fn coerce_number(
     l: &Type,
     l_loc: &pt::Loc,
     r: &Type,
@@ -331,7 +1295,7 @@ fn coerce_number(
     allow_bytes: bool,
     for_compare: bool,
     ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Type, ()> {
     let l = match l {
         Type::Ref(ty) => ty,
@@ -378,6 +1342,12 @@ fn coerce_number(
         (Type::Int(_), Type::Rational) => {
             return Ok(Type::Rational);
         }
+        (Type::Bool, Type::Int(_) | Type::Uint(_)) => {
+            return Ok(r.clone());
+        }
+        (Type::Int(_) | Type::Uint(_), Type::Bool) => {
+            return Ok(l.clone());
+        }
         _ => (),
     }
 
@@ -393,48 +1363,202 @@ fn coerce_number(
     })
 }
 
+/// Resolve the given number literal, multiplied by value of unit
+fn number_literal(
+    loc: &pt::Loc,
+    integer: &str,
+    exp: &str,
+    ns: &Namespace,
+    unit: &BigInt,
+    diagnostics: &mut Diagnostics,
+    resolve_to: ResolveTo,
+) -> Result<Expression, ()> {
+    let integer = BigInt::from_str(integer).unwrap();
+
+    let n = if exp.is_empty() {
+        integer
+    } else {
+        let base10 = BigInt::from_str("10").unwrap();
+
+        if let Some(abs_exp) = exp.strip_prefix('-') {
+            if let Ok(exp) = u8::from_str(abs_exp) {
+                let res = BigRational::new(integer, base10.pow(exp));
+
+                if res.is_integer() {
+                    res.to_integer()
+                } else {
+                    return Ok(Expression::RationalNumberLiteral(*loc, Type::Rational, res));
+                }
+            } else {
+                diagnostics.push(Diagnostic::error(
+                    *loc,
+                    format!("exponent '{}' too large", exp),
+                ));
+                return Err(());
+            }
+        } else if let Ok(exp) = u8::from_str(exp) {
+            integer.mul(base10.pow(exp))
+        } else {
+            diagnostics.push(Diagnostic::error(
+                *loc,
+                format!("exponent '{}' too large", exp),
+            ));
+            return Err(());
+        }
+    };
+
+    bigint_to_expression(loc, &n.mul(unit), ns, diagnostics, resolve_to)
+}
+
+/// Resolve the given rational number literal, multiplied by value of unit
+fn rational_number_literal(
+    loc: &pt::Loc,
+    integer: &str,
+    fraction: &str,
+    exp: &str,
+    unit: &BigInt,
+    ns: &Namespace,
+    diagnostics: &mut Diagnostics,
+    resolve_to: ResolveTo,
+) -> Result<Expression, ()> {
+    let mut integer = integer.to_owned();
+    let len = fraction.len();
+    let exp_negative = exp.starts_with('-');
+
+    let denominator = BigInt::from_str("10").unwrap().pow(len);
+    let zero_index = fraction
+        .chars()
+        .position(|c| c != '0')
+        .unwrap_or(usize::MAX);
+    let n = if exp.is_empty() {
+        if integer.is_empty() || integer == "0" {
+            if zero_index < usize::MAX {
+                BigRational::new(
+                    BigInt::from_str(&fraction[zero_index..]).unwrap(),
+                    denominator,
+                )
+            } else {
+                BigRational::from(BigInt::zero())
+            }
+        } else {
+            integer.push_str(fraction);
+            BigRational::new(BigInt::from_str(&integer).unwrap(), denominator)
+        }
+    } else {
+        let exp = if let Ok(exp) = u8::from_str(if exp_negative { &exp[1..] } else { exp }) {
+            exp
+        } else {
+            diagnostics.push(Diagnostic::error(
+                *loc,
+                format!("exponent '{}' too large", exp),
+            ));
+            return Err(());
+        };
+        let exp_result = BigInt::from_str("10").unwrap().pow(exp);
+
+        if integer.is_empty() || integer == "0" {
+            if zero_index < usize::MAX {
+                if exp_negative {
+                    BigRational::new(
+                        BigInt::from_str(&fraction[zero_index..]).unwrap(),
+                        denominator.mul(exp_result),
+                    )
+                } else {
+                    BigRational::new(
+                        BigInt::from_str(&fraction[zero_index..])
+                            .unwrap()
+                            .mul(exp_result),
+                        denominator,
+                    )
+                }
+            } else {
+                BigRational::from(BigInt::zero())
+            }
+        } else {
+            integer.push_str(fraction);
+            if exp_negative {
+                BigRational::new(
+                    BigInt::from_str(&integer).unwrap(),
+                    denominator.mul(exp_result),
+                )
+            } else {
+                BigRational::new(
+                    BigInt::from_str(&integer).unwrap().mul(exp_result),
+                    denominator,
+                )
+            }
+        }
+    };
+
+    let res = n.mul(unit);
+
+    if res.is_integer() {
+        bigint_to_expression(loc, &res.to_integer(), ns, diagnostics, resolve_to)
+    } else {
+        Ok(Expression::RationalNumberLiteral(*loc, Type::Rational, res))
+    }
+}
+
 /// Try to convert a BigInt into a Expression::NumberLiteral. This checks for sign,
 /// width and creates to correct Type.
 pub fn bigint_to_expression(
     loc: &pt::Loc,
     n: &BigInt,
     ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let bits = n.bits();
 
     if let ResolveTo::Type(resolve_to) = resolve_to {
-        if !resolve_to.is_integer() {
-            diagnostics.push(Diagnostic::error(
-                *loc,
-                format!("expected ‘{}’, found integer", resolve_to.to_string(ns)),
-            ));
-            return Err(());
-        }
-
-        let permitted_bits = if resolve_to.is_signed_int() {
-            resolve_to.bits(ns) as u64 - 1
-        } else {
-            resolve_to.bits(ns) as u64
-        };
-
-        return if n.sign() == Sign::Minus {
-            if !resolve_to.is_signed_int() {
-                diagnostics.push(Diagnostic::error(
+        if *resolve_to != Type::Unresolved {
+            if !resolve_to.is_integer() {
+                diagnostics.push(Diagnostic::cast_error(
                     *loc,
-                    format!(
-                        "negative literal {} not allowed for unsigned type ‘{}’",
-                        n,
-                        resolve_to.to_string(ns)
-                    ),
+                    format!("expected '{}', found integer", resolve_to.to_string(ns)),
                 ));
-                Err(())
-            } else if n.add(1u32).bits() > permitted_bits {
-                diagnostics.push(Diagnostic::error(
+                return Err(());
+            }
+
+            let permitted_bits = if resolve_to.is_signed_int() {
+                resolve_to.bits(ns) as u64 - 1
+            } else {
+                resolve_to.bits(ns) as u64
+            };
+
+            return if n.sign() == Sign::Minus {
+                if !resolve_to.is_signed_int() {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "negative literal {} not allowed for unsigned type '{}'",
+                            n,
+                            resolve_to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else if n.add(1u32).bits() > permitted_bits {
+                    diagnostics.push(Diagnostic::cast_error(
+                        *loc,
+                        format!(
+                            "literal {} is too large to fit into type '{}'",
+                            n,
+                            resolve_to.to_string(ns)
+                        ),
+                    ));
+                    Err(())
+                } else {
+                    Ok(Expression::NumberLiteral(
+                        *loc,
+                        resolve_to.clone(),
+                        n.clone(),
+                    ))
+                }
+            } else if bits > permitted_bits {
+                diagnostics.push(Diagnostic::cast_error(
                     *loc,
                     format!(
-                        "literal {} is too large to fit into type ‘{}’",
+                        "literal {} is too large to fit into type '{}'",
                         n,
                         resolve_to.to_string(ns)
                     ),
@@ -446,24 +1570,8 @@ pub fn bigint_to_expression(
                     resolve_to.clone(),
                     n.clone(),
                 ))
-            }
-        } else if bits > permitted_bits {
-            diagnostics.push(Diagnostic::error(
-                *loc,
-                format!(
-                    "literal {} is too large to fit into type ‘{}’",
-                    n,
-                    resolve_to.to_string(ns)
-                ),
-            ));
-            Err(())
-        } else {
-            Ok(Expression::NumberLiteral(
-                *loc,
-                resolve_to.clone(),
-                n.clone(),
-            ))
-        };
+            };
+        }
     }
 
     // Return smallest type
@@ -493,898 +1601,6 @@ pub fn bigint_to_expression(
     }
 }
 
-/// Try to convert a Bigfloat into a Expression::RationalNumberLiteral. This checks for sign,
-/// width and creates to correct Type.
-pub fn bigdecimal_to_expression(
-    loc: &pt::Loc,
-    n: &BigRational,
-    ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
-    resolve_to: ResolveTo,
-) -> Result<Expression, ()> {
-    if let ResolveTo::Type(resolve_to) = resolve_to {
-        if !resolve_to.is_rational() {
-            diagnostics.push(Diagnostic::error(
-                *loc,
-                format!("expected ‘{}’, found rational", resolve_to.to_string(ns)),
-            ));
-            return Err(());
-        } else {
-            return Ok(Expression::RationalNumberLiteral(
-                *loc,
-                resolve_to.clone(),
-                n.clone(),
-            ));
-        };
-    }
-    Err(())
-}
-
-/// Cast from one type to another, which also automatically derefs any Type::Ref() type.
-/// if the cast is explicit (e.g. bytes32(bar) then implicit should be set to false.
-pub fn cast(
-    loc: &pt::Loc,
-    expr: Expression,
-    to: &Type,
-    implicit: bool,
-    ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Result<Expression, ()> {
-    let from = expr.ty();
-
-    if &from == to {
-        return Ok(expr);
-    }
-
-    // First of all, if we need a ref then derefence it
-    if matches!(to, Type::Ref(..)) && !matches!(from, Type::Ref(..)) {
-        return cast(
-            loc,
-            Expression::GetRef(*loc, Type::Ref(Box::new(from)), Box::new(expr)),
-            to,
-            implicit,
-            ns,
-            diagnostics,
-        );
-    }
-
-    // First of all, if we have a ref then derefence it
-    if let Type::Ref(r) = from {
-        return cast(
-            loc,
-            Expression::Load(*loc, r.as_ref().clone(), Box::new(expr)),
-            to,
-            implicit,
-            ns,
-            diagnostics,
-        );
-    }
-
-    // If it's a storage reference then load the value. The expr is the storage slot
-    if let Type::StorageRef(_, r) = from {
-        if let Expression::Subscript(_, _, ty, ..) = &expr {
-            if ty.is_storage_bytes() {
-                return Ok(expr);
-            }
-        }
-
-        return cast(
-            loc,
-            Expression::StorageLoad(*loc, *r, Box::new(expr)),
-            to,
-            implicit,
-            ns,
-            diagnostics,
-        );
-    }
-
-    // Special case: when converting literal sign can change if it fits
-    match (&expr, &from, to) {
-        (&Expression::NumberLiteral(_, _, ref n), p, &Type::Uint(to_len)) if p.is_primitive() => {
-            return if n.sign() == Sign::Minus {
-                if implicit {
-                    diagnostics.push(Diagnostic::type_error(
-                        *loc,
-                        format!(
-                            "implicit conversion cannot change negative number to ‘{}’",
-                            to.to_string(ns)
-                        ),
-                    ));
-                    Err(())
-                } else {
-                    // Convert to little endian so most significant bytes are at the end; that way
-                    // we can simply resize the vector to the right size
-                    let mut bs = n.to_signed_bytes_le();
-
-                    bs.resize(to_len as usize / 8, 0xff);
-                    Ok(Expression::NumberLiteral(
-                        *loc,
-                        Type::Uint(to_len),
-                        BigInt::from_bytes_le(Sign::Plus, &bs),
-                    ))
-                }
-            } else if n.bits() >= to_len as u64 {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion would truncate from ‘{}’ to ‘{}’",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::NumberLiteral(
-                    *loc,
-                    Type::Uint(to_len),
-                    n.clone(),
-                ))
-            };
-        }
-        (&Expression::NumberLiteral(_, _, ref n), p, &Type::Int(to_len)) if p.is_primitive() => {
-            return if n.bits() >= to_len as u64 {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion would truncate from ‘{}’ to ‘{}’",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::NumberLiteral(
-                    *loc,
-                    Type::Int(to_len),
-                    n.clone(),
-                ))
-            };
-        }
-        (&Expression::NumberLiteral(_, _, ref n), p, &Type::Bytes(to_len)) if p.is_primitive() => {
-            // round up the number of bits to bytes
-            let bytes = (n.bits() + 7) / 8;
-            return if n.sign() == Sign::Minus {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "negative number cannot be converted to type ‘{}’",
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if n.sign() == Sign::Plus && bytes != to_len as u64 {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "number of {} bytes cannot be converted to type ‘{}’",
-                        bytes,
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::NumberLiteral(
-                    *loc,
-                    Type::Bytes(to_len),
-                    n.clone(),
-                ))
-            };
-        }
-        (&Expression::NumberLiteral(_, _, ref n), p, &Type::Address(payable))
-            if p.is_primitive() =>
-        {
-            // note: negative values are allowed
-            return if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    String::from("implicit conversion from int to address not allowed"),
-                ));
-                Err(())
-            } else if n.bits() > ns.address_length as u64 * 8 {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "number larger than possible in {} byte address",
-                        ns.address_length,
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::NumberLiteral(
-                    *loc,
-                    Type::Address(payable),
-                    n.clone(),
-                ))
-            };
-        }
-        // Literal strings can be implicitly lengthened
-        (&Expression::BytesLiteral(_, _, ref bs), p, &Type::Bytes(to_len)) if p.is_primitive() => {
-            return if bs.len() > to_len as usize && implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion would truncate from ‘{}’ to ‘{}’",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                let mut bs = bs.to_owned();
-
-                // Add zero's at the end as needed
-                bs.resize(to_len as usize, 0);
-
-                Ok(Expression::BytesLiteral(*loc, Type::Bytes(to_len), bs))
-            };
-        }
-        (&Expression::BytesLiteral(loc, _, ref init), _, &Type::DynamicBytes)
-        | (&Expression::BytesLiteral(loc, _, ref init), _, &Type::String) => {
-            return Ok(Expression::AllocDynamicArray(
-                loc,
-                to.clone(),
-                Box::new(Expression::NumberLiteral(
-                    loc,
-                    Type::Uint(32),
-                    BigInt::from(init.len()),
-                )),
-                Some(init.clone()),
-            ));
-        }
-        (&Expression::NumberLiteral(_, _, ref n), _, &Type::Rational) => {
-            return Ok(Expression::RationalNumberLiteral(
-                *loc,
-                Type::Rational,
-                BigRational::from(n.clone()),
-            ));
-        }
-        _ => (),
-    };
-
-    cast_types(loc, expr, from, to.clone(), implicit, ns, diagnostics)
-}
-
-/// Do casting between types (no literals)
-fn cast_types(
-    loc: &pt::Loc,
-    expr: Expression,
-    from: Type,
-    to: Type,
-    implicit: bool,
-    ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Result<Expression, ()> {
-    let address_bits = ns.address_length as u16 * 8;
-
-    #[allow(clippy::comparison_chain)]
-    match (&from, &to) {
-        (Type::Uint(from_width), Type::Enum(enum_no))
-        | (Type::Int(from_width), Type::Enum(enum_no)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion from {} to {} not allowed",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                return Err(());
-            }
-
-            let enum_ty = &ns.enums[*enum_no];
-
-            // TODO would be help to have current contract to resolve contract constants
-            if let Ok((_, big_number)) = eval_const_number(&expr, None, ns) {
-                if let Some(number) = big_number.to_usize() {
-                    if enum_ty.values.values().any(|(_, v)| *v == number) {
-                        return Ok(Expression::NumberLiteral(
-                            expr.loc(),
-                            to.clone(),
-                            big_number,
-                        ));
-                    }
-                }
-
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "enum {} has no value with ordinal {}",
-                        to.to_string(ns),
-                        big_number
-                    ),
-                ));
-                return Err(());
-            }
-
-            let to_width = enum_ty.ty.bits(ns);
-
-            // TODO needs runtime checks
-            match from_width.cmp(&to_width) {
-                Ordering::Greater => Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr))),
-                Ordering::Less => Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr))),
-                Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))),
-            }
-        }
-        (Type::Enum(enum_no), Type::Uint(to_width))
-        | (Type::Enum(enum_no), Type::Int(to_width)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion from {} to {} not allowed",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                return Err(());
-            }
-
-            let enum_ty = &ns.enums[*enum_no];
-            let from_width = enum_ty.ty.bits(ns);
-
-            match from_width.cmp(to_width) {
-                Ordering::Greater => Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr))),
-                Ordering::Less => Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr))),
-                Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))),
-            }
-        }
-        (Type::Bytes(1), Type::Uint(8)) => Ok(expr),
-        (Type::Uint(8), Type::Bytes(1)) => Ok(expr),
-        (Type::Uint(from_len), Type::Uint(to_len)) => match from_len.cmp(to_len) {
-            Ordering::Greater => {
-                if implicit {
-                    diagnostics.push(Diagnostic::type_error(
-                        *loc,
-                        format!(
-                            "implicit conversion would truncate from {} to {}",
-                            from.to_string(ns),
-                            to.to_string(ns)
-                        ),
-                    ));
-                    Err(())
-                } else {
-                    Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
-                }
-            }
-            Ordering::Less => Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr))),
-            Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))),
-        },
-        (Type::Int(from_len), Type::Int(to_len)) => match from_len.cmp(to_len) {
-            Ordering::Greater => {
-                if implicit {
-                    diagnostics.push(Diagnostic::type_error(
-                        *loc,
-                        format!(
-                            "implicit conversion would truncate from {} to {}",
-                            from.to_string(ns),
-                            to.to_string(ns)
-                        ),
-                    ));
-                    Err(())
-                } else {
-                    Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
-                }
-            }
-            Ordering::Less => Ok(Expression::SignExt(*loc, to.clone(), Box::new(expr))),
-            Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))),
-        },
-        (Type::Uint(from_len), Type::Int(to_len)) if to_len > from_len => {
-            Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr)))
-        }
-        (Type::Int(from_len), Type::Uint(to_len)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion would change sign from {} to {}",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if from_len > to_len {
-                Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
-            } else if from_len < to_len {
-                Ok(Expression::SignExt(*loc, to.clone(), Box::new(expr)))
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        (Type::Uint(from_len), Type::Int(to_len)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion would change sign from {} to {}",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if from_len > to_len {
-                Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
-            } else if from_len < to_len {
-                Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr)))
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // Casting value to uint
-        (Type::Value, Type::Uint(to_len)) => {
-            let from_len = ns.value_length * 8;
-            let to_len = *to_len as usize;
-
-            match from_len.cmp(&to_len) {
-                Ordering::Greater => {
-                    if implicit {
-                        diagnostics.push(Diagnostic::type_error(
-                            *loc,
-                            format!(
-                                "implicit conversion would truncate from {} to {}",
-                                from.to_string(ns),
-                                to.to_string(ns)
-                            ),
-                        ));
-                        Err(())
-                    } else {
-                        Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
-                    }
-                }
-                Ordering::Less => Ok(Expression::SignExt(*loc, to.clone(), Box::new(expr))),
-                Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))),
-            }
-        }
-        (Type::Value, Type::Int(to_len)) => {
-            let from_len = ns.value_length * 8;
-            let to_len = *to_len as usize;
-
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion would change sign from {} to {}",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if from_len > to_len {
-                Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
-            } else if from_len < to_len {
-                Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr)))
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // Casting value to uint
-        (Type::Uint(from_len), Type::Value) => {
-            let from_len = *from_len as usize;
-            let to_len = ns.value_length * 8;
-
-            match from_len.cmp(&to_len) {
-                Ordering::Greater => {
-                    diagnostics.push(Diagnostic::warning(
-                        *loc,
-                        format!(
-                            "conversion truncates {} to {}, as value is type {} on target {}",
-                            from.to_string(ns),
-                            to.to_string(ns),
-                            Type::Value.to_string(ns),
-                            ns.target
-                        ),
-                    ));
-
-                    Ok(Expression::CheckingTrunc(*loc, to.clone(), Box::new(expr)))
-                }
-                Ordering::Less => Ok(Expression::SignExt(*loc, to.clone(), Box::new(expr))),
-                Ordering::Equal => Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))),
-            }
-        }
-        // Casting int to address
-        (Type::Uint(from_len), Type::Address(_)) | (Type::Int(from_len), Type::Address(_)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion from {} to address not allowed",
-                        from.to_string(ns)
-                    ),
-                ));
-
-                Err(())
-            } else {
-                // cast integer it to integer of the same size of address with sign ext etc
-                let address_to_int = if from.is_signed_int() {
-                    Type::Int(address_bits)
-                } else {
-                    Type::Uint(address_bits)
-                };
-
-                let expr = if *from_len > address_bits {
-                    Expression::Trunc(*loc, address_to_int, Box::new(expr))
-                } else if *from_len < address_bits {
-                    if from.is_signed_int() {
-                        Expression::ZeroExt(*loc, to.clone(), Box::new(expr))
-                    } else {
-                        Expression::SignExt(*loc, to.clone(), Box::new(expr))
-                    }
-                } else {
-                    expr
-                };
-
-                // Now cast integer to address
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // Casting address to int
-        (Type::Address(_), Type::Uint(to_len)) | (Type::Address(_), Type::Int(to_len)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion to {} from {} not allowed",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-
-                Err(())
-            } else {
-                // first convert address to int/uint
-                let address_to_int = if to.is_signed_int() {
-                    Type::Int(address_bits)
-                } else {
-                    Type::Uint(address_bits)
-                };
-
-                let expr = Expression::Cast(*loc, address_to_int, Box::new(expr));
-
-                // now resize int to request size with sign extension etc
-                if *to_len < address_bits {
-                    Ok(Expression::Trunc(*loc, to.clone(), Box::new(expr)))
-                } else if *to_len > address_bits {
-                    if to.is_signed_int() {
-                        Ok(Expression::ZeroExt(*loc, to.clone(), Box::new(expr)))
-                    } else {
-                        Ok(Expression::SignExt(*loc, to.clone(), Box::new(expr)))
-                    }
-                } else {
-                    Ok(expr)
-                }
-            }
-        }
-        // Lengthing or shorting a fixed bytes array
-        (Type::Bytes(from_len), Type::Bytes(to_len)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion would truncate from {} to {}",
-                        from.to_string(ns),
-                        to.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if to_len > from_len {
-                let shift = (to_len - from_len) * 8;
-
-                Ok(Expression::ShiftLeft(
-                    *loc,
-                    to.clone(),
-                    Box::new(Expression::ZeroExt(*loc, to.clone(), Box::new(expr))),
-                    Box::new(Expression::NumberLiteral(
-                        *loc,
-                        Type::Uint(*to_len as u16 * 8),
-                        BigInt::from_u8(shift).unwrap(),
-                    )),
-                ))
-            } else {
-                let shift = (from_len - to_len) * 8;
-
-                Ok(Expression::Trunc(
-                    *loc,
-                    to.clone(),
-                    Box::new(Expression::ShiftRight(
-                        *loc,
-                        from.clone(),
-                        Box::new(expr),
-                        Box::new(Expression::NumberLiteral(
-                            *loc,
-                            Type::Uint(*from_len as u16 * 8),
-                            BigInt::from_u8(shift).unwrap(),
-                        )),
-                        false,
-                    )),
-                ))
-            }
-        }
-        (Type::Rational, Type::Uint(_) | Type::Int(_) | Type::Value) => {
-            match eval_const_rational(&expr, None, ns) {
-                Ok((_, big_number)) => {
-                    if big_number.is_integer() {
-                        let expr = Expression::NumberLiteral(
-                            expr.loc(),
-                            to.clone(),
-                            big_number.to_integer(),
-                        );
-
-                        return cast(loc, expr, &to, true, ns, diagnostics);
-                    }
-
-                    diagnostics.push(Diagnostic::type_error(
-                        *loc,
-                        format!(
-                            "conversion to {} from {} not allowed",
-                            to.to_string(ns),
-                            from.to_string(ns)
-                        ),
-                    ));
-
-                    Err(())
-                }
-                Err(diag) => {
-                    diagnostics.push(diag);
-                    Err(())
-                }
-            }
-        }
-        (Type::Uint(_) | Type::Int(_) | Type::Value, Type::Rational) => {
-            Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-        }
-        (Type::Bytes(_), Type::DynamicBytes) | (Type::DynamicBytes, Type::Bytes(_)) => Ok(
-            Expression::BytesCast(*loc, from.clone(), to.clone(), Box::new(expr)),
-        ),
-        // Explicit conversion from bytesN to int/uint only allowed with expliciy
-        // cast and if it is the same size (i.e. no conversion required)
-        (Type::Bytes(from_len), Type::Uint(to_len))
-        | (Type::Bytes(from_len), Type::Int(to_len)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if *from_len as u16 * 8 != *to_len {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // Explicit conversion to bytesN from int/uint only allowed with expliciy
-        // cast and if it is the same size (i.e. no conversion required)
-        (Type::Uint(from_len), Type::Bytes(to_len))
-        | (Type::Int(from_len), Type::Bytes(to_len)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if *to_len as u16 * 8 != *from_len {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // Explicit conversion from bytesN to address only allowed with expliciy
-        // cast and if it is the same size (i.e. no conversion required)
-        (Type::Bytes(from_len), Type::Address(_)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if *from_len as usize != ns.address_length {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // Explicit conversion between contract and address is allowed
-        (Type::Address(false), Type::Address(true))
-        | (Type::Address(_), Type::Contract(_))
-        | (Type::Contract(_), Type::Address(_)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // Conversion between contracts is allowed if it is a base
-        (Type::Contract(contract_no_from), Type::Contract(contract_no_to)) => {
-            if implicit && !is_base(*contract_no_to, *contract_no_from, ns) {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion not allowed since {} is not a base contract of {}",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        // conversion from address payable to address is implicitly allowed (not vice versa)
-        (Type::Address(true), Type::Address(false)) => {
-            Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-        }
-        // Explicit conversion to bytesN from int/uint only allowed with expliciy
-        // cast and if it is the same size (i.e. no conversion required)
-        (Type::Address(_), Type::Bytes(to_len)) => {
-            if implicit {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "implicit conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if *to_len as usize != ns.address_length {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "conversion to {} from {} not allowed",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        (Type::String, Type::DynamicBytes) | (Type::DynamicBytes, Type::String) if !implicit => {
-            Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-        }
-        // string conversions
-        // (Type::Bytes(_), Type::String) => Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))),
-        /*
-        (Type::String, Type::Bytes(to_len)) => {
-            if let Expression::BytesLiteral(_, from_str) = &expr {
-                if from_str.len() > to_len as usize {
-                    diagnostics.push(Output::type_error(
-                        *loc,
-                        format!(
-                            "string of {} bytes is too long to fit into {}",
-                            from_str.len(),
-                            to.to_string(ns)
-                        ),
-                    ));
-                    return Err(());
-                }
-            }
-            Ok(Expression::Cast(*loc, to.clone(), Box::new(expr))
-        }
-        */
-        (Type::Void, _) => {
-            diagnostics.push(Diagnostic::type_error(
-                *loc,
-                "function or method does not return a value".to_string(),
-            ));
-            Err(())
-        }
-        (
-            Type::ExternalFunction {
-                params: from_params,
-                mutability: from_mutablity,
-                returns: from_returns,
-            },
-            Type::ExternalFunction {
-                params: to_params,
-                mutability: to_mutablity,
-                returns: to_returns,
-            },
-        )
-        | (
-            Type::InternalFunction {
-                params: from_params,
-                mutability: from_mutablity,
-                returns: from_returns,
-            },
-            Type::InternalFunction {
-                params: to_params,
-                mutability: to_mutablity,
-                returns: to_returns,
-            },
-        ) => {
-            if from_params != to_params {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "function arguments do not match in conversion from ‘{}’ to ‘{}’",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if from_returns != to_returns {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "function returns do not match in conversion from ‘{}’ to ‘{}’",
-                        to.to_string(ns),
-                        from.to_string(ns)
-                    ),
-                ));
-                Err(())
-            } else if !compatible_mutability(from_mutablity, to_mutablity) {
-                diagnostics.push(Diagnostic::type_error(
-                    *loc,
-                    format!(
-                        "function mutability not compatible in conversion from ‘{}’ to ‘{}’",
-                        from.to_string(ns),
-                        to.to_string(ns),
-                    ),
-                ));
-                Err(())
-            } else {
-                Ok(Expression::Cast(*loc, to.clone(), Box::new(expr)))
-            }
-        }
-        _ => {
-            diagnostics.push(Diagnostic::type_error(
-                *loc,
-                format!(
-                    "conversion from {} to {} not possible",
-                    from.to_string(ns),
-                    to.to_string(ns)
-                ),
-            ));
-            Err(())
-        }
-    }
-}
-
 /// Compare two mutability levels
 pub fn compatible_mutability(left: &Mutability, right: &Mutability) -> bool {
     matches!(
@@ -1401,10 +1617,11 @@ pub fn compatible_mutability(left: &Mutability, right: &Mutability) -> bool {
 }
 
 /// When resolving an expression, what type are we looking for
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum ResolveTo<'a> {
     Unknown,        // We don't know what we're looking for, best effort
-    Discard,        // We won't be using the result. For example, an expression as a statement/
+    Integer,        // Try to resolve to an integer type value (signed or unsigned, any bit width)
+    Discard,        // We won't be using the result. For example, an expression as a statement
     Type(&'a Type), // We will be wanting this type please, e.g. `int64 x = 1;`
 }
 
@@ -1422,6 +1639,8 @@ pub struct ExprContext {
     pub constant: bool,
     /// Are we resolving an l-value
     pub lvalue: bool,
+    /// Are we resolving a yul function (it cannot have external dependencies)
+    pub yul_function: bool,
 }
 
 /// Resolve a parsed expression into an AST expression. The resolve_to argument is a hint to what
@@ -1431,13 +1650,15 @@ pub fn expression(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     match expr {
+        pt::Expression::Parenthesis(_, expr) => {
+            expression(expr, context, ns, symtable, diagnostics, resolve_to)
+        }
         pt::Expression::ArrayLiteral(loc, exprs) => {
-            let res =
-                resolve_array_literal(loc, exprs, context, ns, symtable, diagnostics, resolve_to);
+            let res = array_literal(loc, exprs, context, ns, symtable, diagnostics, resolve_to);
 
             if let Ok(exp) = &res {
                 used_variable(ns, exp, symtable);
@@ -1449,15 +1670,28 @@ pub fn expression(
         pt::Expression::StringLiteral(v) => {
             Ok(string_literal(v, context.file_no, diagnostics, resolve_to))
         }
-        pt::Expression::HexLiteral(v) => hex_literal(v, diagnostics),
-        pt::Expression::NumberLiteral(loc, b) => {
-            bigint_to_expression(loc, b, ns, diagnostics, resolve_to)
+        pt::Expression::HexLiteral(v) => hex_literal(v, diagnostics, resolve_to),
+        pt::Expression::NumberLiteral(loc, integer, exp) => number_literal(
+            loc,
+            integer,
+            exp,
+            ns,
+            &BigInt::one(),
+            diagnostics,
+            resolve_to,
+        ),
+        pt::Expression::RationalNumberLiteral(loc, integer, fraction, exp) => {
+            rational_number_literal(
+                loc,
+                integer,
+                fraction,
+                exp,
+                &BigInt::one(),
+                ns,
+                diagnostics,
+                resolve_to,
+            )
         }
-        pt::Expression::RationalNumberLiteral(loc, b) => Ok(Expression::RationalNumberLiteral(
-            *loc,
-            Type::Rational,
-            b.clone(),
-        )),
         pt::Expression::HexNumberLiteral(loc, n) => {
             hex_number_literal(loc, n, ns, diagnostics, resolve_to)
         }
@@ -1502,8 +1736,8 @@ pub fn expression(
         }
         // compare
         pt::Expression::More(loc, l, r) => {
-            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
-            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
+            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
+            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
 
             check_var_usage_expression(ns, &left, &right, symtable);
             let ty = coerce_number(
@@ -1519,13 +1753,13 @@ pub fn expression(
 
             Ok(Expression::More(
                 *loc,
-                Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-                Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+                Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+                Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
             ))
         }
         pt::Expression::Less(loc, l, r) => {
-            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
-            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
+            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
+            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
 
             check_var_usage_expression(ns, &left, &right, symtable);
 
@@ -1542,13 +1776,13 @@ pub fn expression(
 
             Ok(Expression::Less(
                 *loc,
-                Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-                Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+                Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+                Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
             ))
         }
         pt::Expression::MoreEqual(loc, l, r) => {
-            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
-            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
+            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
+            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
             check_var_usage_expression(ns, &left, &right, symtable);
 
             let ty = coerce_number(
@@ -1564,13 +1798,13 @@ pub fn expression(
 
             Ok(Expression::MoreEqual(
                 *loc,
-                Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-                Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+                Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+                Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
             ))
         }
         pt::Expression::LessEqual(loc, l, r) => {
-            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
-            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
+            let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
+            let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
             check_var_usage_expression(ns, &left, &right, symtable);
 
             let ty = coerce_number(
@@ -1586,8 +1820,8 @@ pub fn expression(
 
             Ok(Expression::LessEqual(
                 *loc,
-                Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-                Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+                Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+                Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
             ))
         }
         pt::Expression::Equal(loc, l, r) => equal(loc, l, r, context, ns, symtable, diagnostics),
@@ -1603,7 +1837,7 @@ pub fn expression(
             used_variable(ns, &expr, symtable);
             Ok(Expression::Not(
                 *loc,
-                Box::new(cast(loc, expr, &Type::Bool, true, ns, diagnostics)?),
+                Box::new(expr.cast(loc, &Type::Bool, true, ns, diagnostics)?),
             ))
         }
         pt::Expression::Complement(loc, e) => {
@@ -1617,9 +1851,15 @@ pub fn expression(
             Ok(Expression::Complement(*loc, expr_ty, Box::new(expr)))
         }
         pt::Expression::UnaryMinus(loc, e) => match e.as_ref() {
-            pt::Expression::NumberLiteral(_, n) => {
-                bigint_to_expression(loc, &-n, ns, diagnostics, resolve_to)
-            }
+            pt::Expression::NumberLiteral(_, integer, exp) => number_literal(
+                loc,
+                integer,
+                exp,
+                ns,
+                &BigInt::from(-1),
+                diagnostics,
+                resolve_to,
+            ),
             pt::Expression::HexNumberLiteral(_, v) => {
                 // a hex literal with a minus before it cannot be an address literal or a bytesN value
                 let s: String = v.chars().skip(2).filter(|v| *v != '_').collect();
@@ -1628,8 +1868,17 @@ pub fn expression(
 
                 bigint_to_expression(loc, &-n, ns, diagnostics, resolve_to)
             }
-            pt::Expression::RationalNumberLiteral(_, r) => {
-                bigdecimal_to_expression(loc, &-r, ns, diagnostics, resolve_to)
+            pt::Expression::RationalNumberLiteral(loc, integer, fraction, exp) => {
+                rational_number_literal(
+                    loc,
+                    integer,
+                    fraction,
+                    exp,
+                    &BigInt::from(-1),
+                    ns,
+                    diagnostics,
+                    resolve_to,
+                )
             }
             e => {
                 let expr = expression(e, context, ns, symtable, diagnostics, resolve_to)?;
@@ -1639,8 +1888,8 @@ pub fn expression(
 
                 if let Expression::NumberLiteral(_, _, n) = expr {
                     bigint_to_expression(loc, &-n, ns, diagnostics, resolve_to)
-                } else if let Expression::RationalNumberLiteral(_, _, r) = expr {
-                    bigdecimal_to_expression(loc, &-r, ns, diagnostics, resolve_to)
+                } else if let Expression::RationalNumberLiteral(_, ty, r) = expr {
+                    Ok(Expression::RationalNumberLiteral(*loc, ty, -r))
                 } else {
                     get_int_length(&expr_type, loc, false, ns, diagnostics)?;
 
@@ -1665,11 +1914,11 @@ pub fn expression(
             let cond = expression(c, context, ns, symtable, diagnostics, resolve_to)?;
             used_variable(ns, &cond, symtable);
 
-            let cond = cast(&c.loc(), cond, &Type::Bool, true, ns, diagnostics)?;
+            let cond = cond.cast(&c.loc(), &Type::Bool, true, ns, diagnostics)?;
 
             let ty = coerce(&left.ty(), &l.loc(), &right.ty(), &r.loc(), ns, diagnostics)?;
-            let left = cast(&l.loc(), left, &ty, true, ns, diagnostics)?;
-            let right = cast(&r.loc(), right, &ty, true, ns, diagnostics)?;
+            let left = left.cast(&l.loc(), &ty, true, ns, diagnostics)?;
+            let right = right.cast(&r.loc(), &ty, true, ns, diagnostics)?;
 
             Ok(Expression::Ternary(
                 *loc,
@@ -1729,9 +1978,17 @@ pub fn expression(
 
             assign_expr(loc, var, expr, e, context, ns, symtable, diagnostics)
         }
-        pt::Expression::NamedFunctionCall(loc, ty, args) => {
-            named_call_expr(loc, ty, args, false, context, ns, symtable, diagnostics)
-        }
+        pt::Expression::NamedFunctionCall(loc, ty, args) => named_call_expr(
+            loc,
+            ty,
+            args,
+            false,
+            context,
+            ns,
+            symtable,
+            diagnostics,
+            resolve_to,
+        ),
         pt::Expression::New(loc, call) => {
             if context.constant {
                 diagnostics.push(Diagnostic::error(
@@ -1741,7 +1998,7 @@ pub fn expression(
                 return Err(());
             }
 
-            match call.as_ref() {
+            match call.remove_parenthesis() {
                 pt::Expression::FunctionCall(_, ty, args) => {
                     let res = new(loc, ty, args, context, ns, symtable, diagnostics);
 
@@ -1784,7 +2041,7 @@ pub fn expression(
         pt::Expression::ArraySubscript(loc, _, None) => {
             diagnostics.push(Diagnostic::error(
                 *loc,
-                "expected expression before ‘]’ token".to_string(),
+                "expected expression before ']' token".to_string(),
             ));
 
             Err(())
@@ -1800,27 +2057,36 @@ pub fn expression(
         pt::Expression::ArraySubscript(loc, array, Some(index)) => {
             array_subscript(loc, array, index, context, ns, symtable, diagnostics)
         }
-        pt::Expression::MemberAccess(loc, e, id) => {
-            member_access(loc, e, id, context, ns, symtable, diagnostics, resolve_to)
-        }
+        pt::Expression::MemberAccess(loc, e, id) => member_access(
+            loc,
+            e.remove_parenthesis(),
+            id,
+            context,
+            ns,
+            symtable,
+            diagnostics,
+            resolve_to,
+        ),
         pt::Expression::Or(loc, left, right) => {
             let boolty = Type::Bool;
-            let l = cast(
-                loc,
-                expression(left, context, ns, symtable, diagnostics, resolve_to)?,
-                &boolty,
-                true,
+            let l = expression(
+                left,
+                context,
                 ns,
+                symtable,
                 diagnostics,
-            )?;
-            let r = cast(
-                loc,
-                expression(right, context, ns, symtable, diagnostics, resolve_to)?,
-                &boolty,
-                true,
+                ResolveTo::Type(&boolty),
+            )?
+            .cast(loc, &boolty, true, ns, diagnostics)?;
+            let r = expression(
+                right,
+                context,
                 ns,
+                symtable,
                 diagnostics,
-            )?;
+                ResolveTo::Type(&boolty),
+            )?
+            .cast(loc, &boolty, true, ns, diagnostics)?;
 
             check_var_usage_expression(ns, &l, &r, symtable);
 
@@ -1828,22 +2094,24 @@ pub fn expression(
         }
         pt::Expression::And(loc, left, right) => {
             let boolty = Type::Bool;
-            let l = cast(
-                loc,
-                expression(left, context, ns, symtable, diagnostics, resolve_to)?,
-                &boolty,
-                true,
+            let l = expression(
+                left,
+                context,
                 ns,
+                symtable,
                 diagnostics,
-            )?;
-            let r = cast(
-                loc,
-                expression(right, context, ns, symtable, diagnostics, resolve_to)?,
-                &boolty,
-                true,
+                ResolveTo::Type(&boolty),
+            )?
+            .cast(loc, &boolty, true, ns, diagnostics)?;
+            let r = expression(
+                right,
+                context,
                 ns,
+                symtable,
                 diagnostics,
-            )?;
+                ResolveTo::Type(&boolty),
+            )?
+            .cast(loc, &boolty, true, ns, diagnostics)?;
             check_var_usage_expression(ns, &l, &r, symtable);
 
             Ok(Expression::And(*loc, Box::new(l), Box::new(r)))
@@ -1867,29 +2135,8 @@ pub fn expression(
             Err(())
         }
         pt::Expression::Unit(loc, expr, unit) => {
-            let n = match expr.as_ref() {
-                pt::Expression::NumberLiteral(_, n) => n,
-                pt::Expression::HexNumberLiteral(loc, _) => {
-                    diagnostics.push(Diagnostic::error(
-                        *loc,
-                        "hexadecimal numbers cannot be used with unit denominations".to_owned(),
-                    ));
-                    return Err(());
-                }
-                _ => {
-                    diagnostics.push(Diagnostic::error(
-                        *loc,
-                        "unit denominations can only be used with number literals".to_owned(),
-                    ));
-                    return Err(());
-                }
-            };
-
             match unit {
-                pt::Unit::Wei(loc)
-                | pt::Unit::Finney(loc)
-                | pt::Unit::Szabo(loc)
-                | pt::Unit::Ether(loc)
+                pt::Unit::Wei(loc) | pt::Unit::Gwei(loc) | pt::Unit::Ether(loc)
                     if ns.target != crate::Target::Ewasm =>
                 {
                     diagnostics.push(Diagnostic::warning(
@@ -1900,23 +2147,48 @@ pub fn expression(
                 _ => (),
             }
 
-            bigint_to_expression(
-                loc,
-                &(n * match unit {
-                    pt::Unit::Seconds(_) => BigInt::from(1),
-                    pt::Unit::Minutes(_) => BigInt::from(60),
-                    pt::Unit::Hours(_) => BigInt::from(60 * 60),
-                    pt::Unit::Days(_) => BigInt::from(60 * 60 * 24),
-                    pt::Unit::Weeks(_) => BigInt::from(60 * 60 * 24 * 7),
-                    pt::Unit::Wei(_) => BigInt::from(1),
-                    pt::Unit::Szabo(_) => BigInt::from(10).pow(12u32),
-                    pt::Unit::Finney(_) => BigInt::from(10).pow(15u32),
-                    pt::Unit::Ether(_) => BigInt::from(10).pow(18u32),
-                }),
-                ns,
-                diagnostics,
-                resolve_to,
-            )
+            let unit = match unit {
+                pt::Unit::Seconds(_) => BigInt::from(1),
+                pt::Unit::Minutes(_) => BigInt::from(60),
+                pt::Unit::Hours(_) => BigInt::from(60 * 60),
+                pt::Unit::Days(_) => BigInt::from(60 * 60 * 24),
+                pt::Unit::Weeks(_) => BigInt::from(60 * 60 * 24 * 7),
+                pt::Unit::Wei(_) => BigInt::from(1),
+                pt::Unit::Gwei(_) => BigInt::from(10).pow(9u32),
+                pt::Unit::Ether(_) => BigInt::from(10).pow(18u32),
+            };
+
+            match expr.as_ref() {
+                pt::Expression::NumberLiteral(_, integer, exp) => {
+                    number_literal(loc, integer, exp, ns, &unit, diagnostics, resolve_to)
+                }
+                pt::Expression::RationalNumberLiteral(_, significant, mantissa, exp) => {
+                    rational_number_literal(
+                        loc,
+                        significant,
+                        mantissa,
+                        exp,
+                        &unit,
+                        ns,
+                        diagnostics,
+                        resolve_to,
+                    )
+                }
+                pt::Expression::HexNumberLiteral(loc, _) => {
+                    diagnostics.push(Diagnostic::error(
+                        *loc,
+                        "hexadecimal numbers cannot be used with unit denominations".to_owned(),
+                    ));
+                    Err(())
+                }
+                _ => {
+                    diagnostics.push(Diagnostic::error(
+                        *loc,
+                        "unit denominations can only be used with number literals".to_owned(),
+                    ));
+                    Err(())
+                }
+            }
         }
         pt::Expression::This(loc) => match context.contract_no {
             Some(contract_no) => Ok(Expression::Builtin(
@@ -1939,7 +2211,7 @@ pub fn expression(
 fn string_literal(
     v: &[pt::StringLiteral],
     file_no: usize,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Expression {
     // Concatenate the strings
@@ -1958,8 +2230,8 @@ fn string_literal(
 
     let length = result.len();
 
-    if let ResolveTo::Type(Type::String) = resolve_to {
-        Expression::AllocDynamicArray(
+    match resolve_to {
+        ResolveTo::Type(Type::String) => Expression::AllocDynamicArray(
             loc,
             Type::String,
             Box::new(Expression::NumberLiteral(
@@ -1968,13 +2240,28 @@ fn string_literal(
                 BigInt::from(length),
             )),
             Some(result),
-        )
-    } else {
-        Expression::BytesLiteral(loc, Type::Bytes(length as u8), result)
+        ),
+        ResolveTo::Type(Type::Slice(ty)) if ty.as_ref() == &Type::Bytes(1) => {
+            Expression::AllocDynamicArray(
+                loc,
+                Type::Slice(ty.clone()),
+                Box::new(Expression::NumberLiteral(
+                    loc,
+                    Type::Uint(32),
+                    BigInt::from(length),
+                )),
+                Some(result),
+            )
+        }
+        _ => Expression::BytesLiteral(loc, Type::Bytes(length as u8), result),
     }
 }
 
-fn hex_literal(v: &[pt::HexLiteral], diagnostics: &mut Vec<Diagnostic>) -> Result<Expression, ()> {
+fn hex_literal(
+    v: &[pt::HexLiteral],
+    diagnostics: &mut Diagnostics,
+    resolve_to: ResolveTo,
+) -> Result<Expression, ()> {
     let mut result = Vec::new();
     let mut loc = v[0].loc;
 
@@ -1993,18 +2280,42 @@ fn hex_literal(v: &[pt::HexLiteral], diagnostics: &mut Vec<Diagnostic>) -> Resul
 
     let length = result.len();
 
-    Ok(Expression::BytesLiteral(
-        loc,
-        Type::Bytes(length as u8),
-        result,
-    ))
+    match resolve_to {
+        ResolveTo::Type(Type::Slice(ty)) if ty.as_ref() == &Type::Bytes(1) => {
+            Ok(Expression::AllocDynamicArray(
+                loc,
+                Type::Slice(ty.clone()),
+                Box::new(Expression::NumberLiteral(
+                    loc,
+                    Type::Uint(32),
+                    BigInt::from(length),
+                )),
+                Some(result),
+            ))
+        }
+        ResolveTo::Type(Type::DynamicBytes) => Ok(Expression::AllocDynamicArray(
+            loc,
+            Type::DynamicBytes,
+            Box::new(Expression::NumberLiteral(
+                loc,
+                Type::Uint(32),
+                BigInt::from(length),
+            )),
+            Some(result),
+        )),
+        _ => Ok(Expression::BytesLiteral(
+            loc,
+            Type::Bytes(length as u8),
+            result,
+        )),
+    }
 }
 
 fn hex_number_literal(
     loc: &pt::Loc,
     n: &str,
     ns: &mut Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     // ns.address_length is in bytes; double for hex and two for the leading 0x
@@ -2024,7 +2335,7 @@ fn hex_number_literal(
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "address literal has incorrect checksum, expected ‘{}’",
+                        "address literal has incorrect checksum, expected '{}'",
                         address
                     ),
                 ));
@@ -2035,7 +2346,7 @@ fn hex_number_literal(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "ethereum address literal ‘{}’ not supported on target {}",
+                    "ethereum address literal '{}' not supported on target {}",
                     n, ns.target
                 ),
             ));
@@ -2052,10 +2363,10 @@ fn hex_number_literal(
         let val = BigInt::from_str_radix(&s, 16).unwrap();
 
         return if !val.is_zero() && s.len() != expected_length {
-            diagnostics.push(Diagnostic::error(
+            diagnostics.push(Diagnostic::cast_error(
                 *loc,
                 format!(
-                    "hex literal {} must be {} digits for type ‘bytes{}’",
+                    "hex literal {} must be {} digits for type 'bytes{}'",
                     n, expected_length, length,
                 ),
             ));
@@ -2078,7 +2389,7 @@ fn address_literal(
     loc: &pt::Loc,
     address: &str,
     ns: &mut Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     if ns.target.is_substrate() {
         match address.from_base58() {
@@ -2193,14 +2504,14 @@ fn variable(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     if let Some(v) = symtable.find(&id.name) {
         return if context.constant {
             diagnostics.push(Diagnostic::error(
                 id.loc,
-                format!("cannot read variable ‘{}’ in constant expression", id.name),
+                format!("cannot read variable '{}' in constant expression", id.name),
             ));
             Err(())
         } else {
@@ -2240,7 +2551,7 @@ fn variable(
                 diagnostics.push(Diagnostic::error(
                     id.loc,
                     format!(
-                        "cannot read contract variable ‘{}’ in constant expression",
+                        "cannot read contract variable '{}' in constant expression",
                         id.name
                     ),
                 ));
@@ -2303,14 +2614,26 @@ fn variable(
             } else {
                 diagnostics.push(Diagnostic::error(
                     id.loc,
-                    format!("function ‘{}’ is overloaded", id.name),
+                    format!("function '{}' is overloaded", id.name),
                 ));
                 Err(())
             }
         }
+        None if id.name == "now"
+            && matches!(
+                resolve_to,
+                ResolveTo::Type(Type::Uint(_)) | ResolveTo::Integer
+            ) =>
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    id.loc,
+                    "'now' not found. 'now' was an alias for 'block.timestamp' in older versions of the Solidity language. Please use 'block.timestamp' instead.".to_string(),
+                ));
+            Err(())
+        }
         sym => {
-            let error = Namespace::wrong_symbol(sym, id);
-            diagnostics.push(error);
+            diagnostics.push(Namespace::wrong_symbol(sym, id));
             Err(())
         }
     }
@@ -2323,7 +2646,7 @@ fn subtract(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2345,7 +2668,7 @@ fn subtract(
     if ty.is_rational() {
         let expr = Expression::Subtract(*loc, ty, false, Box::new(left), Box::new(right));
 
-        return match eval_const_rational(&expr, context.contract_no, ns) {
+        return match eval_const_rational(&expr, ns) {
             Ok(_) => Ok(expr),
             Err(diag) => {
                 diagnostics.push(diag);
@@ -2358,8 +2681,8 @@ fn subtract(
         *loc,
         ty.clone(),
         context.unchecked,
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -2370,7 +2693,7 @@ fn bitwise_or(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2392,8 +2715,8 @@ fn bitwise_or(
     Ok(Expression::BitwiseOr(
         *loc,
         ty.clone(),
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -2404,7 +2727,7 @@ fn bitwise_and(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2426,8 +2749,8 @@ fn bitwise_and(
     Ok(Expression::BitwiseAnd(
         *loc,
         ty.clone(),
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -2438,7 +2761,7 @@ fn bitwise_xor(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2460,8 +2783,8 @@ fn bitwise_xor(
     Ok(Expression::BitwiseXor(
         *loc,
         ty.clone(),
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -2472,7 +2795,7 @@ fn shift_left(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2501,7 +2824,7 @@ fn shift_right(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2531,7 +2854,7 @@ fn multiply(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2553,7 +2876,7 @@ fn multiply(
     if ty.is_rational() {
         let expr = Expression::Multiply(*loc, ty, false, Box::new(left), Box::new(right));
 
-        return match eval_const_rational(&expr, context.contract_no, ns) {
+        return match eval_const_rational(&expr, ns) {
             Ok(_) => Ok(expr),
             Err(diag) => {
                 diagnostics.push(diag);
@@ -2594,8 +2917,8 @@ fn multiply(
             *loc,
             ty.clone(),
             context.unchecked,
-            Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-            Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+            Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+            Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
         ))
     }
 }
@@ -2607,7 +2930,7 @@ fn divide(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2629,8 +2952,8 @@ fn divide(
     Ok(Expression::Divide(
         *loc,
         ty.clone(),
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -2641,7 +2964,7 @@ fn modulo(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2663,8 +2986,8 @@ fn modulo(
     Ok(Expression::Modulo(
         *loc,
         ty.clone(),
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -2675,7 +2998,7 @@ fn power(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let mut base = expression(b, context, ns, symtable, diagnostics, resolve_to)?;
@@ -2735,8 +3058,8 @@ fn power(
         *loc,
         ty.clone(),
         context.unchecked,
-        Box::new(cast(&b.loc(), base, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&e.loc(), exp, &ty, true, ns, diagnostics)?),
+        Box::new(base.cast(&b.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(exp.cast(&e.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -2749,7 +3072,7 @@ fn constructor(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     // The current contract cannot be constructed with new. In order to create
     // the contract, we need the code hash of the contract. Part of that code
@@ -2759,7 +3082,7 @@ fn constructor(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "new cannot construct current contract ‘{}’",
+                    "new cannot construct current contract '{}'",
                     ns.contracts[no].name
                 ),
             ));
@@ -2779,7 +3102,7 @@ fn constructor(
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "cannot construct ‘{}’ of type ‘{}’",
+                "cannot construct '{}' of type '{}'",
                 ns.contracts[no].name, ns.contracts[no].ty
             ),
         ));
@@ -2792,7 +3115,7 @@ fn constructor(
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "circular reference creating contract ‘{}’",
+                "circular reference creating contract '{}'",
                 ns.contracts[no].name
             ),
         ));
@@ -2809,10 +3132,7 @@ fn constructor(
             contract_no: no,
             constructor_no,
             args: cast_args,
-            value: call_args.value,
-            gas: call_args.gas,
-            salt: call_args.salt,
-            space: call_args.space,
+            call_args,
         }),
         Err(()) => Err(()),
     }
@@ -2826,47 +3146,55 @@ pub fn match_constructor_to_args(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<(Option<usize>, Vec<Expression>), ()> {
-    let marker = diagnostics.len();
+    let mut errors = Diagnostics::default();
 
     // constructor call
-    let mut constructor_count = 0;
+    let function_nos: Vec<usize> = ns.contracts[contract_no]
+        .functions
+        .iter()
+        .filter(|function_no| ns.functions[**function_no].is_constructor())
+        .copied()
+        .collect();
 
-    for function_no in ns.contracts[contract_no].functions.clone() {
-        if !ns.functions[function_no].is_constructor() {
-            continue;
-        }
+    for function_no in &function_nos {
+        let mut matches = true;
 
-        constructor_count += 1;
+        let params_len = ns.functions[*function_no].params.len();
 
-        // ideally we shouldn't be cloning, but expression() takes a mutable reference to the namespace
-        let params = ns.functions[function_no].params.clone();
-
-        if params.len() != args.len() {
-            diagnostics.push(Diagnostic::error(
+        if params_len != args.len() {
+            errors.push(Diagnostic::cast_error(
                 *loc,
                 format!(
                     "constructor expects {} arguments, {} provided",
-                    params.len(),
+                    params_len,
                     args.len()
                 ),
             ));
-            continue;
+            matches = false;
         }
 
-        let mut matches = true;
         let mut cast_args = Vec::new();
 
         // resolve arguments for this constructor
         for (i, arg) in args.iter().enumerate() {
+            let ty = ns.functions[*function_no]
+                .params
+                .get(i)
+                .map(|p| p.ty.clone());
+
             let arg = match expression(
                 arg,
                 context,
                 ns,
                 symtable,
-                diagnostics,
-                ResolveTo::Type(&params[i].ty),
+                &mut errors,
+                if let Some(ty) = &ty {
+                    ResolveTo::Type(ty)
+                } else {
+                    ResolveTo::Unknown
+                },
             ) {
                 Ok(v) => v,
                 Err(()) => {
@@ -2875,37 +3203,36 @@ pub fn match_constructor_to_args(
                 }
             };
 
-            match cast(
-                &arg.loc(),
-                arg.clone(),
-                &ns.functions[function_no].params[i].ty.clone(),
-                true,
-                ns,
-                diagnostics,
-            ) {
-                Ok(expr) => cast_args.push(expr),
-                Err(()) => {
-                    matches = false;
-                    continue;
+            if let Some(ty) = &ty {
+                match arg.cast(&arg.loc(), ty, true, ns, &mut errors) {
+                    Ok(expr) => cast_args.push(expr),
+                    Err(()) => {
+                        matches = false;
+                    }
                 }
             }
         }
 
         if matches {
-            return Ok((Some(function_no), cast_args));
+            return Ok((Some(*function_no), cast_args));
+        } else if function_nos.len() > 1 && diagnostics.extend_non_casting(&errors) {
+            return Err(());
         }
     }
 
-    if constructor_count == 0 && args.is_empty() {
-        return Ok((None, Vec::new()));
-    }
-
-    if constructor_count != 1 {
-        diagnostics.truncate(marker);
-        diagnostics.push(Diagnostic::error(
-            *loc,
-            "cannot find overloaded constructor which matches signature".to_string(),
-        ));
+    match function_nos.len() {
+        0 if args.is_empty() => {
+            return Ok((None, Vec::new()));
+        }
+        0 | 1 => {
+            diagnostics.extend(errors);
+        }
+        _ => {
+            diagnostics.push(Diagnostic::error(
+                *loc,
+                "cannot find overloaded constructor which matches signature".to_string(),
+            ));
+        }
     }
 
     Err(())
@@ -2931,7 +3258,7 @@ pub fn constructor_named_args(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let (ty, call_args, _) = collect_call_args(ty, diagnostics)?;
 
@@ -2953,7 +3280,7 @@ pub fn constructor_named_args(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "new cannot construct current contract ‘{}’",
+                    "new cannot construct current contract '{}'",
                     ns.contracts[no].name
                 ),
             ));
@@ -2973,7 +3300,7 @@ pub fn constructor_named_args(
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "cannot construct ‘{}’ of type ‘{}’",
+                "cannot construct '{}' of type '{}'",
                 ns.contracts[no].name, ns.contracts[no].ty
             ),
         ));
@@ -2986,7 +3313,7 @@ pub fn constructor_named_args(
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "circular reference creating contract ‘{}’",
+                "circular reference creating contract '{}'",
                 ns.contracts[no].name
             ),
         ));
@@ -3003,7 +3330,7 @@ pub fn constructor_named_args(
         if let Some(prev) = arguments.get(arg.name.name.as_str()) {
             diagnostics.push(Diagnostic::error_with_note(
                 *loc,
-                format!("duplicate argument name ‘{}’", arg.name.name),
+                format!("duplicate argument name '{}'", arg.name.name),
                 prev.loc(),
                 String::from("location of previous argument"),
             ));
@@ -3012,44 +3339,67 @@ pub fn constructor_named_args(
         arguments.insert(&arg.name.name, &arg.expr);
     }
 
-    let marker = diagnostics.len();
-    let mut found_constructors = 0;
+    let mut errors = Diagnostics::default();
 
     // constructor call
-    for function_no in ns.contracts[no].functions.clone() {
-        if !ns.functions[function_no].is_constructor() {
-            continue;
-        }
+    let function_nos: Vec<usize> = ns.contracts[no]
+        .functions
+        .iter()
+        .filter(|function_no| ns.functions[**function_no].is_constructor())
+        .copied()
+        .collect();
 
-        found_constructors += 1;
+    // constructor call
+    for function_no in &function_nos {
+        let func = &ns.functions[*function_no];
+        let params_len = func.params.len();
 
-        let params_len = ns.functions[function_no].params.len();
+        let mut matches = true;
 
-        if params_len != args.len() {
-            diagnostics.push(Diagnostic::error(
+        let unnamed_params = func.params.iter().filter(|p| p.id.is_none()).count();
+
+        if unnamed_params > 0 {
+            errors.push(Diagnostic::cast_error_with_note(
+                *loc,
+                format!(
+                    "constructor cannot be called with named arguments as {} of its parameters do not have names",
+                    unnamed_params,
+                ),
+                func.loc,
+                format!("definition of {}", func.ty),
+            ));
+            matches = false;
+        } else if params_len != args.len() {
+            errors.push(Diagnostic::cast_error_with_note(
                 *loc,
                 format!(
                     "constructor expects {} arguments, {} provided",
                     params_len,
                     args.len()
                 ),
+                func.loc,
+                "definition of constructor".to_owned(),
             ));
-            continue;
+            matches = false;
         }
 
-        let mut matches = true;
         let mut cast_args = Vec::new();
+
+        let func_loc = ns.functions[*function_no].loc;
 
         // check if arguments can be implicitly casted
         for i in 0..params_len {
-            let param = ns.functions[function_no].params[i].clone();
+            let param = ns.functions[*function_no].params[i].clone();
+
             let arg = match arguments.get(param.name_as_str()) {
                 Some(a) => a,
                 None => {
                     matches = false;
-                    diagnostics.push(Diagnostic::error(
+                    errors.push(Diagnostic::cast_error_with_note(
                         *loc,
-                        format!("missing argument ‘{}’ to constructor", param.name_as_str()),
+                        format!("missing argument '{}' to constructor", param.name_as_str()),
+                        func_loc,
+                        "definition of constructor".to_owned(),
                     ));
                     break;
                 }
@@ -3060,21 +3410,20 @@ pub fn constructor_named_args(
                 context,
                 ns,
                 symtable,
-                diagnostics,
+                &mut errors,
                 ResolveTo::Type(&param.ty),
             ) {
                 Ok(e) => e,
                 Err(()) => {
                     matches = false;
-                    break;
+                    continue;
                 }
             };
 
-            match cast(&arg.loc(), arg, &param.ty, true, ns, diagnostics) {
+            match arg.cast(&arg.loc(), &param.ty, true, ns, &mut errors) {
                 Ok(expr) => cast_args.push(expr),
                 Err(()) => {
                     matches = false;
-                    break;
                 }
             }
         }
@@ -3083,30 +3432,29 @@ pub fn constructor_named_args(
             return Ok(Expression::Constructor {
                 loc: *loc,
                 contract_no: no,
-                constructor_no: Some(function_no),
+                constructor_no: Some(*function_no),
                 args: cast_args,
-                value: call_args.value,
-                gas: call_args.gas,
-                salt: call_args.salt,
-                space: call_args.space,
+                call_args,
             });
+        } else if function_nos.len() > 1 && diagnostics.extend_non_casting(&errors) {
+            return Err(());
         }
     }
 
-    match found_constructors {
-        0 => Ok(Expression::Constructor {
+    match function_nos.len() {
+        0 if args.is_empty() => Ok(Expression::Constructor {
             loc: *loc,
             contract_no: no,
             constructor_no: None,
             args: Vec::new(),
-            value: call_args.value,
-            gas: call_args.gas,
-            salt: call_args.salt,
-            space: call_args.space,
+            call_args,
         }),
-        1 => Err(()),
+        0 | 1 => {
+            diagnostics.extend(errors);
+
+            Err(())
+        }
         _ => {
-            diagnostics.truncate(marker);
             diagnostics.push(Diagnostic::error(
                 *loc,
                 "cannot find overloaded constructor which matches signature".to_string(),
@@ -3124,7 +3472,7 @@ pub fn type_name_expr(
     field: &pt::Identifier,
     context: &ExprContext,
     ns: &mut Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     if args.is_empty() {
@@ -3208,7 +3556,7 @@ pub fn type_name_expr(
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "containing our own contract code for ‘{}’ would generate infinite size contract",
+                        "containing our own contract code for '{}' would generate infinite size contract",
                         ns.contracts[*no].name
                     ),
                 ));
@@ -3219,7 +3567,7 @@ pub fn type_name_expr(
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "circular reference creating contract code for ‘{}’",
+                        "circular reference creating contract code for '{}'",
                         ns.contracts[*no].name
                     ),
                 ));
@@ -3240,7 +3588,7 @@ pub fn type_name_expr(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "type ‘{}’ does not have type function {}",
+                    "type '{}' does not have type function {}",
                     ty.to_string(ns),
                     field.name
                 ),
@@ -3258,19 +3606,25 @@ pub fn new(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let (ty, call_args, call_args_loc) = collect_call_args(ty, diagnostics)?;
+
+    let ty = if let pt::Expression::New(_, ty) = ty.remove_parenthesis() {
+        ty
+    } else {
+        ty
+    };
 
     let ty = ns.resolve_type(context.file_no, context.contract_no, false, ty, diagnostics)?;
 
     match &ty {
         Type::Array(ty, dim) => {
-            if dim.last().unwrap().is_some() {
+            if matches!(dim.last(), Some(ArrayLength::Fixed(_))) {
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "new cannot allocate fixed array type ‘{}’",
+                        "new cannot allocate fixed array type '{}'",
                         ty.to_string(ns)
                     ),
                 ));
@@ -3280,7 +3634,7 @@ pub fn new(
             if let Type::Contract(_) = ty.as_ref() {
                 diagnostics.push(Diagnostic::error(
                     *loc,
-                    format!("new cannot construct array of ‘{}’", ty.to_string(ns)),
+                    format!("new cannot construct array of '{}'", ty.to_string(ns)),
                 ));
                 return Err(());
             }
@@ -3294,7 +3648,7 @@ pub fn new(
         _ => {
             diagnostics.push(Diagnostic::error(
                 *loc,
-                format!("new cannot allocate type ‘{}’", ty.to_string(ns)),
+                format!("new cannot allocate type '{}'", ty.to_string(ns)),
             ));
             return Err(());
         }
@@ -3315,7 +3669,9 @@ pub fn new(
         ));
         return Err(());
     }
+
     let size_loc = args[0].loc();
+    let expected_ty = Type::Uint(32);
 
     let size_expr = expression(
         &args[0],
@@ -3323,12 +3679,33 @@ pub fn new(
         ns,
         symtable,
         diagnostics,
-        ResolveTo::Type(&Type::Uint(32)),
+        ResolveTo::Type(&expected_ty),
     )?;
 
     used_variable(ns, &size_expr, symtable);
 
-    let size = cast(&size_loc, size_expr, &Type::Uint(32), true, ns, diagnostics)?;
+    let size_ty = size_expr.ty();
+
+    let size = if size_ty.deref_any().bits(ns) > 32 {
+        diagnostics.push(Diagnostic::warning(
+            *loc,
+            format!(
+                "conversion truncates {} to {}, as memory size is type {} on target {}",
+                size_ty.deref_any().to_string(ns),
+                expected_ty.to_string(ns),
+                expected_ty.to_string(ns),
+                ns.target
+            ),
+        ));
+
+        Expression::CheckingTrunc(
+            size_loc,
+            expected_ty.clone(),
+            Box::new(size_expr.cast(&size_loc, &size_ty, true, ns, diagnostics)?),
+        )
+    } else {
+        size_expr.cast(&size_loc, &expected_ty, true, ns, diagnostics)?
+    };
 
     Ok(Expression::AllocDynamicArray(
         *loc,
@@ -3346,10 +3723,10 @@ fn equal(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
-    let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
-    let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
+    let left = expression(l, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
+    let right = expression(r, context, ns, symtable, diagnostics, ResolveTo::Integer)?;
 
     check_var_usage_expression(ns, &left, &right, symtable);
 
@@ -3368,9 +3745,8 @@ fn equal(
         | (Expression::BytesLiteral(_, _, l), Type::DynamicBytes) => {
             return Ok(Expression::StringCompare(
                 *loc,
-                StringLocation::RunTime(Box::new(cast(
+                StringLocation::RunTime(Box::new(right.cast(
                     &r.loc(),
-                    right,
                     right_type.deref_any(),
                     true,
                     ns,
@@ -3387,9 +3763,8 @@ fn equal(
         | (Expression::BytesLiteral(_, _, literal), Type::DynamicBytes) => {
             return Ok(Expression::StringCompare(
                 *loc,
-                StringLocation::RunTime(Box::new(cast(
+                StringLocation::RunTime(Box::new(left.cast(
                     &l.loc(),
-                    left,
                     left_type.deref_any(),
                     true,
                     ns,
@@ -3406,17 +3781,15 @@ fn equal(
         (Type::String, Type::String) | (Type::DynamicBytes, Type::DynamicBytes) => {
             return Ok(Expression::StringCompare(
                 *loc,
-                StringLocation::RunTime(Box::new(cast(
+                StringLocation::RunTime(Box::new(left.cast(
                     &l.loc(),
-                    left,
                     left_type.deref_any(),
                     true,
                     ns,
                     diagnostics,
                 )?)),
-                StringLocation::RunTime(Box::new(cast(
+                StringLocation::RunTime(Box::new(right.cast(
                     &r.loc(),
-                    right,
                     right_type.deref_any(),
                     true,
                     ns,
@@ -3431,8 +3804,8 @@ fn equal(
 
     Ok(Expression::Equal(
         *loc,
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -3444,7 +3817,7 @@ fn addition(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let mut left = expression(l, context, ns, symtable, diagnostics, resolve_to)?;
@@ -3515,6 +3888,18 @@ fn addition(
         diagnostics,
     )?;
 
+    if ty.is_rational() {
+        let expr = Expression::Add(*loc, ty, false, Box::new(left), Box::new(right));
+
+        return match eval_const_rational(&expr, ns) {
+            Ok(_) => Ok(expr),
+            Err(diag) => {
+                diagnostics.push(diag);
+                Err(())
+            }
+        };
+    }
+
     // If we don't know what type the result is going to be
     if resolve_to == ResolveTo::Unknown {
         let bits = std::cmp::min(256, ty.bits(ns) * 2);
@@ -3546,8 +3931,8 @@ fn addition(
         *loc,
         ty.clone(),
         context.unchecked,
-        Box::new(cast(&l.loc(), left, &ty, true, ns, diagnostics)?),
-        Box::new(cast(&r.loc(), right, &ty, true, ns, diagnostics)?),
+        Box::new(left.cast(&l.loc(), &ty, true, ns, diagnostics)?),
+        Box::new(right.cast(&r.loc(), &ty, true, ns, diagnostics)?),
     ))
 }
 
@@ -3559,7 +3944,7 @@ fn assign_single(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let mut lcontext = context.clone();
     lcontext.lvalue = true;
@@ -3589,7 +3974,7 @@ fn assign_single(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "cannot assign to constant ‘{}’",
+                    "cannot assign to constant '{}'",
                     ns.contracts[*contract_no].variables[*var_no].name
                 ),
             ));
@@ -3598,7 +3983,7 @@ fn assign_single(
         Expression::ConstantVariable(loc, _, None, var_no) => {
             diagnostics.push(Diagnostic::error(
                 *loc,
-                format!("cannot assign to constant ‘{}’", ns.constants[*var_no].name),
+                format!("cannot assign to constant '{}'", ns.constants[*var_no].name),
             ));
             Err(())
         }
@@ -3611,7 +3996,7 @@ fn assign_single(
                         diagnostics.push(Diagnostic::error(
                             *loc,
                             format!(
-                                "cannot assign to immutable ‘{}’ outside of constructor",
+                                "cannot assign to immutable '{}' outside of constructor",
                                 store_var.name
                             ),
                         ));
@@ -3624,28 +4009,21 @@ fn assign_single(
                 *loc,
                 ty.clone(),
                 Box::new(var.clone()),
-                Box::new(cast(
-                    &right.loc(),
-                    val,
-                    ty.deref_any(),
-                    true,
-                    ns,
-                    diagnostics,
-                )?),
+                Box::new(val.cast(&right.loc(), ty.deref_any(), true, ns, diagnostics)?),
             ))
         }
         Expression::Variable(_, var_ty, _) => Ok(Expression::Assign(
             *loc,
             var_ty.clone(),
             Box::new(var.clone()),
-            Box::new(cast(&right.loc(), val, var_ty, true, ns, diagnostics)?),
+            Box::new(val.cast(&right.loc(), var_ty, true, ns, diagnostics)?),
         )),
         _ => match &var_ty {
             Type::Ref(r_ty) => Ok(Expression::Assign(
                 *loc,
                 var_ty.clone(),
                 Box::new(var),
-                Box::new(cast(&right.loc(), val, r_ty, true, ns, diagnostics)?),
+                Box::new(val.cast(&right.loc(), r_ty, true, ns, diagnostics)?),
             )),
             Type::StorageRef(immutable, r_ty) => {
                 if *immutable {
@@ -3664,7 +4042,7 @@ fn assign_single(
                     *loc,
                     var_ty.clone(),
                     Box::new(var),
-                    Box::new(cast(&right.loc(), val, r_ty, true, ns, diagnostics)?),
+                    Box::new(val.cast(&right.loc(), r_ty, true, ns, diagnostics)?),
                 ))
             }
             _ => {
@@ -3687,7 +4065,7 @@ fn assign_expr(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let mut lcontext = context.clone();
     lcontext.lvalue = true;
@@ -3719,7 +4097,7 @@ fn assign_expr(
     let op = |assign: Expression,
               ty: &Type,
               ns: &Namespace,
-              diagnostics: &mut Vec<Diagnostic>|
+              diagnostics: &mut Diagnostics|
      -> Result<Expression, ()> {
         let set = match expr {
             pt::Expression::AssignShiftLeft(..) | pt::Expression::AssignShiftRight(..) => {
@@ -3737,7 +4115,7 @@ fn assign_expr(
                     Expression::Trunc(*loc, ty.clone(), Box::new(set))
                 }
             }
-            _ => cast(&right.loc(), set, ty, true, ns, diagnostics)?,
+            _ => set.cast(&right.loc(), ty, true, ns, diagnostics)?,
         };
 
         Ok(match expr {
@@ -3796,7 +4174,7 @@ fn assign_expr(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "cannot assign to constant ‘{}’",
+                    "cannot assign to constant '{}'",
                     ns.contracts[*contract_no].variables[*var_no].name
                 ),
             ));
@@ -3805,7 +4183,7 @@ fn assign_expr(
         Expression::ConstantVariable(loc, _, None, var_no) => {
             diagnostics.push(Diagnostic::error(
                 *loc,
-                format!("cannot assign to constant ‘{}’", ns.constants[*var_no].name),
+                format!("cannot assign to constant '{}'", ns.constants[*var_no].name),
             ));
             Err(())
         }
@@ -3816,7 +4194,7 @@ fn assign_expr(
                     diagnostics.push(Diagnostic::error(
                         var.loc(),
                         format!(
-                            "variable ‘{}’ of incorrect type {}",
+                            "variable '{}' of incorrect type {}",
                             symtable.get_name(*n),
                             var_ty.to_string(ns)
                         ),
@@ -3838,7 +4216,7 @@ fn assign_expr(
                     Type::Void,
                     Box::new(var.clone()),
                     Box::new(op(
-                        cast(loc, var, r_ty, true, ns, diagnostics)?,
+                        var.cast(loc, r_ty, true, ns, diagnostics)?,
                         r_ty,
                         ns,
                         diagnostics,
@@ -3871,7 +4249,7 @@ fn assign_expr(
                         Type::Void,
                         Box::new(var.clone()),
                         Box::new(op(
-                            cast(loc, var, r_ty, true, ns, diagnostics)?,
+                            var.cast(loc, r_ty, true, ns, diagnostics)?,
                             r_ty,
                             ns,
                             diagnostics,
@@ -3904,7 +4282,7 @@ fn incr_decr(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let op = |e: Expression, ty: Type| -> Expression {
         match expr {
@@ -3937,7 +4315,7 @@ fn incr_decr(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "cannot assign to constant ‘{}’",
+                    "cannot assign to constant '{}'",
                     ns.contracts[*contract_no].variables[*var_no].name
                 ),
             ));
@@ -3946,7 +4324,7 @@ fn incr_decr(
         Expression::ConstantVariable(loc, _, None, var_no) => {
             diagnostics.push(Diagnostic::error(
                 *loc,
-                format!("cannot assign to constant ‘{}’", ns.constants[*var_no].name),
+                format!("cannot assign to constant '{}'", ns.constants[*var_no].name),
             ));
             Err(())
         }
@@ -3957,7 +4335,7 @@ fn incr_decr(
                     diagnostics.push(Diagnostic::error(
                         var.loc(),
                         format!(
-                            "variable ‘{}’ of incorrect type {}",
+                            "variable '{}' of incorrect type {}",
                             symtable.get_name(*n),
                             var_ty.to_string(ns)
                         ),
@@ -4021,7 +4399,7 @@ fn enum_value(
     file_no: usize,
     contract_no: Option<usize>,
     ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Option<Expression>, ()> {
     let mut namespace = Vec::new();
 
@@ -4091,7 +4469,7 @@ fn enum_value(
     }
 }
 
-/// Resolve an array subscript expression
+/// Resolve an member access expression
 fn member_access(
     loc: &pt::Loc,
     e: &pt::Expression,
@@ -4099,7 +4477,7 @@ fn member_access(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     // is it a builtin special variable like "block.timestamp"
@@ -4113,7 +4491,7 @@ fn member_access(
         if builtin::builtin_namespace(&namespace.name) {
             diagnostics.push(Diagnostic::error(
                 e.loc(),
-                format!("builtin ‘{}.{}’ does not exist", namespace.name, id.name),
+                format!("builtin '{}.{}' does not exist", namespace.name, id.name),
             ));
 
             return Err(());
@@ -4155,7 +4533,7 @@ fn member_access(
                 let mut name_matches = 0;
                 let mut expr = Err(());
 
-                for function_no in &ns.contracts[call_contract_no].functions {
+                for function_no in ns.contracts[call_contract_no].all_functions.keys() {
                     let func = &ns.functions[*function_no];
 
                     if func.name != id.name || func.ty != pt::FunctionTy::Function {
@@ -4166,7 +4544,7 @@ fn member_access(
 
                     expr = Ok(Expression::InternalFunction {
                         loc: e.loc(),
-                        ty: function_type(func, false),
+                        ty: function_type(func, false, resolve_to),
                         function_no: *function_no,
                         signature: None,
                     })
@@ -4177,7 +4555,7 @@ fn member_access(
                         diagnostics.push(Diagnostic::error(
                             e.loc(),
                             format!(
-                                "contract ‘{}’ does not have a function called ‘{}’",
+                                "contract '{}' does not have a function called '{}'",
                                 ns.contracts[call_contract_no].name, id.name,
                             ),
                         ));
@@ -4188,7 +4566,7 @@ fn member_access(
                         diagnostics.push(Diagnostic::error(
                             e.loc(),
                             format!(
-                                "function ‘{}’ of contract ‘{}’ is overloaded",
+                                "function '{}' of contract '{}' is overloaded",
                                 id.name, ns.contracts[call_contract_no].name,
                             ),
                         ));
@@ -4211,8 +4589,54 @@ fn member_access(
     let expr = expression(e, context, ns, symtable, diagnostics, resolve_to)?;
     let expr_ty = expr.ty();
 
-    // Dereference if need to. This could be struct-in-struct for
-    // example.
+    if let Type::Struct(struct_ty) = expr_ty.deref_memory() {
+        if let Some((i, f)) = struct_ty
+            .definition(ns)
+            .fields
+            .iter()
+            .enumerate()
+            .find(|f| id.name == f.1.name_as_str())
+        {
+            return if context.lvalue && f.readonly {
+                diagnostics.push(Diagnostic::error(
+                    id.loc,
+                    format!(
+                        "struct '{}' field '{}' is readonly",
+                        struct_ty.definition(ns),
+                        id.name
+                    ),
+                ));
+                Err(())
+            } else if f.readonly {
+                // readonly fields return the value, not a reference
+                Ok(Expression::StructMember(
+                    id.loc,
+                    f.ty.clone(),
+                    Box::new(expr),
+                    i,
+                ))
+            } else {
+                Ok(Expression::StructMember(
+                    id.loc,
+                    Type::Ref(Box::new(f.ty.clone())),
+                    Box::new(expr),
+                    i,
+                ))
+            };
+        } else {
+            diagnostics.push(Diagnostic::error(
+                id.loc,
+                format!(
+                    "struct '{}' does not have a field called '{}'",
+                    struct_ty.definition(ns),
+                    id.name
+                ),
+            ));
+            return Err(());
+        }
+    }
+
+    // Dereference if need to
     let (expr, expr_ty) = if let Type::Ref(ty) = &expr_ty {
         (
             Expression::Load(*loc, expr_ty.clone(), Box::new(expr)),
@@ -4239,13 +4663,13 @@ fn member_access(
         Type::Array(_, dim) => {
             if id.name == "length" {
                 return match dim.last().unwrap() {
-                    None => Ok(Expression::Builtin(
+                    ArrayLength::Dynamic => Ok(Expression::Builtin(
                         *loc,
                         vec![Type::Uint(32)],
                         Builtin::ArrayLength,
                         vec![expr],
                     )),
-                    Some(d) => {
+                    ArrayLength::Fixed(d) => {
                         //We should not eliminate an array from the code when 'length' is called
                         //So the variable is also assigned a value to be read from 'length'
                         assigned_variable(ns, &expr, symtable);
@@ -4258,6 +4682,7 @@ fn member_access(
                             ResolveTo::Type(&Type::Uint(32)),
                         )
                     }
+                    ArrayLength::AnyFixed => unreachable!(),
                 };
             }
         }
@@ -4272,8 +4697,9 @@ fn member_access(
             }
         }
         Type::StorageRef(immutable, r) => match *r {
-            Type::Struct(n) => {
-                return if let Some((field_no, field)) = ns.structs[n]
+            Type::Struct(str_ty) => {
+                return if let Some((field_no, field)) = str_ty
+                    .definition(ns)
                     .fields
                     .iter()
                     .enumerate()
@@ -4289,8 +4715,9 @@ fn member_access(
                     diagnostics.push(Diagnostic::error(
                         id.loc,
                         format!(
-                            "struct ‘{}’ does not have a field called ‘{}’",
-                            ns.structs[n].name, id.name
+                            "struct '{}' does not have a field called '{}'",
+                            str_ty.definition(ns).name,
+                            id.name
                         ),
                     ));
                     Err(())
@@ -4300,7 +4727,7 @@ fn member_access(
                 if id.name == "length" {
                     let elem_ty = expr.ty().storage_array_elem().deref_into();
 
-                    if let Some(dim) = &dim[0] {
+                    if let Some(ArrayLength::Fixed(dim)) = dim.last() {
                         // sparse array could be large than ns.storage_type() on Solana
                         if dim.bits() > ns.storage_type().bits(ns) as u64 {
                             return Ok(Expression::StorageArrayLength {
@@ -4320,7 +4747,7 @@ fn member_access(
                     });
                 }
             }
-            Type::Bytes(_) | Type::DynamicBytes => {
+            Type::Bytes(_) | Type::DynamicBytes | Type::String => {
                 if id.name == "length" {
                     let elem_ty = expr.ty().storage_array_elem().deref_into();
 
@@ -4334,46 +4761,6 @@ fn member_access(
             }
             _ => {}
         },
-        Type::Struct(n) => {
-            if let Some((i, f)) = ns.structs[n]
-                .fields
-                .iter()
-                .enumerate()
-                .find(|f| id.name == f.1.name_as_str())
-            {
-                return if context.lvalue && f.readonly {
-                    diagnostics.push(Diagnostic::error(
-                        id.loc,
-                        format!("struct ‘{}’ field ‘{}’ is readonly", ns.structs[n], id.name),
-                    ));
-                    Err(())
-                } else if f.readonly {
-                    // readonly fields return the value, not a reference
-                    Ok(Expression::StructMember(
-                        id.loc,
-                        f.ty.clone(),
-                        Box::new(expr),
-                        i,
-                    ))
-                } else {
-                    Ok(Expression::StructMember(
-                        id.loc,
-                        Type::Ref(Box::new(f.ty.clone())),
-                        Box::new(expr),
-                        i,
-                    ))
-                };
-            } else {
-                diagnostics.push(Diagnostic::error(
-                    id.loc,
-                    format!(
-                        "struct ‘{}’ does not have a field called ‘{}’",
-                        ns.structs[n], id.name
-                    ),
-                ));
-                return Err(());
-            }
-        }
         Type::Address(_) => {
             if id.name == "balance" {
                 if ns.target.is_substrate() {
@@ -4388,7 +4775,7 @@ fn member_access(
                     if !is_this {
                         diagnostics.push(Diagnostic::error(
                             expr.loc(),
-                            "substrate can only retrieve balance of this, like ‘address(this).balance’".to_string(),
+                            "substrate can only retrieve balance of this, like 'address(this).balance'".to_string(),
                         ));
                         return Err(());
                     }
@@ -4406,7 +4793,7 @@ fn member_access(
             let mut name_matches = 0;
             let mut ext_expr = Err(());
 
-            for function_no in &ns.contracts[ref_contract_no].functions {
+            for function_no in ns.contracts[ref_contract_no].all_functions.keys() {
                 let func = &ns.functions[*function_no];
 
                 if func.name != id.name || func.ty != pt::FunctionTy::Function || !func.is_public()
@@ -4434,7 +4821,7 @@ fn member_access(
                 diagnostics.push(Diagnostic::error(
                     id.loc,
                     format!(
-                        "{} ‘{}’ has no public function ‘{}’",
+                        "{} '{}' has no public function '{}'",
                         ns.contracts[ref_contract_no].ty,
                         ns.contracts[ref_contract_no].name,
                         id.name
@@ -4447,7 +4834,7 @@ fn member_access(
                 diagnostics.push(Diagnostic::error(
                     id.loc,
                     format!(
-                        "function ‘{}’ of {} ‘{}’ is overloaded",
+                        "function '{}' of {} '{}' is overloaded",
                         id.name,
                         ns.contracts[ref_contract_no].ty,
                         ns.contracts[ref_contract_no].name
@@ -4492,7 +4879,7 @@ fn member_access(
         _ => (),
     }
 
-    diagnostics.push(Diagnostic::error(*loc, format!("‘{}’ not found", id.name)));
+    diagnostics.push(Diagnostic::error(*loc, format!("'{}' not found", id.name)));
 
     Err(())
 }
@@ -4504,7 +4891,7 @@ fn contract_constant(
     file_no: usize,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Option<Expression>, ()> {
     let namespace = match e {
@@ -4540,7 +4927,7 @@ fn contract_constant(
                     diagnostics.push(Diagnostic::error(
                         *loc,
                         format!(
-                            "need instance of contract ‘{}’ to get variable value ‘{}’",
+                            "need instance of contract '{}' to get variable value '{}'",
                             ns.contracts[contract_no].name,
                             ns.contracts[contract_no].variables[var_no].name,
                         ),
@@ -4571,7 +4958,7 @@ fn array_subscript(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let array = expression(
         array,
@@ -4610,7 +4997,7 @@ fn array_subscript(
             diagnostics.push(Diagnostic::error(
                 *loc,
                 format!(
-                    "array subscript must be an unsigned integer, not ‘{}’",
+                    "array subscript must be an unsigned integer, not '{}'",
                     index.ty().to_string(ns)
                 ),
             ));
@@ -4624,27 +5011,13 @@ fn array_subscript(
             Type::StorageRef(false, Box::new(Type::Bytes(1))),
             array_ty,
             Box::new(array),
-            Box::new(cast(
-                &index.loc(),
-                index,
-                &Type::Uint(32),
-                false,
-                ns,
-                diagnostics,
-            )?),
+            Box::new(index.cast(&index.loc(), &Type::Uint(32), false, ns, diagnostics)?),
         ));
     }
 
     if index_ty.is_contract_storage() {
         // make sure we load the index value from storage
-        index = cast(
-            &index.loc(),
-            index,
-            index_ty.deref_any(),
-            true,
-            ns,
-            diagnostics,
-        )?;
+        index = index.cast(&index.loc(), index_ty.deref_any(), true, ns, diagnostics)?;
     }
 
     match array_ty.deref_any() {
@@ -4660,17 +5033,15 @@ fn array_subscript(
                     Box::new(index),
                 ))
             } else {
-                let mut elem_ty = array_ty.array_deref();
+                let elem_ty = array_ty.array_deref();
 
-                if elem_ty.builtin_struct(ns) == BuiltinStruct::AccountInfo {
-                    // AccountInfo is an array of structures, not an array of pointers to structures
-                    elem_ty = elem_ty.deref_any().clone();
-                }
-
-                let array = cast(
+                let array = array.cast(
                     &array.loc(),
-                    array,
-                    array_ty.deref_any(),
+                    if array_ty.deref_memory().is_fixed_reference_type() {
+                        &array_ty
+                    } else {
+                        array_ty.deref_any()
+                    },
                     true,
                     ns,
                     diagnostics,
@@ -4705,25 +5076,22 @@ fn array_subscript(
 /// Resolve a function call with positional arguments
 fn struct_literal(
     loc: &pt::Loc,
-    struct_no: usize,
+    struct_ty: &StructType,
     args: &[pt::Expression],
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
-    let struct_def = ns.structs[struct_no].clone();
+    let struct_def = struct_ty.definition(ns).clone();
 
-    let ty = Type::Struct(struct_no);
+    let ty = Type::Struct(*struct_ty);
 
-    if ty
-        .contains_builtins(ns, BuiltinStruct::AccountInfo)
-        .is_some()
-    {
+    if ty.contains_builtins(ns, &StructType::AccountInfo).is_some() {
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "builtin struct ‘{}’ cannot be created using struct literal",
+                "builtin struct '{}' cannot be created using struct literal",
                 struct_def.name,
             ),
         ));
@@ -4732,7 +5100,7 @@ fn struct_literal(
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "struct ‘{}’ has {} fields, not {}",
+                "struct '{}' has {} fields, not {}",
                 struct_def.name,
                 struct_def.fields.len(),
                 args.len()
@@ -4752,14 +5120,7 @@ fn struct_literal(
                 ResolveTo::Type(&struct_def.fields[i].ty),
             )?;
             used_variable(ns, &expr, symtable);
-            fields.push(cast(
-                loc,
-                expr,
-                &struct_def.fields[i].ty,
-                true,
-                ns,
-                diagnostics,
-            )?);
+            fields.push(expr.cast(loc, &struct_def.fields[i].ty, true, ns, diagnostics)?);
         }
 
         Ok(Expression::StructLiteral(*loc, ty, fields))
@@ -4777,7 +5138,8 @@ fn call_function_type(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
+    resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let mut function = expression(expr, context, ns, symtable, diagnostics, ResolveTo::Unknown)?;
 
@@ -4786,7 +5148,7 @@ fn call_function_type(
     match ty {
         Type::StorageRef(_, real_ty) | Type::Ref(real_ty) => {
             ty = *real_ty;
-            function = cast(&expr.loc(), function, &ty, true, ns, diagnostics)?;
+            function = function.cast(&expr.loc(), &ty, true, ns, diagnostics)?;
         }
         _ => (),
     };
@@ -4827,19 +5189,12 @@ fn call_function_type(
                 ResolveTo::Type(&params[i]),
             )?;
 
-            cast_args.push(cast(
-                &arg.loc(),
-                arg.clone(),
-                &params[i],
-                true,
-                ns,
-                diagnostics,
-            )?);
+            cast_args.push(arg.cast(&arg.loc(), &params[i], true, ns, diagnostics)?);
         }
 
         Ok(Expression::InternalFunctionCall {
             loc: *loc,
-            returns: if returns.is_empty() {
+            returns: if returns.is_empty() || resolve_to == ResolveTo::Discard {
                 vec![Type::Void]
             } else {
                 returns
@@ -4855,24 +5210,18 @@ fn call_function_type(
     {
         let call_args = parse_call_args(call_args, true, context, ns, symtable, diagnostics)?;
 
-        let value = if let Some(value) = call_args.value {
-            if !value.const_zero(context.contract_no, ns)
-                && !matches!(mutability, Mutability::Payable(_))
-            {
+        if let Some(value) = &call_args.value {
+            if !value.const_zero(ns) && !matches!(mutability, Mutability::Payable(_)) {
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "sending value to function type ‘{}’ which is not payable",
+                        "sending value to function type '{}' which is not payable",
                         function.ty().to_string(ns),
                     ),
                 ));
                 return Err(());
             }
-
-            Some(value)
-        } else {
-            None
-        };
+        }
 
         if params.len() != args.len() {
             diagnostics.push(Diagnostic::error(
@@ -4899,27 +5248,19 @@ fn call_function_type(
                 ResolveTo::Type(&params[i]),
             )?;
 
-            cast_args.push(cast(
-                &arg.loc(),
-                arg.clone(),
-                &params[i],
-                true,
-                ns,
-                diagnostics,
-            )?);
+            cast_args.push(arg.cast(&arg.loc(), &params[i], true, ns, diagnostics)?);
         }
 
         Ok(Expression::ExternalFunctionCall {
             loc: *loc,
-            returns: if returns.is_empty() {
+            returns: if returns.is_empty() || resolve_to == ResolveTo::Discard {
                 vec![Type::Void]
             } else {
                 returns
             },
             function: Box::new(function),
             args: cast_args,
-            gas: call_args.gas,
-            value,
+            call_args,
         })
     } else {
         diagnostics.push(Diagnostic::error(
@@ -4971,7 +5312,7 @@ pub fn available_functions(
 pub fn available_super_functions(name: &str, contract_no: usize, ns: &Namespace) -> Vec<usize> {
     let mut list = Vec::new();
 
-    for base_contract_no in visit_bases(contract_no, ns).into_iter().rev() {
+    for base_contract_no in ns.contract_bases(contract_no).into_iter().rev() {
         if base_contract_no == contract_no {
             continue;
         }
@@ -4994,7 +5335,7 @@ pub fn available_super_functions(name: &str, contract_no: usize, ns: &Namespace)
 }
 
 /// Resolve a function call with positional arguments
-pub fn call_position_args(
+pub fn function_call_pos_args(
     loc: &pt::Loc,
     id: &pt::Identifier,
     func_ty: pt::FunctionTy,
@@ -5003,15 +5344,16 @@ pub fn call_position_args(
     virtual_call: bool,
     context: &ExprContext,
     ns: &mut Namespace,
+    resolve_to: ResolveTo,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let mut name_matches = 0;
-    let mut errors = Vec::new();
+    let mut errors = Diagnostics::default();
 
     // Try to resolve as a function call
-    for function_no in function_nos {
-        let func = &ns.functions[function_no];
+    for function_no in &function_nos {
+        let func = &ns.functions[*function_no];
 
         if func.ty != func_ty {
             continue;
@@ -5039,7 +5381,7 @@ pub fn call_position_args(
 
         // check if arguments can be implicitly casted
         for (i, arg) in args.iter().enumerate() {
-            let ty = ns.functions[function_no].params[i].ty.clone();
+            let ty = ns.functions[*function_no].params[i].ty.clone();
 
             let arg = match expression(
                 arg,
@@ -5056,34 +5398,37 @@ pub fn call_position_args(
                 }
             };
 
-            match cast(&arg.loc(), arg.clone(), &ty, true, ns, &mut errors) {
+            match arg.cast(&arg.loc(), &ty, true, ns, &mut errors) {
                 Ok(expr) => cast_args.push(expr),
                 Err(_) => {
                     matches = false;
-                    continue;
                 }
             }
         }
 
         if !matches {
+            if function_nos.len() > 1 && diagnostics.extend_non_casting(&errors) {
+                return Err(());
+            }
+
             continue;
         }
 
-        let func = &ns.functions[function_no];
+        let func = &ns.functions[*function_no];
 
         if func.contract_no != context.contract_no && func.is_private() {
             errors.push(Diagnostic::error_with_note(
                 *loc,
                 format!("cannot call private {}", func.ty),
                 func.loc,
-                format!("declaration of {} ‘{}’", func.ty, func.name),
+                format!("declaration of {} '{}'", func.ty, func.name),
             ));
 
             continue;
         }
 
-        let returns = function_returns(func);
-        let ty = function_type(func, false);
+        let returns = function_returns(func, resolve_to);
+        let ty = function_type(func, false, resolve_to);
 
         return Ok(Expression::InternalFunctionCall {
             loc: *loc,
@@ -5091,7 +5436,7 @@ pub fn call_position_args(
             function: Box::new(Expression::InternalFunction {
                 loc: *loc,
                 ty,
-                function_no,
+                function_no: *function_no,
                 signature: if virtual_call && (func.is_virtual || func.is_override.is_some()) {
                     Some(func.signature.clone())
                 } else {
@@ -5107,12 +5452,12 @@ pub fn call_position_args(
             if func_ty == pt::FunctionTy::Modifier {
                 diagnostics.push(Diagnostic::error(
                     id.loc,
-                    format!("unknown modifier ‘{}’", id.name),
+                    format!("unknown modifier '{}'", id.name),
                 ));
             } else {
                 diagnostics.push(Diagnostic::error(
                     id.loc,
-                    format!("unknown {} or type ‘{}’", func_ty, id.name),
+                    format!("unknown {} or type '{}'", func_ty, id.name),
                 ));
             }
         }
@@ -5129,16 +5474,17 @@ pub fn call_position_args(
 }
 
 /// Resolve a function call with named arguments
-fn function_call_with_named_args(
+fn function_call_named_args(
     loc: &pt::Loc,
     id: &pt::Identifier,
     args: &[pt::NamedArgument],
     function_nos: Vec<usize>,
     virtual_call: bool,
     context: &ExprContext,
+    resolve_to: ResolveTo,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let mut arguments = HashMap::new();
 
@@ -5146,32 +5492,49 @@ fn function_call_with_named_args(
         if arguments.contains_key(arg.name.name.as_str()) {
             diagnostics.push(Diagnostic::error(
                 arg.name.loc,
-                format!("duplicate argument with name ‘{}’", arg.name.name),
+                format!("duplicate argument with name '{}'", arg.name.name),
             ));
-            return Err(());
+
+            let _ = expression(
+                &arg.expr,
+                context,
+                ns,
+                symtable,
+                diagnostics,
+                ResolveTo::Unknown,
+            );
         }
 
         arguments.insert(arg.name.name.as_str(), &arg.expr);
     }
+    // Try to resolve as a function call
+    let mut errors = Diagnostics::default();
 
     // Try to resolve as a function call
-    let mut name_matches = 0;
-    let mut errors = Vec::new();
+    for function_no in &function_nos {
+        let func = &ns.functions[*function_no];
 
-    // Try to resolve as a function call
-    for function_no in function_nos {
-        let func = &ns.functions[function_no];
-
-        if func.name != id.name || func.ty != pt::FunctionTy::Function {
+        if func.ty != pt::FunctionTy::Function {
             continue;
         }
 
-        name_matches += 1;
-
+        let unnamed_params = func.params.iter().filter(|p| p.id.is_none()).count();
         let params_len = func.params.len();
+        let mut matches = true;
 
-        if params_len != args.len() {
-            errors.push(Diagnostic::error(
+        if unnamed_params > 0 {
+            errors.push(Diagnostic::cast_error_with_note(
+                *loc,
+                format!(
+                    "function cannot be called with named arguments as {} of its parameters do not have names",
+                    unnamed_params,
+                ),
+                func.loc,
+                format!("definition of {}", func.name),
+            ));
+            matches = false;
+        } else if params_len != args.len() {
+            errors.push(Diagnostic::cast_error(
                 *loc,
                 format!(
                     "function expects {} arguments, {} provided",
@@ -5179,28 +5542,30 @@ fn function_call_with_named_args(
                     args.len()
                 ),
             ));
-            continue;
+            matches = false;
         }
 
-        let mut matches = true;
         let mut cast_args = Vec::new();
 
         // check if arguments can be implicitly casted
         for i in 0..params_len {
-            let param = &ns.functions[function_no].params[i];
+            let param = &ns.functions[*function_no].params[i];
+            if param.id.is_none() {
+                continue;
+            }
             let arg = match arguments.get(param.name_as_str()) {
                 Some(a) => a,
                 None => {
                     matches = false;
-                    diagnostics.push(Diagnostic::error(
+                    diagnostics.push(Diagnostic::cast_error(
                         *loc,
                         format!(
-                            "missing argument ‘{}’ to function ‘{}’",
+                            "missing argument '{}' to function '{}'",
                             param.name_as_str(),
                             id.name,
                         ),
                     ));
-                    break;
+                    continue;
                 }
             };
 
@@ -5221,34 +5586,36 @@ fn function_call_with_named_args(
                 }
             };
 
-            match cast(&arg.loc(), arg, &ty, true, ns, &mut errors) {
+            match arg.cast(&arg.loc(), &ty, true, ns, &mut errors) {
                 Ok(expr) => cast_args.push(expr),
                 Err(_) => {
                     matches = false;
-                    continue;
                 }
             }
         }
 
         if !matches {
+            if diagnostics.extend_non_casting(&errors) {
+                return Err(());
+            }
             continue;
         }
 
-        let func = &ns.functions[function_no];
+        let func = &ns.functions[*function_no];
 
         if func.contract_no != context.contract_no && func.is_private() {
             errors.push(Diagnostic::error_with_note(
                 *loc,
                 "cannot call private function".to_string(),
                 func.loc,
-                format!("declaration of function ‘{}’", func.name),
+                format!("declaration of function '{}'", func.name),
             ));
 
             continue;
         }
 
-        let returns = function_returns(func);
-        let ty = function_type(func, false);
+        let returns = function_returns(func, resolve_to);
+        let ty = function_type(func, false, resolve_to);
 
         return Ok(Expression::InternalFunctionCall {
             loc: *loc,
@@ -5256,7 +5623,7 @@ fn function_call_with_named_args(
             function: Box::new(Expression::InternalFunction {
                 loc: *loc,
                 ty,
-                function_no,
+                function_no: *function_no,
                 signature: if virtual_call && (func.is_virtual || func.is_override.is_some()) {
                     Some(func.signature.clone())
                 } else {
@@ -5267,11 +5634,11 @@ fn function_call_with_named_args(
         });
     }
 
-    match name_matches {
+    match function_nos.len() {
         0 => {
             diagnostics.push(Diagnostic::error(
                 id.loc,
-                format!("unknown function or type ‘{}’", id.name),
+                format!("unknown function or type '{}'", id.name),
             ));
         }
         1 => diagnostics.extend(errors),
@@ -5289,24 +5656,21 @@ fn function_call_with_named_args(
 /// Resolve a struct literal with named fields
 fn named_struct_literal(
     loc: &pt::Loc,
-    struct_no: usize,
+    str_ty: &StructType,
     args: &[pt::NamedArgument],
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
-    let struct_def = ns.structs[struct_no].clone();
-    let ty = Type::Struct(struct_no);
+    let struct_def = str_ty.definition(ns).clone();
+    let ty = Type::Struct(*str_ty);
 
-    if ty
-        .contains_builtins(ns, BuiltinStruct::AccountInfo)
-        .is_some()
-    {
+    if ty.contains_builtins(ns, &StructType::AccountInfo).is_some() {
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "builtin struct ‘{}’ cannot be created using struct literal",
+                "builtin struct '{}' cannot be created using struct literal",
                 struct_def.name,
             ),
         ));
@@ -5315,7 +5679,7 @@ fn named_struct_literal(
         diagnostics.push(Diagnostic::error(
             *loc,
             format!(
-                "struct ‘{}’ has {} fields, not {}",
+                "struct '{}' has {} fields, not {}",
                 struct_def.name,
                 struct_def.fields.len(),
                 args.len()
@@ -5324,10 +5688,10 @@ fn named_struct_literal(
         Err(())
     } else {
         let mut fields = Vec::new();
-        fields.resize(args.len(), Expression::Poison);
+        fields.resize(args.len(), Expression::BoolLiteral(Loc::Implicit, false));
         for a in args {
             match struct_def.fields.iter().enumerate().find(|(_, f)| {
-                f.name.as_ref().map(|id| id.name.as_str()) == Some(a.name.name.as_str())
+                f.id.as_ref().map(|id| id.name.as_str()) == Some(a.name.name.as_str())
             }) {
                 Some((i, f)) => {
                     let expr = expression(
@@ -5339,13 +5703,13 @@ fn named_struct_literal(
                         ResolveTo::Type(&f.ty),
                     )?;
                     used_variable(ns, &expr, symtable);
-                    fields[i] = cast(loc, expr, &f.ty, true, ns, diagnostics)?;
+                    fields[i] = expr.cast(loc, &f.ty, true, ns, diagnostics)?;
                 }
                 None => {
                     diagnostics.push(Diagnostic::error(
                         a.name.loc,
                         format!(
-                            "struct ‘{}’ has no field ‘{}’",
+                            "struct '{}' has no field '{}'",
                             struct_def.name, a.name.name,
                         ),
                     ));
@@ -5368,7 +5732,7 @@ fn method_call_pos_args(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     if let pt::Expression::Variable(namespace) = var {
@@ -5404,7 +5768,7 @@ fn method_call_pos_args(
                     return Err(());
                 }
 
-                return call_position_args(
+                return function_call_pos_args(
                     loc,
                     func,
                     pt::FunctionTy::Function,
@@ -5413,6 +5777,7 @@ fn method_call_pos_args(
                     false,
                     context,
                     ns,
+                    resolve_to,
                     symtable,
                     diagnostics,
                 );
@@ -5436,7 +5801,7 @@ fn method_call_pos_args(
                     return Err(());
                 }
 
-                return call_position_args(
+                return function_call_pos_args(
                     loc,
                     func,
                     pt::FunctionTy::Function,
@@ -5451,6 +5816,7 @@ fn method_call_pos_args(
                     true,
                     context,
                     ns,
+                    resolve_to,
                     symtable,
                     diagnostics,
                 );
@@ -5467,7 +5833,7 @@ fn method_call_pos_args(
                         return Err(());
                     }
 
-                    return call_position_args(
+                    return function_call_pos_args(
                         loc,
                         func,
                         pt::FunctionTy::Function,
@@ -5482,11 +5848,112 @@ fn method_call_pos_args(
                         false,
                         context,
                         ns,
+                        resolve_to,
                         symtable,
                         diagnostics,
                     );
                 }
             }
+        }
+    }
+
+    if let Ok(Type::UserType(no)) = ns.resolve_type(
+        context.file_no,
+        context.contract_no,
+        false,
+        var,
+        &mut Diagnostics::default(),
+    ) {
+        if let Some(loc) = call_args_loc {
+            diagnostics.push(Diagnostic::error(
+                loc,
+                "call arguments not allowed on builtins".to_string(),
+            ));
+            return Err(());
+        }
+
+        let elem_ty = ns.user_types[no].ty.clone();
+        let user_ty = Type::UserType(no);
+
+        if func.name == "unwrap" {
+            return if args.len() != 1 {
+                diagnostics.push(Diagnostic::error(
+                    func.loc,
+                    "method 'unwrap()' takes one argument".to_string(),
+                ));
+                Err(())
+            } else {
+                let expr = expression(
+                    &args[0],
+                    context,
+                    ns,
+                    symtable,
+                    diagnostics,
+                    ResolveTo::Type(&user_ty),
+                )?;
+
+                Ok(Expression::Builtin(
+                    *loc,
+                    vec![elem_ty],
+                    Builtin::UserTypeUnwrap,
+                    vec![expr.cast(&expr.loc(), &user_ty, true, ns, diagnostics)?],
+                ))
+            };
+        } else if func.name == "wrap" {
+            return if args.len() != 1 {
+                diagnostics.push(Diagnostic::error(
+                    func.loc,
+                    "method 'wrap()' takes one argument".to_string(),
+                ));
+                Err(())
+            } else {
+                let expr = expression(
+                    &args[0],
+                    context,
+                    ns,
+                    symtable,
+                    diagnostics,
+                    ResolveTo::Type(&elem_ty),
+                )?;
+
+                Ok(Expression::Builtin(
+                    *loc,
+                    vec![user_ty],
+                    Builtin::UserTypeWrap,
+                    vec![expr.cast(&expr.loc(), &elem_ty, true, ns, diagnostics)?],
+                ))
+            };
+        }
+    }
+
+    if let Some(mut path) = ns.expr_to_identifier_path(var) {
+        path.identifiers.push(func.clone());
+
+        if let Ok(list) = ns.resolve_free_function_with_namespace(
+            context.file_no,
+            &path,
+            &mut Diagnostics::default(),
+        ) {
+            if let Some(loc) = call_args_loc {
+                diagnostics.push(Diagnostic::error(
+                    loc,
+                    "call arguments not allowed on internal calls".to_string(),
+                ));
+            }
+
+            return function_call_pos_args(
+                loc,
+                func,
+                pt::FunctionTy::Function,
+                args,
+                list.iter().map(|(_, no)| *no).collect(),
+                false,
+                context,
+                ns,
+                resolve_to,
+                symtable,
+                diagnostics,
+            );
         }
     }
 
@@ -5545,10 +6012,10 @@ fn method_call_pos_args(
                 }
 
                 if func.name == "push" {
-                    if dim.last().unwrap().is_some() {
+                    if matches!(dim.last(), Some(ArrayLength::Fixed(_))) {
                         diagnostics.push(Diagnostic::error(
                             func.loc,
-                            "method ‘push()’ not allowed on fixed length array".to_string(),
+                            "method 'push()' not allowed on fixed length array".to_string(),
                         ));
                         return Err(());
                     }
@@ -5567,9 +6034,8 @@ fn method_call_pos_args(
                                 ResolveTo::Type(&elem_ty),
                             )?;
 
-                            builtin_args.push(cast(
+                            builtin_args.push(expr.cast(
                                 &args[0].loc(),
-                                expr,
                                 &elem_ty,
                                 true,
                                 ns,
@@ -5588,7 +6054,7 @@ fn method_call_pos_args(
                         _ => {
                             diagnostics.push(Diagnostic::error(
                                 func.loc,
-                                "method ‘push()’ takes at most 1 argument".to_string(),
+                                "method 'push()' takes at most 1 argument".to_string(),
                             ));
                             return Err(());
                         }
@@ -5602,10 +6068,10 @@ fn method_call_pos_args(
                     ));
                 }
                 if func.name == "pop" {
-                    if dim.last().unwrap().is_some() {
+                    if matches!(dim.last(), Some(ArrayLength::Fixed(_))) {
                         diagnostics.push(Diagnostic::error(
                             func.loc,
-                            "method ‘pop()’ not allowed on fixed length array".to_string(),
+                            "method 'pop()' not allowed on fixed length array".to_string(),
                         ));
 
                         return Err(());
@@ -5614,7 +6080,7 @@ fn method_call_pos_args(
                     if !args.is_empty() {
                         diagnostics.push(Diagnostic::error(
                             func.loc,
-                            "method ‘pop()’ does not take any arguments".to_string(),
+                            "method 'pop()' does not take any arguments".to_string(),
                         ));
                         return Err(());
                     }
@@ -5674,9 +6140,8 @@ fn method_call_pos_args(
                                 ResolveTo::Type(&elem_ty),
                             )?;
 
-                            builtin_args.push(cast(
+                            builtin_args.push(expr.cast(
                                 &args[0].loc(),
-                                expr,
                                 &elem_ty,
                                 true,
                                 ns,
@@ -5689,7 +6154,7 @@ fn method_call_pos_args(
                         _ => {
                             diagnostics.push(Diagnostic::error(
                                 func.loc,
-                                "method ‘push()’ takes at most 1 argument".to_string(),
+                                "method 'push()' takes at most 1 argument".to_string(),
                             ));
                             return Err(());
                         }
@@ -5706,7 +6171,7 @@ fn method_call_pos_args(
                     if !args.is_empty() {
                         diagnostics.push(Diagnostic::error(
                             func.loc,
-                            "method ‘pop()’ does not take any arguments".to_string(),
+                            "method 'pop()' does not take any arguments".to_string(),
                         ));
                         return Err(());
                     }
@@ -5728,18 +6193,22 @@ fn method_call_pos_args(
             if ns.target == Target::Solana {
                 diagnostics.push(Diagnostic::error(
                     func.loc,
-                    format!("‘push()’ not supported on ‘bytes’ on target {}", ns.target),
+                    format!("'push()' not supported on 'bytes' on target {}", ns.target),
                 ));
                 return Err(());
             }
 
-            let elem_ty = match &var_ty {
-                Type::Array(ty, _) => ty,
-                Type::DynamicBytes => &Type::Uint(8),
-                _ => unreachable!(),
-            };
+            let elem_ty = var_ty.array_elem();
+
             let val = match args.len() {
-                0 => elem_ty.default(ns).unwrap(),
+                0 => {
+                    return Ok(Expression::Builtin(
+                        *loc,
+                        vec![elem_ty.clone()],
+                        Builtin::ArrayPush,
+                        vec![var_expr],
+                    ));
+                }
                 1 => {
                     let val_expr = expression(
                         &args[0],
@@ -5747,15 +6216,15 @@ fn method_call_pos_args(
                         ns,
                         symtable,
                         diagnostics,
-                        ResolveTo::Type(elem_ty),
+                        ResolveTo::Type(&elem_ty),
                     )?;
 
-                    cast(&args[0].loc(), val_expr, elem_ty, true, ns, diagnostics)?
+                    val_expr.cast(&args[0].loc(), &elem_ty, true, ns, diagnostics)?
                 }
                 _ => {
                     diagnostics.push(Diagnostic::error(
                         func.loc,
-                        "method ‘push()’ takes at most 1 argument".to_string(),
+                        "method 'push()' takes at most 1 argument".to_string(),
                     ));
                     return Err(());
                 }
@@ -5772,7 +6241,7 @@ fn method_call_pos_args(
             if ns.target == Target::Solana {
                 diagnostics.push(Diagnostic::error(
                     func.loc,
-                    format!("‘pop()’ not supported on ‘bytes’ on target {}", ns.target),
+                    format!("'pop()' not supported on 'bytes' on target {}", ns.target),
                 ));
                 return Err(());
             }
@@ -5780,7 +6249,7 @@ fn method_call_pos_args(
             if !args.is_empty() {
                 diagnostics.push(Diagnostic::error(
                     func.loc,
-                    "method ‘pop()’ does not take any arguments".to_string(),
+                    "method 'pop()' does not take any arguments".to_string(),
                 ));
                 return Err(());
             }
@@ -5803,22 +6272,24 @@ fn method_call_pos_args(
     if let Type::Contract(ext_contract_no) = &var_ty.deref_any() {
         let call_args = parse_call_args(call_args, true, context, ns, symtable, diagnostics)?;
 
-        let marker = diagnostics.len();
-        let mut name_match = 0;
+        let mut errors = Diagnostics::default();
+        let mut name_matches: Vec<usize> = Vec::new();
 
-        for function_no in ns.contracts[*ext_contract_no].functions.clone() {
-            if func.name != ns.functions[function_no].name
-                || ns.functions[function_no].ty != pt::FunctionTy::Function
+        for function_no in ns.contracts[*ext_contract_no].all_functions.keys() {
+            if func.name != ns.functions[*function_no].name
+                || ns.functions[*function_no].ty != pt::FunctionTy::Function
             {
                 continue;
             }
 
-            name_match += 1;
+            name_matches.push(*function_no);
+        }
 
-            let params_len = ns.functions[function_no].params.len();
+        for function_no in &name_matches {
+            let params_len = ns.functions[*function_no].params.len();
 
             if params_len != args.len() {
-                diagnostics.push(Diagnostic::error(
+                errors.push(Diagnostic::error(
                     *loc,
                     format!(
                         "function expects {} arguments, {} provided",
@@ -5828,18 +6299,20 @@ fn method_call_pos_args(
                 ));
                 continue;
             }
+
             let mut matches = true;
             let mut cast_args = Vec::new();
+
             // check if arguments can be implicitly casted
             for (i, arg) in args.iter().enumerate() {
-                let ty = ns.functions[function_no].params[i].ty.clone();
+                let ty = ns.functions[*function_no].params[i].ty.clone();
 
                 let arg = match expression(
                     arg,
                     context,
                     ns,
                     symtable,
-                    diagnostics,
+                    &mut errors,
                     ResolveTo::Type(&ty),
                 ) {
                     Ok(e) => e,
@@ -5849,7 +6322,7 @@ fn method_call_pos_args(
                     }
                 };
 
-                match cast(&arg.loc(), arg, &ty, true, ns, diagnostics) {
+                match arg.cast(&arg.loc(), &ty, true, ns, &mut errors) {
                     Ok(expr) => cast_args.push(expr),
                     Err(()) => {
                         matches = false;
@@ -5857,39 +6330,32 @@ fn method_call_pos_args(
                     }
                 }
             }
-            if matches {
-                diagnostics.truncate(marker);
 
-                if !ns.functions[function_no].is_public() {
+            if matches {
+                if !ns.functions[*function_no].is_public() {
                     diagnostics.push(Diagnostic::error(
                         *loc,
-                        format!("function ‘{}’ is not ‘public’ or ‘external’", func.name),
+                        format!("function '{}' is not 'public' or 'external'", func.name),
                     ));
                     return Err(());
                 }
 
-                let value = if let Some(value) = call_args.value {
-                    if !value.const_zero(Some(*ext_contract_no), ns)
-                        && !ns.functions[function_no].is_payable()
-                    {
+                if let Some(value) = &call_args.value {
+                    if !value.const_zero(ns) && !ns.functions[*function_no].is_payable() {
                         diagnostics.push(Diagnostic::error(
                             *loc,
                             format!(
-                                "sending value to function ‘{}’ which is not payable",
+                                "sending value to function '{}' which is not payable",
                                 func.name
                             ),
                         ));
                         return Err(());
                     }
+                }
 
-                    Some(value)
-                } else {
-                    None
-                };
-
-                let func = &ns.functions[function_no];
-                let returns = function_returns(func);
-                let ty = function_type(func, true);
+                let func = &ns.functions[*function_no];
+                let returns = function_returns(func, resolve_to);
+                let ty = function_type(func, true, resolve_to);
 
                 return Ok(Expression::ExternalFunctionCall {
                     loc: *loc,
@@ -5897,40 +6363,36 @@ fn method_call_pos_args(
                     function: Box::new(Expression::ExternalFunction {
                         loc: *loc,
                         ty,
-                        function_no,
-                        address: Box::new(cast(
+                        function_no: *function_no,
+                        address: Box::new(var_expr.cast(
                             &var.loc(),
-                            var_expr,
-                            &Type::Contract(*ext_contract_no),
+                            &Type::Contract(func.contract_no.unwrap()),
                             true,
                             ns,
                             diagnostics,
                         )?),
                     }),
                     args: cast_args,
-                    value,
-                    gas: call_args.gas,
+                    call_args,
                 });
+            } else if name_matches.len() > 1 && diagnostics.extend_non_casting(&errors) {
+                return Err(());
             }
         }
 
-        let self_ty = var_ty.deref_any();
-
         // what about call args
-        match resolve_using(
+        match using::try_resolve_using_call(
             loc,
             func,
             &var_expr,
-            self_ty,
             context,
             args,
             symtable,
             diagnostics,
             ns,
+            resolve_to,
         ) {
             Ok(Some(expr)) => {
-                diagnostics.truncate(marker);
-
                 return Ok(expr);
             }
             Ok(None) => (),
@@ -5939,8 +6401,9 @@ fn method_call_pos_args(
             }
         }
 
-        if name_match != 1 {
-            diagnostics.truncate(marker);
+        if name_matches.len() == 1 {
+            diagnostics.extend(errors);
+        } else if name_matches.len() != 1 {
             diagnostics.push(Diagnostic::error(
                 *loc,
                 "cannot find overloaded function which matches signature".to_string(),
@@ -5956,7 +6419,7 @@ fn method_call_pos_args(
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "method ‘{}’ available on type ‘address payable’ not ‘address’",
+                        "method '{}' available on type 'address payable' not 'address'",
                         func.name,
                     ),
                 ));
@@ -5968,7 +6431,7 @@ fn method_call_pos_args(
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "‘{}’ expects 1 argument, {} provided",
+                        "'{}' expects 1 argument, {} provided",
                         func.name,
                         args.len()
                     ),
@@ -5980,7 +6443,7 @@ fn method_call_pos_args(
             if let Some(loc) = call_args_loc {
                 diagnostics.push(Diagnostic::error(
                     loc,
-                    format!("call arguments not allowed on ‘{}’", func.name),
+                    format!("call arguments not allowed on '{}'", func.name),
                 ));
                 return Err(());
             }
@@ -5994,16 +6457,10 @@ fn method_call_pos_args(
                 ResolveTo::Type(&Type::Value),
             )?;
 
-            let address = cast(
-                &var_expr.loc(),
-                var_expr,
-                var_ty.deref_any(),
-                true,
-                ns,
-                diagnostics,
-            )?;
+            let address =
+                var_expr.cast(&var_expr.loc(), var_ty.deref_any(), true, ns, diagnostics)?;
 
-            let value = cast(&args[0].loc(), expr, &Type::Value, true, ns, diagnostics)?;
+            let value = expr.cast(&args[0].loc(), &Type::Value, true, ns, diagnostics)?;
 
             return if func.name == "transfer" {
                 Ok(Expression::Builtin(
@@ -6023,7 +6480,7 @@ fn method_call_pos_args(
         }
     }
 
-    if let Type::Address(_) = &var_ty.deref_any() {
+    if let Type::Address(payable) = &var_ty.deref_any() {
         let ty = match func.name.as_str() {
             "call" => Some(CallTy::Regular),
             "delegatecall" if ns.target == Target::Ewasm => Some(CallTy::Delegate),
@@ -6037,7 +6494,7 @@ fn method_call_pos_args(
             if ty != CallTy::Regular && call_args.value.is_some() {
                 diagnostics.push(Diagnostic::error(
                     *loc,
-                    format!("‘{}’ cannot have value specifed", func.name,),
+                    format!("'{}' cannot have value specifed", func.name,),
                 ));
 
                 return Err(());
@@ -6047,7 +6504,7 @@ fn method_call_pos_args(
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "‘{}’ expects 1 argument, {} provided",
+                        "'{}' expects 1 argument, {} provided",
                         func.name,
                         args.len()
                     ),
@@ -6056,7 +6513,7 @@ fn method_call_pos_args(
                 return Err(());
             }
 
-            let expr = expression(
+            let args = expression(
                 &args[0],
                 context,
                 ns,
@@ -6065,201 +6522,69 @@ fn method_call_pos_args(
                 ResolveTo::Type(&Type::DynamicBytes),
             )?;
 
-            let args = cast(
-                &args[0].loc(),
-                expr,
-                &Type::DynamicBytes,
-                true,
-                ns,
-                diagnostics,
-            )?;
+            let mut args_ty = args.ty();
+
+            match args_ty.deref_any() {
+                Type::DynamicBytes => (),
+                Type::Bytes(_) => {
+                    args_ty = Type::DynamicBytes;
+                }
+                Type::Array(..) | Type::Struct(..) if !args_ty.is_dynamic(ns) => (),
+                _ => {
+                    diagnostics.push(Diagnostic::error(
+                        args.loc(),
+                        format!("'{}' is not fixed length type", args_ty.to_string(ns),),
+                    ));
+
+                    return Err(());
+                }
+            }
+
+            let args = args.cast(&args.loc(), args_ty.deref_any(), true, ns, diagnostics)?;
 
             return Ok(Expression::ExternalFunctionCallRaw {
                 loc: *loc,
                 ty,
                 args: Box::new(args),
-                address: Box::new(var_expr),
-                gas: call_args.gas,
-                value: call_args.value,
+                address: Box::new(var_expr.cast(
+                    &var_expr.loc(),
+                    &Type::Address(*payable),
+                    true,
+                    ns,
+                    diagnostics,
+                )?),
+                call_args,
             });
         }
     }
 
     // resolve it using library extension
-    if context.contract_no.is_some() {
-        let self_ty = var_ty.deref_any();
-
-        match resolve_using(
-            loc,
-            func,
-            &var_expr,
-            self_ty,
-            context,
-            args,
-            symtable,
-            diagnostics,
-            ns,
-        ) {
-            Ok(Some(expr)) => {
-                return Ok(expr);
-            }
-            Ok(None) => (),
-            Err(_) => {
-                return Err(());
-            }
+    match using::try_resolve_using_call(
+        loc,
+        func,
+        &var_expr,
+        context,
+        args,
+        symtable,
+        diagnostics,
+        ns,
+        resolve_to,
+    ) {
+        Ok(Some(expr)) => {
+            return Ok(expr);
+        }
+        Ok(None) => (),
+        Err(_) => {
+            return Err(());
         }
     }
 
     diagnostics.push(Diagnostic::error(
         func.loc,
-        format!("method ‘{}’ does not exist", func.name),
+        format!("method '{}' does not exist", func.name),
     ));
 
     Err(())
-}
-
-fn resolve_using(
-    loc: &pt::Loc,
-    func: &pt::Identifier,
-    self_expr: &Expression,
-    self_ty: &Type,
-    context: &ExprContext,
-    args: &[pt::Expression],
-    symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
-    ns: &mut Namespace,
-) -> Result<Option<Expression>, ()> {
-    // first collect all possible libraries that match the using directive type
-    // Use HashSet for deduplication.
-    // If the using directive specifies a type, the type must match the type of
-    // the method call object exactly.
-    let libraries: HashSet<usize> = ns.contracts[context.contract_no.unwrap()]
-        .using
-        .iter()
-        .filter_map(|(library_no, ty)| match ty {
-            None => Some(*library_no),
-            Some(ty) if ty == self_ty => Some(*library_no),
-            _ => None,
-        })
-        .collect();
-
-    let mut name_matches = 0;
-    let mut errors = Vec::new();
-
-    for library_no in libraries {
-        for function_no in ns.contracts[library_no].functions.clone() {
-            let libfunc = &ns.functions[function_no];
-
-            if libfunc.name != func.name || libfunc.ty != pt::FunctionTy::Function {
-                continue;
-            }
-
-            name_matches += 1;
-
-            let params_len = libfunc.params.len();
-
-            if params_len != args.len() + 1 {
-                errors.push(Diagnostic::error(
-                    *loc,
-                    format!(
-                        "library function expects {} arguments, {} provided (including self)",
-                        params_len,
-                        args.len() + 1
-                    ),
-                ));
-                continue;
-            }
-            let mut matches = true;
-            let mut cast_args = Vec::new();
-
-            match cast(
-                &self_expr.loc(),
-                self_expr.clone(),
-                &libfunc.params[0].ty,
-                true,
-                ns,
-                &mut errors,
-            ) {
-                Ok(e) => cast_args.push(e),
-                Err(()) => continue,
-            }
-
-            // check if arguments can be implicitly casted
-            for (i, arg) in args.iter().enumerate() {
-                let ty = ns.functions[function_no].params[i + 1].ty.clone();
-
-                let arg = match expression(
-                    arg,
-                    context,
-                    ns,
-                    symtable,
-                    &mut errors,
-                    ResolveTo::Type(&ty),
-                ) {
-                    Ok(e) => e,
-                    Err(()) => {
-                        matches = false;
-                        continue;
-                    }
-                };
-
-                match cast(&arg.loc(), arg.clone(), &ty, true, ns, &mut errors) {
-                    Ok(expr) => cast_args.push(expr),
-                    Err(_) => {
-                        matches = false;
-                        break;
-                    }
-                }
-            }
-            if !matches {
-                continue;
-            }
-
-            let libfunc = &ns.functions[function_no];
-
-            if libfunc.is_private() {
-                errors.push(Diagnostic::error_with_note(
-                    *loc,
-                    "cannot call private library function".to_string(),
-                    libfunc.loc,
-                    format!("declaration of function ‘{}’", libfunc.name),
-                ));
-
-                continue;
-            }
-
-            let returns = function_returns(libfunc);
-            let ty = function_type(libfunc, false);
-
-            return Ok(Some(Expression::InternalFunctionCall {
-                loc: *loc,
-                returns,
-                function: Box::new(Expression::InternalFunction {
-                    loc: *loc,
-                    ty,
-                    function_no,
-                    signature: None,
-                }),
-                args: cast_args,
-            }));
-        }
-    }
-
-    match name_matches {
-        0 => Ok(None),
-        1 => {
-            diagnostics.extend(errors);
-
-            Err(())
-        }
-        _ => {
-            diagnostics.push(Diagnostic::error(
-                *loc,
-                "cannot find overloaded library function which matches signature".to_string(),
-            ));
-            Err(())
-        }
-    }
 }
 
 fn method_call_named_args(
@@ -6272,7 +6597,8 @@ fn method_call_named_args(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
+    resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     if let pt::Expression::Variable(namespace) = var {
         // is it a call to super
@@ -6286,13 +6612,14 @@ fn method_call_named_args(
                     return Err(());
                 }
 
-                return function_call_with_named_args(
+                return function_call_named_args(
                     loc,
                     func_name,
                     args,
                     available_super_functions(&func_name.name, cur_contract_no, ns),
                     false,
                     context,
+                    resolve_to,
                     ns,
                     symtable,
                     diagnostics,
@@ -6317,7 +6644,7 @@ fn method_call_named_args(
                     return Err(());
                 }
 
-                return function_call_with_named_args(
+                return function_call_named_args(
                     loc,
                     func_name,
                     args,
@@ -6330,6 +6657,7 @@ fn method_call_named_args(
                     ),
                     true,
                     context,
+                    resolve_to,
                     ns,
                     symtable,
                     diagnostics,
@@ -6347,7 +6675,7 @@ fn method_call_named_args(
                         return Err(());
                     }
 
-                    return function_call_with_named_args(
+                    return function_call_named_args(
                         loc,
                         func_name,
                         args,
@@ -6360,12 +6688,43 @@ fn method_call_named_args(
                         ),
                         false,
                         context,
+                        resolve_to,
                         ns,
                         symtable,
                         diagnostics,
                     );
                 }
             }
+        }
+    }
+
+    if let Some(mut path) = ns.expr_to_identifier_path(var) {
+        path.identifiers.push(func_name.clone());
+
+        if let Ok(list) = ns.resolve_free_function_with_namespace(
+            context.file_no,
+            &path,
+            &mut Diagnostics::default(),
+        ) {
+            if let Some(loc) = call_args_loc {
+                diagnostics.push(Diagnostic::error(
+                    loc,
+                    "call arguments not allowed on internal calls".to_string(),
+                ));
+            }
+
+            return function_call_named_args(
+                loc,
+                func_name,
+                args,
+                list.iter().map(|(_, no)| *no).collect(),
+                false,
+                context,
+                resolve_to,
+                ns,
+                symtable,
+                diagnostics,
+            );
         }
     }
 
@@ -6377,35 +6736,64 @@ fn method_call_named_args(
 
         let mut arguments = HashMap::new();
 
+        // check if the arguments are not garbage
         for arg in args {
             if arguments.contains_key(arg.name.name.as_str()) {
                 diagnostics.push(Diagnostic::error(
                     arg.name.loc,
-                    format!("duplicate argument with name ‘{}’", arg.name.name),
+                    format!("duplicate argument with name '{}'", arg.name.name),
                 ));
-                return Err(());
+
+                let _ = expression(
+                    &arg.expr,
+                    context,
+                    ns,
+                    symtable,
+                    diagnostics,
+                    ResolveTo::Unknown,
+                );
+
+                continue;
             }
 
             arguments.insert(arg.name.name.as_str(), &arg.expr);
         }
 
-        let marker = diagnostics.len();
-        let mut name_match = 0;
+        let mut errors = Diagnostics::default();
+        let mut name_matches: Vec<usize> = Vec::new();
 
         // function call
-        for function_no in ns.contracts[*external_contract_no].functions.clone() {
-            if ns.functions[function_no].name != func_name.name
-                || ns.functions[function_no].ty != pt::FunctionTy::Function
+        for function_no in ns.contracts[*external_contract_no].all_functions.keys() {
+            if ns.functions[*function_no].name != func_name.name
+                || ns.functions[*function_no].ty != pt::FunctionTy::Function
             {
                 continue;
             }
 
-            let params_len = ns.functions[function_no].params.len();
+            name_matches.push(*function_no);
+        }
 
-            name_match += 1;
+        for function_no in &name_matches {
+            let func = &ns.functions[*function_no];
 
-            if params_len != args.len() {
-                diagnostics.push(Diagnostic::error(
+            let unnamed_params = func.params.iter().filter(|p| p.id.is_none()).count();
+            let params_len = func.params.len();
+
+            let mut matches = true;
+
+            if unnamed_params > 0 {
+                errors.push(Diagnostic::cast_error_with_note(
+                    *loc,
+                    format!(
+                        "function cannot be called with named arguments as {} of its parameters do not have names",
+                        unnamed_params,
+                    ),
+                    func.loc,
+                    format!("definition of {}", func.name),
+                ));
+                matches = false;
+            } else if params_len != args.len() {
+                errors.push(Diagnostic::cast_error(
                     *loc,
                     format!(
                         "function expects {} arguments, {} provided",
@@ -6413,21 +6801,24 @@ fn method_call_named_args(
                         args.len()
                     ),
                 ));
-                continue;
+                matches = false;
             }
-            let mut matches = true;
             let mut cast_args = Vec::new();
-            // check if arguments can be implicitly casted
+
             for i in 0..params_len {
-                let param = ns.functions[function_no].params[i].clone();
+                let param = ns.functions[*function_no].params[i].clone();
+                if param.id.is_none() {
+                    continue;
+                }
+
                 let arg = match arguments.get(param.name_as_str()) {
                     Some(a) => a,
                     None => {
                         matches = false;
-                        diagnostics.push(Diagnostic::error(
+                        diagnostics.push(Diagnostic::cast_error(
                             *loc,
                             format!(
-                                "missing argument ‘{}’ to function ‘{}’",
+                                "missing argument '{}' to function '{}'",
                                 param.name_as_str(),
                                 func_name.name,
                             ),
@@ -6441,7 +6832,7 @@ fn method_call_named_args(
                     context,
                     ns,
                     symtable,
-                    diagnostics,
+                    &mut errors,
                     ResolveTo::Type(&param.ty),
                 ) {
                     Ok(e) => e,
@@ -6451,7 +6842,7 @@ fn method_call_named_args(
                     }
                 };
 
-                match cast(&arg.loc(), arg.clone(), &param.ty, true, ns, diagnostics) {
+                match arg.cast(&arg.loc(), &param.ty, true, ns, &mut errors) {
                     Ok(expr) => cast_args.push(expr),
                     Err(()) => {
                         matches = false;
@@ -6461,39 +6852,29 @@ fn method_call_named_args(
             }
 
             if matches {
-                if !ns.functions[function_no].is_public() {
+                if !ns.functions[*function_no].is_public() {
                     diagnostics.push(Diagnostic::error(
                         *loc,
                         format!(
-                            "function ‘{}’ is not ‘public’ or ‘external’",
+                            "function '{}' is not 'public' or 'external'",
                             func_name.name
                         ),
                     ));
-                    return Err(());
-                }
-
-                let value = if let Some(value) = call_args.value {
-                    if !value.const_zero(context.contract_no, ns)
-                        && !ns.functions[function_no].is_payable()
-                    {
+                } else if let Some(value) = &call_args.value {
+                    if !value.const_zero(ns) && !ns.functions[*function_no].is_payable() {
                         diagnostics.push(Diagnostic::error(
                             *loc,
                             format!(
-                                "sending value to function ‘{}’ which is not payable",
+                                "sending value to function '{}' which is not payable",
                                 func_name.name
                             ),
                         ));
-                        return Err(());
                     }
+                }
 
-                    Some(value)
-                } else {
-                    None
-                };
-
-                let func = &ns.functions[function_no];
-                let returns = function_returns(func);
-                let ty = function_type(func, true);
+                let func = &ns.functions[*function_no];
+                let returns = function_returns(func, resolve_to);
+                let ty = function_type(func, true, resolve_to);
 
                 return Ok(Expression::ExternalFunctionCall {
                     loc: *loc,
@@ -6501,37 +6882,36 @@ fn method_call_named_args(
                     function: Box::new(Expression::ExternalFunction {
                         loc: *loc,
                         ty,
-                        function_no,
-                        address: Box::new(cast(
+                        function_no: *function_no,
+                        address: Box::new(var_expr.cast(
                             &var.loc(),
-                            var_expr,
-                            &Type::Contract(*external_contract_no),
+                            &Type::Contract(func.contract_no.unwrap()),
                             true,
                             ns,
                             diagnostics,
                         )?),
                     }),
                     args: cast_args,
-                    value,
-                    gas: call_args.gas,
+                    call_args,
                 });
+            } else if name_matches.len() > 1 && diagnostics.extend_non_casting(&errors) {
+                return Err(());
             }
         }
 
-        match name_match {
+        match name_matches.len() {
             0 => {
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     format!(
-                        "contract ‘{}’ does not have function ‘{}’",
+                        "contract '{}' does not have function '{}'",
                         var_ty.deref_any().to_string(ns),
                         func_name.name
                     ),
                 ));
             }
-            1 => {}
+            1 => diagnostics.extend(errors),
             _ => {
-                diagnostics.truncate(marker);
                 diagnostics.push(Diagnostic::error(
                     *loc,
                     "cannot find overloaded function which matches signature".to_string(),
@@ -6543,7 +6923,7 @@ fn method_call_named_args(
 
     diagnostics.push(Diagnostic::error(
         func_name.loc,
-        format!("method ‘{}’ does not exist", func_name.name),
+        format!("method '{}' does not exist", func_name.name),
     ));
 
     Err(())
@@ -6575,19 +6955,90 @@ pub fn cast_shift_arg(
 /// Given an parsed literal array, ensure that it is valid. All the elements in the array
 /// must of the same type. The array might be a multidimensional array; all the leaf nodes
 /// must match.
-fn resolve_array_literal(
+fn array_literal(
     loc: &pt::Loc,
     exprs: &[pt::Expression],
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let mut dims = Box::new(Vec::new());
     let mut flattened = Vec::new();
 
-    check_subarrays(exprs, &mut Some(&mut dims), &mut flattened, ns, diagnostics)?;
+    let resolve_to = match resolve_to {
+        ResolveTo::Type(Type::Array(elem_ty, _)) => ResolveTo::Type(elem_ty),
+        // Solana seeds are a slice of slice of bytes, e.g. [ [ "fo", "o" ], [ "b", "a", "r"]]. In this
+        // case we want to resolve
+        ResolveTo::Type(Type::Slice(slice)) if matches!(slice.as_ref(), Type::Slice(_)) => {
+            let mut res = Vec::new();
+            let mut has_errors = false;
+
+            for expr in exprs {
+                let expr = match expression(
+                    expr,
+                    context,
+                    ns,
+                    symtable,
+                    diagnostics,
+                    ResolveTo::Type(&Type::Array(slice.clone(), vec![ArrayLength::Dynamic])),
+                ) {
+                    Ok(expr) => expr,
+                    Err(_) => {
+                        has_errors = true;
+                        continue;
+                    }
+                };
+
+                let ty = expr.ty();
+
+                if let Type::Array(elem, dims) = &ty {
+                    if elem != slice || dims.len() != 1 {
+                        diagnostics.push(Diagnostic::error(
+                            expr.loc(),
+                            format!(
+                                "type {} found where array {} expected",
+                                elem.to_string(ns),
+                                slice.to_string(ns)
+                            ),
+                        ));
+                        has_errors = true;
+                    }
+                } else {
+                    diagnostics.push(Diagnostic::error(
+                        expr.loc(),
+                        format!(
+                            "type {} found where array of slices expected",
+                            ty.to_string(ns)
+                        ),
+                    ));
+                    has_errors = true;
+                }
+
+                res.push(expr);
+            }
+
+            return if has_errors {
+                Err(())
+            } else {
+                let aty = Type::Array(
+                    slice.clone(),
+                    vec![ArrayLength::Fixed(BigInt::from(exprs.len()))],
+                );
+
+                Ok(Expression::ArrayLiteral(
+                    *loc,
+                    aty,
+                    vec![exprs.len() as u32],
+                    res,
+                ))
+            };
+        }
+        _ => resolve_to,
+    };
+
+    check_subarrays(exprs, &mut Some(&mut dims), &mut flattened, diagnostics)?;
 
     if flattened.is_empty() {
         diagnostics.push(Diagnostic::error(
@@ -6599,15 +7050,9 @@ fn resolve_array_literal(
 
     let mut flattened = flattened.iter();
 
-    let resolve_to = if let ResolveTo::Type(Type::Array(elem_ty, _)) = resolve_to {
-        ResolveTo::Type(elem_ty)
-    } else {
-        resolve_to
-    };
-
     // We follow the solidity scheme were everthing gets implicitly converted to the
     // type of the first element
-    let first = expression(
+    let mut first = expression(
         flattened.next().unwrap(),
         context,
         ns,
@@ -6617,6 +7062,8 @@ fn resolve_array_literal(
     )?;
 
     let ty = if let ResolveTo::Type(ty) = resolve_to {
+        first = first.cast(&first.loc(), ty, true, ns, diagnostics)?;
+
         ty.clone()
     } else {
         first.ty()
@@ -6630,7 +7077,7 @@ fn resolve_array_literal(
         used_variable(ns, &other, symtable);
 
         if other.ty() != ty {
-            other = cast(&e.loc(), other, &ty, true, ns, diagnostics)?;
+            other = other.cast(&e.loc(), &ty, true, ns, diagnostics)?;
         }
 
         exprs.push(other);
@@ -6639,8 +7086,8 @@ fn resolve_array_literal(
     let aty = Type::Array(
         Box::new(ty),
         dims.iter()
-            .map(|n| Some(BigInt::from_u32(*n).unwrap()))
-            .collect::<Vec<Option<BigInt>>>(),
+            .map(|n| ArrayLength::Fixed(BigInt::from_u32(*n).unwrap()))
+            .collect::<Vec<ArrayLength>>(),
     );
 
     if context.constant {
@@ -6656,12 +7103,11 @@ fn check_subarrays<'a>(
     exprs: &'a [pt::Expression],
     dims: &mut Option<&mut Vec<u32>>,
     flatten: &mut Vec<&'a pt::Expression>,
-    ns: &Namespace,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<(), ()> {
     if let Some(pt::Expression::ArrayLiteral(_, first)) = exprs.get(0) {
         // ensure all elements are array literals of the same length
-        check_subarrays(first, dims, flatten, ns, diagnostics)?;
+        check_subarrays(first, dims, flatten, diagnostics)?;
 
         for (i, e) in exprs.iter().enumerate().skip(1) {
             if let pt::Expression::ArrayLiteral(_, other) = e {
@@ -6674,7 +7120,7 @@ fn check_subarrays<'a>(
                     ));
                     return Err(());
                 }
-                check_subarrays(other, &mut None, flatten, ns, diagnostics)?;
+                check_subarrays(other, &mut None, flatten, diagnostics)?;
             } else {
                 diagnostics.push(Diagnostic::error(
                     e.loc(),
@@ -6709,7 +7155,7 @@ fn check_subarrays<'a>(
 /// Function call arguments
 pub fn collect_call_args<'a>(
     expr: &'a pt::Expression,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<
     (
         &'a pt::Expression,
@@ -6744,7 +7190,7 @@ pub fn collect_call_args<'a>(
             _ => {
                 diagnostics.push(Diagnostic::error(
                     block.loc(),
-                    "code block found where list of call arguments expected, like ‘{gas: 5000}’"
+                    "code block found where list of call arguments expected, like '{gas: 5000}'"
                         .to_string(),
                 ));
                 return Err(());
@@ -6757,13 +7203,6 @@ pub fn collect_call_args<'a>(
     Ok((expr, named_arguments, loc))
 }
 
-struct CallArgs {
-    gas: Option<Box<Expression>>,
-    salt: Option<Box<Expression>>,
-    value: Option<Box<Expression>>,
-    space: Option<Box<Expression>>,
-}
-
 /// Parse call arguments for external calls
 fn parse_call_args(
     call_args: &[&pt::NamedArgument],
@@ -6771,7 +7210,7 @@ fn parse_call_args(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<CallArgs, ()> {
     let mut args: HashMap<&String, &pt::NamedArgument> = HashMap::new();
 
@@ -6779,9 +7218,9 @@ fn parse_call_args(
         if let Some(prev) = args.get(&arg.name.name) {
             diagnostics.push(Diagnostic::error_with_note(
                 arg.loc,
-                format!("‘{}’ specified multiple times", arg.name.name),
+                format!("'{}' specified multiple times", arg.name.name),
                 prev.loc,
-                format!("location of previous declaration of ‘{}’", arg.name.name),
+                format!("location of previous declaration of '{}'", arg.name.name),
             ));
             return Err(());
         }
@@ -6789,42 +7228,52 @@ fn parse_call_args(
         args.insert(&arg.name.name, arg);
     }
 
-    let mut res = CallArgs {
-        gas: None,
-        value: None,
-        salt: None,
-        space: None,
-    };
+    let mut res = CallArgs::default();
 
     for arg in args.values() {
         match arg.name.name.as_str() {
             "value" => {
-                let ty = Type::Value;
+                if ns.target == Target::Solana {
+                    diagnostics.push(Diagnostic::error(
+                        arg.loc,
+                "Solana Cross Program Invocation (CPI) cannot transfer native value. See https://solang.readthedocs.io/en/latest/language/functions.html#value_transfer".to_string(),
+                    ));
 
-                let expr = expression(
-                    &arg.expr,
-                    context,
-                    ns,
-                    symtable,
-                    diagnostics,
-                    ResolveTo::Type(&ty),
-                )?;
+                    expression(
+                        &arg.expr,
+                        context,
+                        ns,
+                        symtable,
+                        diagnostics,
+                        ResolveTo::Unknown,
+                    )?;
+                } else {
+                    let ty = Type::Value;
 
-                res.value = Some(Box::new(cast(
-                    &arg.expr.loc(),
-                    expr,
-                    &ty,
-                    true,
-                    ns,
-                    diagnostics,
-                )?));
+                    let expr = expression(
+                        &arg.expr,
+                        context,
+                        ns,
+                        symtable,
+                        diagnostics,
+                        ResolveTo::Type(&ty),
+                    )?;
+
+                    res.value = Some(Box::new(expr.cast(
+                        &arg.expr.loc(),
+                        &ty,
+                        true,
+                        ns,
+                        diagnostics,
+                    )?));
+                }
             }
             "gas" => {
                 if ns.target == Target::Solana {
                     diagnostics.push(Diagnostic::error(
                         arg.loc,
                         format!(
-                            "‘gas’ not permitted for external calls or constructors on {}",
+                            "'gas' not permitted for external calls or constructors on {}",
                             ns.target
                         ),
                     ));
@@ -6841,9 +7290,8 @@ fn parse_call_args(
                     ResolveTo::Type(&ty),
                 )?;
 
-                res.gas = Some(Box::new(cast(
+                res.gas = Some(Box::new(expr.cast(
                     &arg.expr.loc(),
-                    expr,
                     &ty,
                     true,
                     ns,
@@ -6855,7 +7303,7 @@ fn parse_call_args(
                     diagnostics.push(Diagnostic::error(
                         arg.loc,
                         format!(
-                            "‘space’ not permitted for external calls or constructors on {}",
+                            "'space' not permitted for external calls or constructors on {}",
                             ns.target
                         ),
                     ));
@@ -6865,7 +7313,7 @@ fn parse_call_args(
                 if external_call {
                     diagnostics.push(Diagnostic::error(
                         arg.loc,
-                        "‘space’ not valid for external calls".to_string(),
+                        "'space' not valid for external calls".to_string(),
                     ));
                     return Err(());
                 }
@@ -6881,9 +7329,8 @@ fn parse_call_args(
                     ResolveTo::Type(&ty),
                 )?;
 
-                res.space = Some(Box::new(cast(
+                res.space = Some(Box::new(expr.cast(
                     &arg.expr.loc(),
-                    expr,
                     &ty,
                     true,
                     ns,
@@ -6895,7 +7342,7 @@ fn parse_call_args(
                     diagnostics.push(Diagnostic::error(
                         arg.loc,
                         format!(
-                            "‘salt’ not permitted for external calls or constructors on {}",
+                            "'salt' not permitted for external calls or constructors on {}",
                             ns.target
                         ),
                     ));
@@ -6905,7 +7352,7 @@ fn parse_call_args(
                 if external_call {
                     diagnostics.push(Diagnostic::error(
                         arg.loc,
-                        "‘salt’ not valid for external calls".to_string(),
+                        "'salt' not valid for external calls".to_string(),
                     ));
                     return Err(());
                 }
@@ -6921,19 +7368,89 @@ fn parse_call_args(
                     ResolveTo::Type(&ty),
                 )?;
 
-                res.salt = Some(Box::new(cast(
+                res.salt = Some(Box::new(expr.cast(
                     &arg.expr.loc(),
-                    expr,
                     &ty,
                     true,
                     ns,
                     diagnostics,
                 )?));
             }
+            "accounts" => {
+                if ns.target != Target::Solana {
+                    diagnostics.push(Diagnostic::error(
+                        arg.loc,
+                        format!(
+                            "'accounts' not permitted for external calls or constructors on {}",
+                            ns.target
+                        ),
+                    ));
+                    return Err(());
+                }
+
+                let expr = expression(
+                    &arg.expr,
+                    context,
+                    ns,
+                    symtable,
+                    diagnostics,
+                    ResolveTo::Unknown,
+                )?;
+
+                let mut correct_ty = false;
+                let expr_ty = expr.ty();
+
+                // if let chains would really help here
+                if let Type::Array(elem_ty, dims) = expr_ty.deref_memory() {
+                    if elem_ty.is_builtin_struct() == Some(StructType::AccountMeta)
+                        && dims.len() == 1
+                    {
+                        correct_ty = true;
+                    }
+                }
+
+                if !correct_ty {
+                    diagnostics.push(Diagnostic::error(
+                        arg.loc,
+                        format!(
+                            "'accounts' takes array of AccountMeta, not '{}'",
+                            expr_ty.to_string(ns)
+                        ),
+                    ));
+                    return Err(());
+                }
+
+                res.accounts = Some(Box::new(expr));
+            }
+            "seeds" => {
+                if ns.target != Target::Solana {
+                    diagnostics.push(Diagnostic::error(
+                        arg.loc,
+                        format!(
+                            "'seeds' not permitted for external calls or constructors on {}",
+                            ns.target
+                        ),
+                    ));
+                    return Err(());
+                }
+
+                let ty = Type::Slice(Box::new(Type::Slice(Box::new(Type::Bytes(1)))));
+
+                let expr = expression(
+                    &arg.expr,
+                    context,
+                    ns,
+                    symtable,
+                    diagnostics,
+                    ResolveTo::Type(&ty),
+                )?;
+
+                res.seeds = Some(Box::new(expr));
+            }
             _ => {
                 diagnostics.push(Diagnostic::error(
                     arg.loc,
-                    format!("‘{}’ not a valid call parameter", arg.name.name),
+                    format!("'{}' not a valid call parameter", arg.name.name),
                 ));
                 return Err(());
             }
@@ -6951,9 +7468,10 @@ pub fn named_call_expr(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
+    resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
-    let mut nullsink = Vec::new();
+    let mut nullsink = Diagnostics::default();
 
     // is it a struct literal
     match ns.resolve_type(
@@ -6963,8 +7481,8 @@ pub fn named_call_expr(
         ty,
         &mut nullsink,
     ) {
-        Ok(Type::Struct(n)) => {
-            return named_struct_literal(loc, n, args, context, ns, symtable, diagnostics);
+        Ok(Type::Struct(str_ty)) => {
+            return named_struct_literal(loc, &str_ty, args, context, ns, symtable, diagnostics);
         }
         Ok(_) => {
             diagnostics.push(Diagnostic::error(
@@ -6985,7 +7503,16 @@ pub fn named_call_expr(
         return Err(());
     }
 
-    let expr = named_function_call_expr(loc, ty, args, context, ns, symtable, diagnostics)?;
+    let expr = named_function_call_expr(
+        loc,
+        ty,
+        args,
+        context,
+        ns,
+        symtable,
+        diagnostics,
+        resolve_to,
+    )?;
 
     check_function_call(ns, &expr, symtable);
     if expr.tys().len() > 1 && !is_destructible {
@@ -7008,10 +7535,11 @@ pub fn call_expr(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
-    let mut nullsink = Vec::new();
+    let mut nullsink = Diagnostics::default();
+    let ty = ty.remove_parenthesis();
 
     match ns.resolve_type(
         context.file_no,
@@ -7020,8 +7548,8 @@ pub fn call_expr(
         ty,
         &mut nullsink,
     ) {
-        Ok(Type::Struct(n)) => {
-            return struct_literal(loc, n, args, context, ns, symtable, diagnostics);
+        Ok(Type::Struct(str_ty)) => {
+            return struct_literal(loc, &str_ty, args, context, ns, symtable, diagnostics);
         }
         Ok(to) => {
             // Cast
@@ -7047,22 +7575,30 @@ pub fn call_expr(
                     ResolveTo::Unknown,
                 )?;
 
-                cast(loc, expr, &to, false, ns, diagnostics)
+                expr.cast(loc, &to, false, ns, diagnostics)
             };
         }
         Err(_) => (),
     }
 
-    let expr = function_call_expr(
-        loc,
-        ty,
-        args,
-        context,
-        ns,
-        symtable,
-        diagnostics,
-        resolve_to,
-    )?;
+    let expr = match ty.remove_parenthesis() {
+        pt::Expression::New(_, ty) => new(loc, ty, args, context, ns, symtable, diagnostics)?,
+        pt::Expression::FunctionCallBlock(loc, expr, _)
+            if matches!(expr.remove_parenthesis(), pt::Expression::New(..)) =>
+        {
+            new(loc, ty, args, context, ns, symtable, diagnostics)?
+        }
+        _ => function_call_expr(
+            loc,
+            ty,
+            args,
+            context,
+            ns,
+            symtable,
+            diagnostics,
+            resolve_to,
+        )?,
+    };
 
     check_function_call(ns, &expr, symtable);
     if expr.tys().len() > 1 && !is_destructible {
@@ -7084,12 +7620,12 @@ pub fn function_call_expr(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
     resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let (ty, call_args, call_args_loc) = collect_call_args(ty, diagnostics)?;
 
-    match ty {
+    match ty.remove_parenthesis() {
         pt::Expression::MemberAccess(_, member, func) => {
             if context.constant {
                 diagnostics.push(Diagnostic::error(
@@ -7131,7 +7667,7 @@ pub fn function_call_expr(
                     if expr.tys().len() > 1 {
                         diagnostics.push(Diagnostic::error(
                             *loc,
-                            format!("builtin function ‘{}’ returns more than one value", id.name),
+                            format!("builtin function '{}' returns more than one value", id.name),
                         ));
                         Err(())
                     } else {
@@ -7165,6 +7701,7 @@ pub fn function_call_expr(
                     ns,
                     symtable,
                     diagnostics,
+                    resolve_to,
                 )
             } else {
                 if let Some(loc) = call_args_loc {
@@ -7175,7 +7712,7 @@ pub fn function_call_expr(
                     return Err(());
                 }
 
-                call_position_args(
+                function_call_pos_args(
                     loc,
                     id,
                     pt::FunctionTy::Function,
@@ -7184,6 +7721,7 @@ pub fn function_call_expr(
                     true,
                     context,
                     ns,
+                    resolve_to,
                     symtable,
                     diagnostics,
                 )
@@ -7199,6 +7737,7 @@ pub fn function_call_expr(
             ns,
             symtable,
             diagnostics,
+            resolve_to,
         ),
     }
 }
@@ -7211,7 +7750,8 @@ pub fn named_function_call_expr(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
+    resolve_to: ResolveTo,
 ) -> Result<Expression, ()> {
     let (ty, call_args, call_args_loc) = collect_call_args(ty, diagnostics)?;
 
@@ -7227,6 +7767,7 @@ pub fn named_function_call_expr(
             ns,
             symtable,
             diagnostics,
+            resolve_to,
         ),
         pt::Expression::Variable(id) => {
             if let Some(loc) = call_args_loc {
@@ -7237,13 +7778,14 @@ pub fn named_function_call_expr(
                 return Err(());
             }
 
-            function_call_with_named_args(
+            function_call_named_args(
                 loc,
                 id,
                 args,
                 available_functions(&id.name, true, context.file_no, context.contract_no, ns),
                 true,
                 context,
+                resolve_to,
                 ns,
                 symtable,
                 diagnostics,
@@ -7267,8 +7809,8 @@ pub fn named_function_call_expr(
 }
 
 /// Get the return values for a function call
-fn function_returns(ftype: &Function) -> Vec<Type> {
-    if !ftype.returns.is_empty() {
+pub(crate) fn function_returns(ftype: &Function, resolve_to: ResolveTo) -> Vec<Type> {
+    if !ftype.returns.is_empty() && !matches!(resolve_to, ResolveTo::Discard) {
         ftype.returns.iter().map(|p| p.ty.clone()).collect()
     } else {
         vec![Type::Void]
@@ -7276,10 +7818,10 @@ fn function_returns(ftype: &Function) -> Vec<Type> {
 }
 
 /// Get the function type for an internal.external function call
-fn function_type(func: &Function, external: bool) -> Type {
+pub(crate) fn function_type(func: &Function, external: bool, resolve_to: ResolveTo) -> Type {
     let params = func.params.iter().map(|p| p.ty.clone()).collect();
     let mutability = func.mutability.clone();
-    let returns = function_returns(func);
+    let returns = function_returns(func, resolve_to);
 
     if external {
         Type::ExternalFunction {
@@ -7304,27 +7846,21 @@ fn mapping_subscript(
     context: &ExprContext,
     ns: &mut Namespace,
     symtable: &mut Symtable,
-    diagnostics: &mut Vec<Diagnostic>,
+    diagnostics: &mut Diagnostics,
 ) -> Result<Expression, ()> {
     let ty = mapping.ty();
     let elem_ty = ty.storage_array_elem();
 
     if let Type::Mapping(key_ty, _) = ty.deref_any() {
-        let index_expr = cast(
-            &index.loc(),
-            expression(
-                index,
-                context,
-                ns,
-                symtable,
-                diagnostics,
-                ResolveTo::Type(key_ty),
-            )?,
-            key_ty,
-            true,
+        let index_expr = expression(
+            index,
+            context,
             ns,
+            symtable,
             diagnostics,
-        )?;
+            ResolveTo::Type(key_ty),
+        )?
+        .cast(&index.loc(), key_ty, true, ns, diagnostics)?;
 
         Ok(Expression::Subscript(
             *loc,

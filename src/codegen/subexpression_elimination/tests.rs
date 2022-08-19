@@ -1,11 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![cfg(test)]
 
 use crate::codegen::cfg::Instr;
 use crate::codegen::subexpression_elimination::common_subexpression_tracker::CommonSubExpressionTracker;
 use crate::codegen::subexpression_elimination::{AvailableExpression, AvailableExpressionSet};
-use crate::parser::pt::Loc;
-use crate::sema::ast::{Expression, StringLocation, Type};
+use crate::codegen::Expression;
+use crate::sema::ast::{StringLocation, Type};
 use num_bigint::{BigInt, Sign};
+use solang_parser::pt::Loc;
 
 #[test]
 fn add_variable_function_arg() {
@@ -37,7 +40,8 @@ fn add_variable_function_arg() {
 
 #[test]
 fn add_constants() {
-    let var = Expression::ConstantVariable(Loc::Codegen, Type::Int(2), None, 1);
+    let var =
+        Expression::NumberLiteral(Loc::Codegen, Type::Int(2), BigInt::new(Sign::Plus, vec![3]));
     let num =
         Expression::NumberLiteral(Loc::Codegen, Type::Int(1), BigInt::new(Sign::Plus, vec![2]));
     let sub = Expression::Subtract(
@@ -62,9 +66,15 @@ fn add_constants() {
 
 #[test]
 fn add_commutative() {
-    let cte = Expression::BoolLiteral(Loc::Codegen, false);
-    let var = Expression::Variable(Loc::Codegen, Type::Bool, 3);
-    let expr = Expression::Or(Loc::Codegen, Box::new(cte.clone()), Box::new(var.clone()));
+    let cte = Expression::NumberLiteral(Loc::Codegen, Type::Int(32), BigInt::from(20));
+    let var = Expression::Variable(Loc::Codegen, Type::Int(32), 3);
+    let expr = Expression::Add(
+        Loc::Codegen,
+        Type::Int(32),
+        true,
+        Box::new(cte.clone()),
+        Box::new(var.clone()),
+    );
 
     let instr = Instr::ValueTransfer {
         success: None,
@@ -72,7 +82,13 @@ fn add_commutative() {
         value: expr.clone(),
     };
 
-    let expr_other = Expression::Or(Loc::Codegen, Box::new(var), Box::new(cte));
+    let expr_other = Expression::Add(
+        Loc::Codegen,
+        Type::Int(32),
+        true,
+        Box::new(var),
+        Box::new(cte),
+    );
 
     let mut ave = AvailableExpression::default();
     let mut set = AvailableExpressionSet::default();
@@ -205,7 +221,7 @@ fn invalid() {
 #[test]
 fn complex_expression() {
     let var = Expression::Variable(Loc::Codegen, Type::Int(8), 2);
-    let cte = Expression::ConstantVariable(Loc::Codegen, Type::Int(8), Some(2), 3);
+    let cte = Expression::NumberLiteral(Loc::Codegen, Type::Int(8), BigInt::from(3));
     let arg = Expression::FunctionArg(Loc::Codegen, Type::Int(9), 5);
 
     let sum = Expression::Add(
@@ -222,7 +238,7 @@ fn complex_expression() {
         Box::new(cte.clone()),
         Box::new(arg.clone()),
     );
-    let div = Expression::Divide(
+    let div = Expression::SignedDivide(
         Loc::Codegen,
         Type::Int(8),
         Box::new(sum.clone()),
@@ -243,7 +259,7 @@ fn complex_expression() {
         Box::new(div.clone()),
         true,
     );
-    let modu = Expression::Modulo(
+    let modu = Expression::SignedModulo(
         Loc::Codegen,
         Type::Int(8),
         Box::new(cte.clone()),
@@ -343,7 +359,7 @@ fn string() {
 #[test]
 fn kill() {
     let var = Expression::Variable(Loc::Codegen, Type::Int(8), 2);
-    let cte = Expression::ConstantVariable(Loc::Codegen, Type::Int(8), Some(2), 3);
+    let cte = Expression::NumberLiteral(Loc::Codegen, Type::Int(8), BigInt::from(3));
     let arg = Expression::FunctionArg(Loc::Codegen, Type::Int(9), 5);
 
     let sum = Expression::Add(
@@ -360,7 +376,7 @@ fn kill() {
         Box::new(cte.clone()),
         Box::new(arg.clone()),
     );
-    let div = Expression::Divide(
+    let div = Expression::SignedDivide(
         Loc::Codegen,
         Type::Int(8),
         Box::new(sum.clone()),
@@ -381,7 +397,7 @@ fn kill() {
         Box::new(div.clone()),
         true,
     );
-    let modu = Expression::Modulo(
+    let modu = Expression::SignedModulo(
         Loc::Codegen,
         Type::Int(8),
         Box::new(cte.clone()),
@@ -432,7 +448,7 @@ fn kill() {
 #[test]
 fn clone() {
     let var = Expression::Variable(Loc::Codegen, Type::Int(8), 2);
-    let cte = Expression::ConstantVariable(Loc::Codegen, Type::Int(8), Some(2), 3);
+    let cte = Expression::NumberLiteral(Loc::Codegen, Type::Int(8), BigInt::from(3));
     let arg = Expression::FunctionArg(Loc::Codegen, Type::Int(9), 5);
 
     let sum = Expression::Add(
@@ -449,7 +465,7 @@ fn clone() {
         Box::new(cte.clone()),
         Box::new(arg.clone()),
     );
-    let div = Expression::Divide(
+    let div = Expression::SignedDivide(
         Loc::Codegen,
         Type::Int(8),
         Box::new(sum.clone()),
@@ -470,7 +486,7 @@ fn clone() {
         Box::new(div.clone()),
         true,
     );
-    let modu = Expression::Modulo(
+    let modu = Expression::SignedModulo(
         Loc::Codegen,
         Type::Int(8),
         Box::new(cte.clone()),
@@ -519,7 +535,7 @@ fn clone() {
 #[test]
 fn intersect() {
     let var = Expression::Variable(Loc::Codegen, Type::Int(8), 1);
-    let cte = Expression::ConstantVariable(Loc::Codegen, Type::Int(8), Some(2), 3);
+    let cte = Expression::NumberLiteral(Loc::Codegen, Type::Int(8), BigInt::from(3));
     let arg = Expression::FunctionArg(Loc::Codegen, Type::Int(9), 5);
 
     let sum = Expression::Add(
@@ -536,7 +552,7 @@ fn intersect() {
         Box::new(cte.clone()),
         Box::new(arg.clone()),
     );
-    let div = Expression::Divide(
+    let div = Expression::SignedDivide(
         Loc::Codegen,
         Type::Int(8),
         Box::new(sum.clone()),
@@ -557,7 +573,7 @@ fn intersect() {
         Box::new(div.clone()),
         true,
     );
-    let modu = Expression::Modulo(
+    let modu = Expression::SignedModulo(
         Loc::Codegen,
         Type::Int(8),
         Box::new(cte.clone()),
@@ -591,10 +607,16 @@ fn intersect() {
     let mut ave = AvailableExpression::default();
     let mut set = AvailableExpressionSet::default();
     let mut cst = CommonSubExpressionTracker::default();
+    let cfg_dag = vec![vec![1, 2], vec![], vec![1]];
+    cst.set_dag(cfg_dag);
 
+    ave.set_cur_block(0);
+    cst.set_cur_block(0);
     set.process_instruction(&instr, &mut ave, &mut cst);
     set.process_instruction(&instr2, &mut ave, &mut cst);
-    let mut set_2 = set.clone_for_parent_block(1);
+    let mut set_2 = set.clone_for_parent_block(0);
+    cst.set_cur_block(2);
+    ave.set_cur_block(2);
     set.kill(1);
 
     let sum2 = Expression::Add(
@@ -620,9 +642,11 @@ fn intersect() {
     };
 
     set.process_instruction(&instr3, &mut ave, &mut cst);
+    cst.set_cur_block(1);
+    ave.set_cur_block(1);
     set_2.process_instruction(&instr3, &mut ave, &mut cst);
 
-    set_2.intersect_sets(&set);
+    set_2.intersect_sets(&set, &cst);
 
     // Available expressions
     assert!(set_2.find_expression(&unary).is_some());

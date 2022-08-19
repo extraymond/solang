@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::cfg::{BasicBlock, ControlFlowGraph, Instr};
 use super::reaching_definitions::{Def, Transfer};
-use crate::sema::ast::{Expression, Namespace, Type};
+use crate::codegen::cfg::ASTFunction;
+use crate::codegen::Expression;
+use crate::sema::ast::{Namespace, Type};
 use indexmap::IndexMap;
 use std::collections::HashSet;
 
@@ -71,14 +75,19 @@ fn find_writable_vectors(
 
                 apply_transfers(&block.transfers[instr_no], vars, writable);
             }
-            Instr::Store { pos, .. } => {
-                if let Some(entry) = vars.get_mut(pos) {
-                    writable.extend(entry.keys());
+            Instr::Store { data, .. } => {
+                if let Expression::Variable(_, _, var_no) = data {
+                    if let Some(entry) = vars.get_mut(var_no) {
+                        writable.extend(entry.keys());
+                    }
                 }
 
                 apply_transfers(&block.transfers[instr_no], vars, writable);
             }
-            Instr::WriteBuffer { buf, .. } => {
+            Instr::MemCopy {
+                destination: buf, ..
+            }
+            | Instr::WriteBuffer { buf, .. } => {
                 if let Expression::Variable(_, _, var_no) = buf {
                     if let Some(entry) = vars.get_mut(var_no) {
                         writable.extend(entry.keys());
@@ -162,13 +171,16 @@ fn update_vectors_to_slice(
 
     for block_no in 0..cfg.blocks.len() {
         for instr_no in 0..cfg.blocks[block_no].instr.len() {
-            let cur = Def { block_no, instr_no };
-
             if let Instr::Set {
                 expr: Expression::AllocDynamicArray(..),
                 ..
             } = &cfg.blocks[block_no].instr[instr_no]
             {
+                let cur = Def {
+                    block_no,
+                    instr_no,
+                    assignment_no: 0,
+                };
                 if !writable.contains(&cur) {
                     defs_to_be_updated.insert(cur);
                 }
@@ -209,13 +221,13 @@ fn update_vectors_to_slice(
                 res,
                 expr: Expression::AllocDynamicArray(
                     *loc,
-                    Type::Slice,
+                    Type::Slice(Box::new(Type::Bytes(1))),
                     len.clone(),
                     Some(bs.clone()),
                 ),
             };
 
-            if let Some(function_no) = cfg.function_no {
+            if let ASTFunction::SolidityFunction(function_no) = cfg.function_no {
                 if let Some(var) = ns.functions[function_no].symtable.vars.get_mut(&res) {
                     var.slice = true;
                 }

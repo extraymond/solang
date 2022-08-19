@@ -1,90 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{account_new, build_solidity, AccountState};
 use ethabi::{ethereum_types::U256, Function, StateMutability, Token};
-
-#[test]
-fn msg_value() {
-    let mut vm = build_solidity(
-        r#"
-        contract c {
-            function test() public payable returns (uint64) {
-                return msg.value * 3;
-            }
-        }"#,
-    );
-
-    vm.constructor("c", &[], 0);
-
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
-
-    let returns = vm.function("test", &[], &[], 102, None);
-
-    assert_eq!(returns[0], Token::Uint(U256::from(306)));
-
-    assert_eq!(vm.account_data[&vm.origin].lamports, 312 - 102);
-    assert_eq!(vm.account_data[&vm.stack[0].data].lamports, 102);
-}
-
-#[test]
-fn msg_value_not_enough() {
-    let mut vm = build_solidity(
-        r#"
-        contract c {
-            function test() public payable {}
-        }"#,
-    );
-
-    vm.constructor("c", &[], 0);
-
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 5;
-
-    let res = vm.function_must_fail("test", &[], &[], 102, None);
-    assert!(res.is_err());
-}
-
-#[test]
-#[should_panic]
-fn default_constructor_not_payable() {
-    let mut vm = build_solidity(r#"contract c {}"#);
-
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 2;
-
-    vm.constructor("c", &[], 1);
-}
-
-#[test]
-#[should_panic]
-fn constructor_not_payable() {
-    let mut vm = build_solidity(
-        r#"
-        contract c {
-            constructor () {}
-        }
-    "#,
-    );
-
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 2;
-
-    vm.constructor("c", &[], 1);
-}
-
-#[test]
-fn function_not_payable() {
-    let mut vm = build_solidity(
-        r#"
-        contract c {
-            function test() public {}
-        }
-    "#,
-    );
-
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 200;
-
-    vm.constructor("c", &[], 0);
-
-    let res = vm.function_must_fail("test", &[], &[], 102, None);
-
-    assert_eq!(res.ok(), Some(4294967296));
-}
 
 #[test]
 fn get_balance() {
@@ -97,7 +14,7 @@ fn get_balance() {
         }"#,
     );
 
-    vm.constructor("c", &[], 0);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -110,7 +27,7 @@ fn get_balance() {
         },
     );
 
-    let returns = vm.function("test", &[], &[], 0, Some(&new));
+    let returns = vm.function("test", &[], &[], Some(&new));
 
     assert_eq!(returns, vec![Token::Uint(U256::from(102))]);
 }
@@ -126,7 +43,7 @@ fn send_fails() {
         }"#,
     );
 
-    vm.constructor("c", &[], 0);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -146,7 +63,6 @@ fn send_fails() {
             Token::Uint(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -166,9 +82,9 @@ fn send_succeeds() {
         }"#,
     );
 
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
+    vm.account_data.get_mut(&vm.stack[0].data).unwrap().lamports = 103;
 
-    vm.constructor("c", &[], 103);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -188,16 +104,10 @@ fn send_succeeds() {
             Token::Uint(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
     assert_eq!(returns, vec![Token::Bool(true)]);
-
-    assert_eq!(
-        vm.account_data.get_mut(&vm.origin).unwrap().lamports,
-        312 - 103
-    );
 
     assert_eq!(vm.account_data.get_mut(&new).unwrap().lamports, 107);
 
@@ -212,17 +122,15 @@ fn send_overflows() {
     let mut vm = build_solidity(
         r#"
         contract c {
-            constructor() payable {}
-
             function send(address payable addr, uint64 amount) public returns (bool) {
                 return addr.send(amount);
             }
         }"#,
     );
 
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
+    vm.account_data.get_mut(&vm.stack[0].data).unwrap().lamports = 103;
 
-    vm.constructor("c", &[], 103);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -242,16 +150,10 @@ fn send_overflows() {
             Token::Uint(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
     assert_eq!(returns, vec![Token::Bool(false)]);
-
-    assert_eq!(
-        vm.account_data.get_mut(&vm.origin).unwrap().lamports,
-        312 - 103
-    );
 
     assert_eq!(
         vm.account_data.get_mut(&new).unwrap().lamports,
@@ -269,17 +171,15 @@ fn transfer_succeeds() {
     let mut vm = build_solidity(
         r#"
         contract c {
-            constructor() payable {}
-
             function transfer(address payable addr, uint64 amount) public {
                 addr.transfer(amount);
             }
         }"#,
     );
 
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
+    vm.account_data.get_mut(&vm.stack[0].data).unwrap().lamports = 103;
 
-    vm.constructor("c", &[], 103);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -299,13 +199,7 @@ fn transfer_succeeds() {
             Token::Uint(U256::from(102)),
         ],
         &[],
-        0,
         None,
-    );
-
-    assert_eq!(
-        vm.account_data.get_mut(&vm.origin).unwrap().lamports,
-        312 - 103
     );
 
     assert_eq!(vm.account_data.get_mut(&new).unwrap().lamports, 107);
@@ -321,17 +215,15 @@ fn transfer_fails_not_enough() {
     let mut vm = build_solidity(
         r#"
         contract c {
-            constructor() payable {}
-
             function transfer(address payable addr, uint64 amount) public {
                 addr.transfer(amount);
             }
         }"#,
     );
 
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
+    vm.account_data.get_mut(&vm.stack[0].data).unwrap().lamports = 103;
 
-    vm.constructor("c", &[], 103);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -351,7 +243,6 @@ fn transfer_fails_not_enough() {
             Token::Uint(U256::from(104)),
         ],
         &[],
-        0,
         None,
     );
     assert!(res.is_err());
@@ -370,9 +261,9 @@ fn transfer_fails_overflow() {
         }"#,
     );
 
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
+    vm.account_data.get_mut(&vm.stack[0].data).unwrap().lamports = 103;
 
-    vm.constructor("c", &[], 103);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -392,30 +283,25 @@ fn transfer_fails_overflow() {
             Token::Uint(U256::from(104)),
         ],
         &[],
-        0,
         None,
     );
     assert!(res.is_err());
 }
 
 #[test]
-fn receive() {
+fn fallback() {
     let mut vm = build_solidity(
         r#"
         contract c {
             fallback() external {
                 print("fallback");
             }
-
-            receive() external payable {
-                print("receive");
-            }
         }"#,
     );
 
     vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
 
-    vm.constructor("c", &[], 0);
+    vm.constructor("c", &[]);
 
     if let Some(abi) = &vm.stack[0].abi {
         let mut abi = abi.clone();
@@ -427,7 +313,7 @@ fn receive() {
                 name: "extinct".to_string(),
                 inputs: vec![],
                 outputs: vec![],
-                constant: false,
+                constant: None,
                 state_mutability: StateMutability::Payable,
             }],
         );
@@ -435,15 +321,9 @@ fn receive() {
         vm.stack[0].abi = Some(abi);
     }
 
-    vm.function("extinct", &[], &[], 0, None);
+    vm.function("extinct", &[], &[], None);
 
     assert_eq!(vm.logs, "fallback");
-
-    vm.logs.truncate(0);
-
-    vm.function("extinct", &[], &[], 10, None);
-
-    assert_eq!(vm.logs, "receive");
 }
 
 #[test]
@@ -459,9 +339,9 @@ fn value_overflows() {
         }"#,
     );
 
-    vm.account_data.get_mut(&vm.origin).unwrap().lamports = 312;
+    vm.account_data.get_mut(&vm.stack[0].data).unwrap().lamports = 103;
 
-    vm.constructor("c", &[], 103);
+    vm.constructor("c", &[]);
 
     let new = account_new();
 
@@ -481,7 +361,6 @@ fn value_overflows() {
             Token::Uint(U256::from(u64::MAX as u128 + 1)),
         ],
         &[],
-        0,
         None,
     );
     assert_eq!(res.ok(), Some(4294967296));
@@ -493,7 +372,6 @@ fn value_overflows() {
             Token::Uint(U256::from(u128::MAX)),
         ],
         &[],
-        0,
         None,
     );
     assert_eq!(res.ok(), Some(4294967296));
@@ -505,16 +383,10 @@ fn value_overflows() {
             Token::Uint(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
     assert_eq!(returns, vec![Token::Bool(false)]);
-
-    assert_eq!(
-        vm.account_data.get_mut(&vm.origin).unwrap().lamports,
-        312 - 103
-    );
 
     assert_eq!(
         vm.account_data.get_mut(&new).unwrap().lamports,

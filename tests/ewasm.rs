@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use ethabi::{decode, ethereum_types, RawLog, Token};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
@@ -11,7 +13,7 @@ use tiny_keccak::{Hasher, Keccak};
 use wasmi::memory_units::Pages;
 use wasmi::*;
 
-use solang::{compile, file_resolver::FileResolver, sema::diagnostics, Target};
+use solang::{compile, file_resolver::FileResolver, Target};
 
 mod ewasm_tests;
 
@@ -76,6 +78,7 @@ pub enum Extern {
     revert,
     printMem,
     getCodeSize,
+    getExternalCodeSize,
     codeCopy,
     create,
     call,
@@ -89,7 +92,7 @@ pub enum Extern {
     log,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HostCodeFinish {}
 
 impl HostError for HostCodeFinish {}
@@ -100,7 +103,7 @@ impl fmt::Display for HostCodeFinish {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HostCodeRevert {}
 
 impl fmt::Display for HostCodeRevert {
@@ -564,6 +567,21 @@ impl Externals for TestRuntime {
 
                 Ok(None)
             }
+            Some(Extern::getExternalCodeSize) => {
+                let address_ptr: u32 = args.nth_checked(0)?;
+
+                let mut addr = [0u8; 20];
+
+                if let Err(e) = self.vm.memory.get_into(address_ptr, &mut addr) {
+                    panic!("getExternalCodeSize: {}", e);
+                }
+
+                let size = self.accounts.get(&addr).map(|a| a.0.len()).unwrap();
+
+                println!("getExternalCodeSize: {} {}", hex::encode(&addr), size);
+
+                Ok(Some(RuntimeValue::I32(size as i32)))
+            }
             _ => panic!("external {} unknown", index),
         }
     }
@@ -590,6 +608,7 @@ impl ModuleImportResolver for TestRuntime {
             "getAddress" => Extern::getAddress,
             "getExternalBalance" => Extern::getExternalBalance,
             "selfDestruct" => Extern::selfDestruct,
+            "getExternalCodeSize" => Extern::getExternalCodeSize,
             "log" => Extern::log,
             _ => {
                 panic!("{} not implemented", field_name);
@@ -823,7 +842,7 @@ fn build_solidity(src: &str) -> TestRuntime {
         false,
     );
 
-    diagnostics::print_diagnostics_plain(&cache, &ns, false);
+    ns.print_diagnostics_in_plain(&cache, false);
 
     for v in &res {
         println!("contract size:{}", v.0.len());
@@ -2284,7 +2303,7 @@ fn selfdestruct() {
             }
 
             function step2() public {
-                o.goaway(payable(address(this)));
+                bool foo = o.goaway(payable(address(this)));
             }
         }"##,
     );

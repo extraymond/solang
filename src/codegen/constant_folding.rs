@@ -1,11 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::cfg::{ControlFlowGraph, Instr};
 use super::reaching_definitions;
-use crate::parser::pt::Loc;
-use crate::sema::ast::{Builtin, Diagnostic, Expression, Namespace, StringLocation, Type};
+use crate::codegen::{Builtin, Expression};
+use crate::sema::ast::RetrieveType;
+use crate::sema::ast::{Diagnostic, Namespace, StringLocation, Type};
 use num_bigint::{BigInt, Sign};
 use num_traits::{ToPrimitive, Zero};
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
+use solang_parser::pt::Loc;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Rem, Shl, Shr, Sub};
 use tiny_keccak::{Hasher, Keccak};
 
@@ -18,11 +22,9 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
         let mut vars = cfg.blocks[block_no].defs.clone();
 
         for instr_no in 0..cfg.blocks[block_no].instr.len() {
-            let cur = reaching_definitions::Def { block_no, instr_no };
-
             match &cfg.blocks[block_no].instr[instr_no] {
                 Instr::Set { loc, res, expr, .. } => {
-                    let (expr, expr_constant) = expression(expr, Some(&vars), &cur, cfg, ns);
+                    let (expr, expr_constant) = expression(expr, Some(&vars), cfg, ns);
 
                     if expr_constant {
                         ns.var_constants.insert(*loc, expr.clone());
@@ -42,7 +44,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                 } => {
                     let args = args
                         .iter()
-                        .map(|e| expression(e, Some(&vars), &cur, cfg, ns).0)
+                        .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::Call {
@@ -55,7 +57,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                 Instr::Return { value } => {
                     let value = value
                         .iter()
-                        .map(|e| expression(e, Some(&vars), &cur, cfg, ns).0)
+                        .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::Return { value };
@@ -65,7 +67,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     true_block,
                     false_block,
                 } => {
-                    let (cond, _) = expression(cond, Some(&vars), &cur, cfg, ns);
+                    let (cond, _) = expression(cond, Some(&vars), cfg, ns);
 
                     if let Expression::BoolLiteral(_, cond) = cond {
                         cfg.blocks[block_no].instr[instr_no] = Instr::Branch {
@@ -79,24 +81,25 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                         };
                     }
                 }
-                Instr::Store { dest, pos } => {
-                    let (dest, _) = expression(dest, Some(&vars), &cur, cfg, ns);
+                Instr::Store { dest, data } => {
+                    let (dest, _) = expression(dest, Some(&vars), cfg, ns);
+                    let (data, _) = expression(data, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::Store { dest, pos: *pos };
+                    cfg.blocks[block_no].instr[instr_no] = Instr::Store { dest, data };
                 }
                 Instr::AssertFailure { expr: Some(expr) } => {
-                    let (expr, _) = expression(expr, Some(&vars), &cur, cfg, ns);
+                    let (expr, _) = expression(expr, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] =
                         Instr::AssertFailure { expr: Some(expr) };
                 }
                 Instr::Print { expr } => {
-                    let (expr, _) = expression(expr, Some(&vars), &cur, cfg, ns);
+                    let (expr, _) = expression(expr, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::Print { expr };
                 }
                 Instr::ClearStorage { ty, storage } => {
-                    let (storage, _) = expression(storage, Some(&vars), &cur, cfg, ns);
+                    let (storage, _) = expression(storage, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::ClearStorage {
                         ty: ty.clone(),
@@ -104,8 +107,8 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     };
                 }
                 Instr::SetStorage { ty, storage, value } => {
-                    let (storage, _) = expression(storage, Some(&vars), &cur, cfg, ns);
-                    let (value, _) = expression(value, Some(&vars), &cur, cfg, ns);
+                    let (storage, _) = expression(storage, Some(&vars), cfg, ns);
+                    let (value, _) = expression(value, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::SetStorage {
                         ty: ty.clone(),
@@ -114,7 +117,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     };
                 }
                 Instr::LoadStorage { ty, storage, res } => {
-                    let (storage, _) = expression(storage, Some(&vars), &cur, cfg, ns);
+                    let (storage, _) = expression(storage, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::LoadStorage {
                         ty: ty.clone(),
@@ -127,9 +130,9 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     value,
                     offset,
                 } => {
-                    let (storage, _) = expression(storage, Some(&vars), &cur, cfg, ns);
-                    let (value, _) = expression(value, Some(&vars), &cur, cfg, ns);
-                    let (offset, _) = expression(offset, Some(&vars), &cur, cfg, ns);
+                    let (storage, _) = expression(storage, Some(&vars), cfg, ns);
+                    let (value, _) = expression(value, Some(&vars), cfg, ns);
+                    let (offset, _) = expression(offset, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::SetStorageBytes {
                         storage,
@@ -143,10 +146,10 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     storage,
                     value,
                 } => {
-                    let (storage, _) = expression(storage, Some(&vars), &cur, cfg, ns);
+                    let (storage, _) = expression(storage, Some(&vars), cfg, ns);
                     let value = value
                         .as_ref()
-                        .map(|expr| expression(expr, Some(&vars), &cur, cfg, ns).0);
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::PushStorage {
                         res: *res,
@@ -156,7 +159,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     };
                 }
                 Instr::PopStorage { res, ty, storage } => {
-                    let (storage, _) = expression(storage, Some(&vars), &cur, cfg, ns);
+                    let (storage, _) = expression(storage, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::PopStorage {
                         res: *res,
@@ -170,7 +173,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     array,
                     value,
                 } => {
-                    let (value, _) = expression(value, Some(&vars), &cur, cfg, ns);
+                    let (value, _) = expression(value, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::PushMemory {
                         res: *res,
@@ -192,18 +195,18 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                 } => {
                     let args = args
                         .iter()
-                        .map(|e| expression(e, Some(&vars), &cur, cfg, ns).0)
+                        .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
                     let value = value
                         .as_ref()
-                        .map(|expr| expression(expr, Some(&vars), &cur, cfg, ns).0);
-                    let gas = expression(gas, Some(&vars), &cur, cfg, ns).0;
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
+                    let gas = expression(gas, Some(&vars), cfg, ns).0;
                     let salt = salt
                         .as_ref()
-                        .map(|expr| expression(expr, Some(&vars), &cur, cfg, ns).0);
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
                     let space = space
                         .as_ref()
-                        .map(|expr| expression(expr, Some(&vars), &cur, cfg, ns).0);
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::Constructor {
                         success: *success,
@@ -223,18 +226,28 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     payload,
                     value,
                     gas,
+                    accounts,
+                    seeds,
                     callty,
                 } => {
-                    let value = expression(value, Some(&vars), &cur, cfg, ns).0;
-                    let gas = expression(gas, Some(&vars), &cur, cfg, ns).0;
-                    let payload = expression(payload, Some(&vars), &cur, cfg, ns).0;
+                    let value = expression(value, Some(&vars), cfg, ns).0;
+                    let gas = expression(gas, Some(&vars), cfg, ns).0;
+                    let payload = expression(payload, Some(&vars), cfg, ns).0;
                     let address = address
                         .as_ref()
-                        .map(|expr| expression(expr, Some(&vars), &cur, cfg, ns).0);
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
+                    let accounts = accounts
+                        .as_ref()
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
+                    let seeds = seeds
+                        .as_ref()
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::ExternalCall {
                         success: *success,
                         address,
+                        accounts,
+                        seeds,
                         payload,
                         value,
                         gas,
@@ -248,7 +261,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     tys,
                     data,
                 } => {
-                    let (data, _) = expression(data, Some(&vars), &cur, cfg, ns);
+                    let (data, _) = expression(data, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::AbiDecode {
                         res: res.clone(),
@@ -259,7 +272,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     }
                 }
                 Instr::SelfDestruct { recipient } => {
-                    let (recipient, _) = expression(recipient, Some(&vars), &cur, cfg, ns);
+                    let (recipient, _) = expression(recipient, Some(&vars), cfg, ns);
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::SelfDestruct { recipient };
                 }
@@ -272,12 +285,12 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                 } => {
                     let data = data
                         .iter()
-                        .map(|e| expression(e, Some(&vars), &cur, cfg, ns).0)
+                        .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
 
                     let topics = topics
                         .iter()
-                        .map(|e| expression(e, Some(&vars), &cur, cfg, ns).0)
+                        .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
 
                     cfg.blocks[block_no].instr[instr_no] = Instr::EmitEvent {
@@ -306,14 +319,13 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
 fn expression(
     expr: &Expression,
     vars: Option<&reaching_definitions::VarDefs>,
-    pos: &reaching_definitions::Def,
     cfg: &ControlFlowGraph,
     ns: &mut Namespace,
 ) -> (Expression, bool) {
     match expr {
         Expression::Add(loc, ty, unchecked, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -333,8 +345,8 @@ fn expression(
             }
         }
         Expression::Subtract(loc, ty, unchecked, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -353,9 +365,27 @@ fn expression(
                 )
             }
         }
+        Expression::AdvancePointer {
+            loc,
+            ty,
+            pointer,
+            bytes_offset: offset,
+        } => {
+            // Only the offset can be simplified
+            let offset = expression(offset, vars, cfg, ns);
+            (
+                Expression::AdvancePointer {
+                    loc: *loc,
+                    ty: ty.clone(),
+                    pointer: pointer.clone(),
+                    bytes_offset: Box::new(offset.0),
+                },
+                offset.1,
+            )
+        }
         Expression::Multiply(loc, ty, unchecked, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -375,8 +405,8 @@ fn expression(
             }
         }
         Expression::BitwiseAnd(loc, ty, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -390,8 +420,8 @@ fn expression(
             }
         }
         Expression::BitwiseOr(loc, ty, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -405,8 +435,8 @@ fn expression(
             }
         }
         Expression::BitwiseXor(loc, ty, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -420,8 +450,8 @@ fn expression(
             }
         }
         Expression::ShiftLeft(loc, ty, left_expr, right_expr) => {
-            let left = expression(left_expr, vars, pos, cfg, ns);
-            let right = expression(right_expr, vars, pos, cfg, ns);
+            let left = expression(left_expr, vars, cfg, ns);
+            let right = expression(right_expr, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -443,8 +473,8 @@ fn expression(
             )
         }
         Expression::ShiftRight(loc, ty, left_expr, right_expr, signed) => {
-            let left = expression(left_expr, vars, pos, cfg, ns);
-            let right = expression(right_expr, vars, pos, cfg, ns);
+            let left = expression(left_expr, vars, cfg, ns);
+            let right = expression(right_expr, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -473,8 +503,8 @@ fn expression(
             )
         }
         Expression::Power(loc, ty, unchecked, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let (Expression::NumberLiteral(_, _, left), Expression::NumberLiteral(_, _, right)) =
                 (&left.0, &right.0)
@@ -502,9 +532,10 @@ fn expression(
                 left.1 && right.1,
             )
         }
-        Expression::Divide(loc, ty, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+        Expression::UnsignedDivide(loc, ty, left, right)
+        | Expression::SignedDivide(loc, ty, left, right) => {
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let Expression::NumberLiteral(_, _, right) = &right.0 {
                 if right.is_zero() {
@@ -514,15 +545,24 @@ fn expression(
                     return bigint_to_expression(loc, ty, left.div(right));
                 }
             }
-
             (
-                Expression::Divide(*loc, ty.clone(), Box::new(left.0), Box::new(right.0)),
+                if matches!(expr, Expression::SignedDivide(..)) {
+                    Expression::SignedDivide(*loc, ty.clone(), Box::new(left.0), Box::new(right.0))
+                } else {
+                    Expression::UnsignedDivide(
+                        *loc,
+                        ty.clone(),
+                        Box::new(left.0),
+                        Box::new(right.0),
+                    )
+                },
                 left.1 && right.1,
             )
         }
-        Expression::Modulo(loc, ty, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+        Expression::SignedModulo(loc, ty, left, right)
+        | Expression::UnsignedModulo(loc, ty, left, right) => {
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             if let Expression::NumberLiteral(_, _, right) = &right.0 {
                 if right.is_zero() {
@@ -534,12 +574,21 @@ fn expression(
             }
 
             (
-                Expression::Modulo(*loc, ty.clone(), Box::new(left.0), Box::new(right.0)),
+                if matches!(expr, Expression::SignedModulo(..)) {
+                    Expression::SignedModulo(*loc, ty.clone(), Box::new(left.0), Box::new(right.0))
+                } else {
+                    Expression::UnsignedModulo(
+                        *loc,
+                        ty.clone(),
+                        Box::new(left.0),
+                        Box::new(right.0),
+                    )
+                },
                 left.1 && right.1,
             )
         }
         Expression::ZeroExt(loc, ty, expr) => {
-            let expr = expression(expr, vars, pos, cfg, ns);
+            let expr = expression(expr, vars, cfg, ns);
             if let Expression::NumberLiteral(_, _, n) = expr.0 {
                 (Expression::NumberLiteral(*loc, ty.clone(), n), true)
             } else {
@@ -550,7 +599,7 @@ fn expression(
             }
         }
         Expression::SignExt(loc, ty, expr) => {
-            let expr = expression(expr, vars, pos, cfg, ns);
+            let expr = expression(expr, vars, cfg, ns);
             if let Expression::NumberLiteral(_, _, n) = expr.0 {
                 (Expression::NumberLiteral(*loc, ty.clone(), n), true)
             } else {
@@ -561,7 +610,7 @@ fn expression(
             }
         }
         Expression::Trunc(loc, ty, expr) => {
-            let expr = expression(expr, vars, pos, cfg, ns);
+            let expr = expression(expr, vars, cfg, ns);
             if let Expression::NumberLiteral(_, _, n) = expr.0 {
                 bigint_to_expression(loc, ty, n)
             } else {
@@ -572,7 +621,7 @@ fn expression(
             }
         }
         Expression::Complement(loc, ty, expr) => {
-            let expr = expression(expr, vars, pos, cfg, ns);
+            let expr = expression(expr, vars, cfg, ns);
             if let Expression::NumberLiteral(_, _, n) = expr.0 {
                 bigint_to_expression(loc, ty, !n)
             } else {
@@ -583,7 +632,7 @@ fn expression(
             }
         }
         Expression::UnaryMinus(loc, ty, expr) => {
-            let expr = expression(expr, vars, pos, cfg, ns);
+            let expr = expression(expr, vars, cfg, ns);
             if let Expression::NumberLiteral(_, _, n) = expr.0 {
                 bigint_to_expression(loc, ty, -n)
             } else {
@@ -602,7 +651,7 @@ fn expression(
 
                         for def in defs.keys() {
                             if let Some(expr) = get_definition(def, cfg) {
-                                let expr = expression(expr, None, pos, cfg, ns);
+                                let expr = expression(expr, None, cfg, ns);
 
                                 if expr.1 {
                                     if let Some(last) = &v {
@@ -636,7 +685,7 @@ fn expression(
             (expr.clone(), false)
         }
         Expression::Builtin(loc, tys, Builtin::Keccak256, args) => {
-            let arg = expression(&args[0], vars, pos, cfg, ns);
+            let arg = expression(&args[0], vars, cfg, ns);
 
             if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
                 let mut hasher = Keccak::v256();
@@ -656,7 +705,7 @@ fn expression(
             }
         }
         Expression::Builtin(loc, tys, Builtin::Ripemd160, args) => {
-            let arg = expression(&args[0], vars, pos, cfg, ns);
+            let arg = expression(&args[0], vars, cfg, ns);
 
             if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
                 let mut hasher = Ripemd160::new();
@@ -675,7 +724,7 @@ fn expression(
             }
         }
         Expression::Builtin(loc, tys, Builtin::Blake2_256, args) => {
-            let arg = expression(&args[0], vars, pos, cfg, ns);
+            let arg = expression(&args[0], vars, cfg, ns);
 
             if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
                 let hash = blake2_rfc::blake2b::blake2b(32, &[], &bs);
@@ -692,7 +741,7 @@ fn expression(
             }
         }
         Expression::Builtin(loc, tys, Builtin::Blake2_128, args) => {
-            let arg = expression(&args[0], vars, pos, cfg, ns);
+            let arg = expression(&args[0], vars, cfg, ns);
 
             if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
                 let hash = blake2_rfc::blake2b::blake2b(16, &[], &bs);
@@ -709,7 +758,7 @@ fn expression(
             }
         }
         Expression::Builtin(loc, tys, Builtin::Sha256, args) => {
-            let arg = expression(&args[0], vars, pos, cfg, ns);
+            let arg = expression(&args[0], vars, cfg, ns);
 
             if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
                 let mut hasher = Sha256::new();
@@ -738,7 +787,7 @@ fn expression(
             let args = args
                 .iter()
                 .map(|expr| {
-                    let (expr, _) = expression(expr, vars, pos, cfg, ns);
+                    let (expr, _) = expression(expr, vars, cfg, ns);
 
                     if all_constant {
                         match &expr {
@@ -760,6 +809,9 @@ fn expression(
                                         while (*n as usize) < bs.len() {
                                             bs.insert(0, 0);
                                         }
+                                    }
+                                    Type::Address(_) => {
+                                        bs.resize(ns.address_length, 0);
                                     }
                                     _ => unreachable!(),
                                 }
@@ -791,7 +843,7 @@ fn expression(
         Expression::StructLiteral(loc, ty, args) => {
             let args = args
                 .iter()
-                .map(|expr| expression(expr, vars, pos, cfg, ns).0)
+                .map(|expr| expression(expr, vars, cfg, ns).0)
                 .collect();
 
             (Expression::StructLiteral(*loc, ty.clone(), args), false)
@@ -799,7 +851,7 @@ fn expression(
         Expression::ArrayLiteral(loc, ty, lengths, args) => {
             let args = args
                 .iter()
-                .map(|expr| expression(expr, vars, pos, cfg, ns).0)
+                .map(|expr| expression(expr, vars, cfg, ns).0)
                 .collect();
 
             (
@@ -810,7 +862,7 @@ fn expression(
         Expression::ConstArrayLiteral(loc, ty, lengths, args) => {
             let args = args
                 .iter()
-                .map(|expr| expression(expr, vars, pos, cfg, ns).0)
+                .map(|expr| expression(expr, vars, cfg, ns).0)
                 .collect();
 
             (
@@ -819,52 +871,62 @@ fn expression(
             )
         }
         Expression::Load(loc, ty, expr) => {
-            let (expr, _) = expression(expr, vars, pos, cfg, ns);
+            let (expr, _) = expression(expr, vars, cfg, ns);
 
             (Expression::Load(*loc, ty.clone(), Box::new(expr)), false)
         }
-        Expression::StorageLoad(loc, ty, expr) => {
-            let (expr, _) = expression(expr, vars, pos, cfg, ns);
-
-            (
-                Expression::StorageLoad(*loc, ty.clone(), Box::new(expr)),
-                false,
-            )
-        }
         Expression::Cast(loc, ty, expr) => {
-            let (expr, _) = expression(expr, vars, pos, cfg, ns);
+            let (expr, _) = expression(expr, vars, cfg, ns);
 
             (Expression::Cast(*loc, ty.clone(), Box::new(expr)), false)
         }
         Expression::BytesCast(loc, from, to, expr) => {
-            let (expr, _) = expression(expr, vars, pos, cfg, ns);
+            let (expr, _) = expression(expr, vars, cfg, ns);
 
             (
                 Expression::BytesCast(*loc, from.clone(), to.clone(), Box::new(expr)),
                 false,
             )
         }
-        Expression::More(loc, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+        Expression::UnsignedMore(loc, left, right) => {
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             (
-                Expression::More(*loc, Box::new(left.0), Box::new(right.0)),
+                Expression::UnsignedMore(*loc, Box::new(left.0), Box::new(right.0)),
                 false,
             )
         }
-        Expression::Less(loc, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+        Expression::SignedMore(loc, left, right) => {
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             (
-                Expression::Less(*loc, Box::new(left.0), Box::new(right.0)),
+                Expression::SignedMore(*loc, Box::new(left.0), Box::new(right.0)),
+                false,
+            )
+        }
+        Expression::SignedLess(loc, left, right) => {
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
+
+            (
+                Expression::SignedLess(*loc, Box::new(left.0), Box::new(right.0)),
+                false,
+            )
+        }
+        Expression::UnsignedLess(loc, left, right) => {
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
+
+            (
+                Expression::UnsignedLess(*loc, Box::new(left.0), Box::new(right.0)),
                 false,
             )
         }
         Expression::MoreEqual(loc, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             (
                 Expression::MoreEqual(*loc, Box::new(left.0), Box::new(right.0)),
@@ -872,8 +934,8 @@ fn expression(
             )
         }
         Expression::LessEqual(loc, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             (
                 Expression::LessEqual(*loc, Box::new(left.0), Box::new(right.0)),
@@ -881,8 +943,8 @@ fn expression(
             )
         }
         Expression::Equal(loc, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             (
                 Expression::Equal(*loc, Box::new(left.0), Box::new(right.0)),
@@ -890,38 +952,22 @@ fn expression(
             )
         }
         Expression::NotEqual(loc, left, right) => {
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
+            let left = expression(left, vars, cfg, ns);
+            let right = expression(right, vars, cfg, ns);
 
             (
                 Expression::NotEqual(*loc, Box::new(left.0), Box::new(right.0)),
                 false,
             )
         }
-        Expression::Ternary(loc, ty, cond, left, right) => {
-            let cond = expression(cond, vars, pos, cfg, ns);
-            let left = expression(left, vars, pos, cfg, ns);
-            let right = expression(right, vars, pos, cfg, ns);
-
-            (
-                Expression::Ternary(
-                    *loc,
-                    ty.clone(),
-                    Box::new(cond.0),
-                    Box::new(left.0),
-                    Box::new(right.0),
-                ),
-                false,
-            )
-        }
         Expression::Not(loc, expr) => {
-            let expr = expression(expr, vars, pos, cfg, ns);
+            let expr = expression(expr, vars, cfg, ns);
 
             (Expression::Not(*loc, Box::new(expr.0)), expr.1)
         }
         Expression::Subscript(loc, ty, array_ty, array, index) => {
-            let array = expression(array, vars, pos, cfg, ns);
-            let index = expression(index, vars, pos, cfg, ns);
+            let array = expression(array, vars, cfg, ns);
+            let index = expression(index, vars, cfg, ns);
 
             (
                 Expression::Subscript(
@@ -935,7 +981,7 @@ fn expression(
             )
         }
         Expression::StructMember(loc, ty, strct, member) => {
-            let strct = expression(strct, vars, pos, cfg, ns);
+            let strct = expression(strct, vars, cfg, ns);
 
             (
                 Expression::StructMember(*loc, ty.clone(), Box::new(strct.0), *member),
@@ -949,7 +995,7 @@ fn expression(
             array,
             elem_ty,
         } => {
-            let array = expression(array, vars, pos, cfg, ns);
+            let array = expression(array, vars, cfg, ns);
 
             (
                 Expression::StorageArrayLength {
@@ -968,13 +1014,13 @@ fn expression(
                 (Expression::BoolLiteral(*loc, left == right), true)
             } else {
                 let left = if let StringLocation::RunTime(left) = left {
-                    StringLocation::RunTime(Box::new(expression(left, vars, pos, cfg, ns).0))
+                    StringLocation::RunTime(Box::new(expression(left, vars, cfg, ns).0))
                 } else {
                     left.clone()
                 };
 
                 let right = if let StringLocation::RunTime(right) = right {
-                    StringLocation::RunTime(Box::new(expression(right, vars, pos, cfg, ns).0))
+                    StringLocation::RunTime(Box::new(expression(right, vars, cfg, ns).0))
                 } else {
                     right.clone()
                 };
@@ -994,13 +1040,13 @@ fn expression(
                 (Expression::BytesLiteral(*loc, ty.clone(), bs), true)
             } else {
                 let left = if let StringLocation::RunTime(left) = left {
-                    StringLocation::RunTime(Box::new(expression(left, vars, pos, cfg, ns).0))
+                    StringLocation::RunTime(Box::new(expression(left, vars, cfg, ns).0))
                 } else {
                     left.clone()
                 };
 
                 let right = if let StringLocation::RunTime(right) = right {
-                    StringLocation::RunTime(Box::new(expression(right, vars, pos, cfg, ns).0))
+                    StringLocation::RunTime(Box::new(expression(right, vars, cfg, ns).0))
                 } else {
                     right.clone()
                 };
@@ -1014,30 +1060,12 @@ fn expression(
         Expression::Builtin(loc, tys, builtin, args) => {
             let args = args
                 .iter()
-                .map(|expr| expression(expr, vars, pos, cfg, ns).0)
+                .map(|expr| expression(expr, vars, cfg, ns).0)
                 .collect();
 
             (
                 Expression::Builtin(*loc, tys.clone(), *builtin, args),
                 false,
-            )
-        }
-        Expression::ExternalFunction {
-            loc,
-            ty,
-            address,
-            function_no,
-        } => {
-            let address = expression(address, vars, pos, cfg, ns);
-
-            (
-                Expression::ExternalFunction {
-                    loc: *loc,
-                    ty: ty.clone(),
-                    address: Box::new(address.0),
-                    function_no: *function_no,
-                },
-                address.1,
             )
         }
         Expression::AbiEncode {
@@ -1048,11 +1076,11 @@ fn expression(
         } => {
             let packed = packed
                 .iter()
-                .map(|expr| expression(expr, vars, pos, cfg, ns).0)
+                .map(|expr| expression(expr, vars, cfg, ns).0)
                 .collect();
             let args = args
                 .iter()
-                .map(|expr| expression(expr, vars, pos, cfg, ns).0)
+                .map(|expr| expression(expr, vars, cfg, ns).0)
                 .collect();
 
             (

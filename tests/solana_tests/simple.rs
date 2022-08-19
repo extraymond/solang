@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_solidity;
 use ethabi::ethereum_types::U256;
 use solang::{file_resolver::FileResolver, Target};
@@ -18,13 +20,13 @@ fn simple() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     assert_eq!(vm.logs, "Hello from constructor");
 
     vm.logs.truncate(0);
 
-    vm.function("test", &[], &[], 0, None);
+    vm.function("test", &[], &[], None);
 
     assert_eq!(vm.logs, "Hello from function");
 }
@@ -42,7 +44,7 @@ fn format() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     assert_eq!(
         vm.logs,
@@ -67,7 +69,7 @@ fn parameters() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     vm.function(
         "test",
@@ -76,7 +78,6 @@ fn parameters() {
             ethabi::Token::Uint(U256::from(10)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -91,7 +92,6 @@ fn parameters() {
             ethabi::Token::Uint(U256::from(102)),
         ],
         &[],
-        0,
         None,
     );
 
@@ -109,9 +109,9 @@ fn returns() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
-    let returns = vm.function("test", &[ethabi::Token::Uint(U256::from(10))], &[], 0, None);
+    let returns = vm.function("test", &[ethabi::Token::Uint(U256::from(10))], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(100))]);
 
@@ -124,13 +124,12 @@ fn returns() {
         }"#,
     );
 
-    vm.constructor("foo", &[], 0);
+    vm.constructor("foo", &[]);
 
     let returns = vm.function(
         "test",
         &[ethabi::Token::Uint(U256::from(982451653))],
         &[],
-        0,
         None,
     );
 
@@ -169,25 +168,25 @@ fn flipper() {
         }"#,
     );
 
-    vm.constructor("flipper", &[ethabi::Token::Bool(true)], 0);
+    vm.constructor("flipper", &[ethabi::Token::Bool(true)]);
 
     assert_eq!(
         vm.data()[0..17].to_vec(),
         hex::decode("6fc90ec500000000000000001800000001").unwrap()
     );
 
-    let returns = vm.function("get", &[], &[], 0, None);
+    let returns = vm.function("get", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Bool(true)]);
 
-    vm.function("flip", &[], &[], 0, None);
+    vm.function("flip", &[], &[], None);
 
     assert_eq!(
         vm.data()[0..17].to_vec(),
         hex::decode("6fc90ec500000000000000001800000000").unwrap()
     );
 
-    let returns = vm.function("get", &[], &[], 0, None);
+    let returns = vm.function("get", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Bool(false)]);
 }
@@ -223,15 +222,15 @@ fn incrementer() {
         }"#,
     );
 
-    vm.constructor("incrementer", &[ethabi::Token::Uint(U256::from(5))], 0);
+    vm.constructor("incrementer", &[ethabi::Token::Uint(U256::from(5))]);
 
-    let returns = vm.function("get", &[], &[], 0, None);
+    let returns = vm.function("get", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(5))]);
 
-    vm.function("inc", &[ethabi::Token::Uint(U256::from(7))], &[], 0, None);
+    vm.function("inc", &[ethabi::Token::Uint(U256::from(7))], &[], None);
 
-    let returns = vm.function("get", &[], &[], 0, None);
+    let returns = vm.function("get", &[], &[], None);
 
     assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(12))]);
 }
@@ -253,10 +252,59 @@ contract line {
 
     let ns = solang::parse_and_resolve(OsStr::new("test.sol"), &mut cache, Target::Solana);
 
-    solang::sema::diagnostics::print_diagnostics_plain(&cache, &ns, false);
+    ns.print_diagnostics_in_plain(&cache, false);
 
     assert_eq!(
-        ns.diagnostics[1].message,
+        ns.diagnostics.iter().nth(1).unwrap().message,
         "implicit conversion from int to address not allowed"
     );
+}
+
+#[test]
+fn two_arrays() {
+    let mut vm = build_solidity(
+        r#"
+        contract two_arrays {
+            uint[] array1;
+            uint[] array2;
+
+            constructor() {
+                for(uint i = 0; i < 10; i++) {
+                    array1.push((i*uint(sha256("i"))));
+                    array2.push(((i+1)*uint(sha256("i"))));
+               }
+            }
+        }"#,
+    );
+
+    vm.constructor("two_arrays", &[]);
+}
+
+#[test]
+fn dead_storage_bug() {
+    let mut vm = build_solidity(
+        r#"
+        contract deadstorage {
+            uint public maxlen = 10000;
+            uint public z;
+            uint public v;
+
+            constructor() {
+                for(uint i = 0; i < 10; i++) {
+                    uint x = i*(10e34+9999);
+                    print("x:{}".format(x));
+                    v = x%maxlen;
+                    print("v:{}".format(v));
+                    z = v%maxlen;
+                    print("z:{}".format(z));
+               }
+            }
+        }"#,
+    );
+
+    vm.constructor("deadstorage", &[]);
+
+    let returns = vm.function("v", &[], &[], None);
+
+    assert_eq!(returns, vec![ethabi::Token::Uint(U256::from(9991))]);
 }

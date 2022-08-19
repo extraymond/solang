@@ -1,17 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Create WASM virtual machine like substrate
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, ffi::OsStr, fmt};
+use std::{collections::HashMap, ffi::OsStr, fmt, fmt::Write};
 use tiny_keccak::{Hasher, Keccak};
 use wasmi::memory_units::Pages;
 use wasmi::*;
 
 use solang::abi;
 use solang::file_resolver::FileResolver;
-use solang::sema::ast;
-use solang::sema::diagnostics;
 use solang::{compile, Target};
 
 mod substrate_tests;
@@ -29,7 +29,7 @@ fn account_new() -> Account {
     a
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HostCodeTerminate {}
 
 impl HostError for HostCodeTerminate {}
@@ -40,7 +40,7 @@ impl fmt::Display for HostCodeTerminate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HostCodeReturn(i32);
 
 impl fmt::Display for HostCodeReturn {
@@ -60,7 +60,7 @@ enum SubstrateExternal {
     seal_get_storage,
     seal_return,
     seal_hash_keccak_256,
-    seal_println,
+    seal_debug_message,
     seal_call,
     seal_instantiate,
     seal_value_transferred,
@@ -398,7 +398,7 @@ impl Externals for MockSubstrate {
                     _ => panic!("seal_return flag {} not valid", flags),
                 }
             }
-            Some(SubstrateExternal::seal_println) => {
+            Some(SubstrateExternal::seal_debug_message) => {
                 let data_ptr: u32 = args.nth_checked(0)?;
                 let len: u32 = args.nth_checked(1)?;
 
@@ -406,16 +406,16 @@ impl Externals for MockSubstrate {
                 buf.resize(len as usize, 0u8);
 
                 if let Err(e) = self.vm.memory.get_into(data_ptr, &mut buf) {
-                    panic!("seal_println: {}", e);
+                    panic!("seal_debug_message: {}", e);
                 }
 
-                let s = String::from_utf8_lossy(&buf);
+                let s = String::from_utf8(buf).expect("seal_debug_message: Invalid UFT8");
 
-                println!("seal_println: {}", s);
+                println!("seal_debug_message: {}", s);
 
                 self.printbuf.push_str(&s);
 
-                Ok(None)
+                Ok(Some(RuntimeValue::I32(0)))
             }
             Some(SubstrateExternal::seal_random) => {
                 let data_ptr: u32 = args.nth_checked(0)?;
@@ -742,8 +742,8 @@ impl Externals for MockSubstrate {
             }
             Some(SubstrateExternal::seal_caller) => {
                 let dest_ptr: u32 = args.nth_checked(0)?;
-                let len_ptr: u32 = args.nth_checked(1)?;
 
+                let len_ptr: u32 = args.nth_checked(1)?;
                 let scratch = self.vm.caller;
 
                 set_seal_value!("seal_caller", dest_ptr, len_ptr, &scratch);
@@ -914,7 +914,7 @@ impl ModuleImportResolver for MockSubstrate {
             "seal_hash_keccak_256" => SubstrateExternal::seal_hash_keccak_256,
             "seal_hash_blake2_128" => SubstrateExternal::seal_hash_blake2_128,
             "seal_hash_blake2_256" => SubstrateExternal::seal_hash_blake2_256,
-            "seal_println" => SubstrateExternal::seal_println,
+            "seal_debug_message" => SubstrateExternal::seal_debug_message,
             "seal_call" => SubstrateExternal::seal_call,
             "seal_instantiate" => SubstrateExternal::seal_instantiate,
             "seal_value_transferred" => SubstrateExternal::seal_value_transferred,
@@ -1172,9 +1172,9 @@ impl MockSubstrate {
                             break;
                         }
                         let b = buf[offset + i];
-                        hex.push_str(&format!(" {:02x}", b));
+                        write!(hex, " {:02x}", b).unwrap();
                         if b.is_ascii() && !b.is_ascii_control() {
-                            chars.push_str(&format!("  {}", b as char));
+                            write!(chars, "  {}", b as char).unwrap();
                         } else {
                             chars.push_str("   ");
                         }
@@ -1208,9 +1208,9 @@ pub fn build_solidity(src: &'static str) -> MockSubstrate {
         false,
     );
 
-    diagnostics::print_diagnostics_plain(&cache, &ns, false);
+    ns.print_diagnostics_in_plain(&cache, false);
 
-    no_errors(ns.diagnostics);
+    assert!(!ns.diagnostics.any_errors());
 
     assert!(!res.is_empty());
 
@@ -1254,7 +1254,7 @@ pub fn build_solidity_with_overflow_check(src: &'static str) -> MockSubstrate {
         true,
     );
 
-    diagnostics::print_diagnostics_plain(&cache, &ns, false);
+    ns.print_diagnostics_in_plain(&cache, false);
 
     assert!(!res.is_empty());
 
@@ -1283,21 +1283,4 @@ pub fn build_solidity_with_overflow_check(src: &'static str) -> MockSubstrate {
         current_program: 0,
         events: Vec::new(),
     }
-}
-
-pub(crate) fn first_error(errors: Vec<ast::Diagnostic>) -> String {
-    match errors.iter().find(|m| m.level == ast::Level::Error) {
-        Some(m) => m.message.to_owned(),
-        None => panic!("no errors found"),
-    }
-}
-
-pub(crate) fn no_errors(errors: Vec<ast::Diagnostic>) {
-    assert!(
-        errors
-            .iter()
-            .filter(|m| m.level == ast::Level::Error)
-            .count()
-            == 0
-    );
 }
