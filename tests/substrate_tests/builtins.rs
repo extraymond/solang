@@ -325,19 +325,6 @@ fn block() {
         r##"
         contract bar {
             function test() public {
-                uint128 b = block.tombstone_deposit;
-
-                assert(b == 93_603_701_976_053);
-            }
-        }"##,
-    );
-
-    runtime.function("test", Vec::new());
-
-    let mut runtime = build_solidity(
-        r##"
-        contract bar {
-            function test() public {
                 uint128 b = block.minimum_balance;
 
                 assert(b == 500);
@@ -429,21 +416,6 @@ fn functions() {
     );
 
     runtime.function("test", Vec::new());
-
-    let mut runtime = build_solidity(
-        r##"
-        contract c {
-            function test() public {
-                bytes32 o = random(
-                    "abcd"
-                );
-
-                assert(o == hex"429ccf3ebce07f0c6d7cd0d1dead74459f753cdf53ed8359e42728042a91c39c");
-            }
-        }"##,
-    );
-
-    runtime.function("test", Vec::new());
 }
 
 #[test]
@@ -457,8 +429,8 @@ fn data() {
         r##"
         contract bar {
             constructor(string memory s) public {
-                assert(msg.data == hex"88eaeb6c18666f6f626172");
-                assert(msg.sig == hex"88ea_eb6c");
+                assert(msg.data == hex"98dd1bb318666f6f626172");
+                assert(msg.sig == hex"98dd_1bb3");
             }
 
             function test(uint32 x) public {
@@ -479,7 +451,7 @@ fn addmod() {
         r##"
         contract x {
             function test() public {
-                assert(addmod(500, 100, 3) == 200);
+                assert(addmod(500, 100, 3) == 0);
             }
         }"##,
     );
@@ -491,12 +463,12 @@ fn addmod() {
         r##"
         contract x {
             function test() public {
-                assert(addmod(500, 100, 0) == 200);
+                assert(addmod(500, 100, 0) == 0);
             }
         }"##,
     );
 
-    runtime.function_expect_failure("test", Vec::new());
+    runtime.function("test", Vec::new());
 
     // bigger numbers (64 bit)
     let mut runtime = build_solidity(
@@ -507,7 +479,7 @@ fn addmod() {
                 assert(addmod(
                     0,
                     134_480_801_439_669_508_040_541_782_812_209_371_611,
-                    16_473_784_705_703_234_153) == 8_163_321_534_310_945_187);
+                    16_473_784_705_703_234_153) == 0);
             }
         }"##,
     );
@@ -523,7 +495,7 @@ fn addmod() {
                 assert(addmod(
                     0,
                     37_927_759_795_988_462_606_362_647_643_228_779_300_269_446_446_871_437_380_583_919_404_728_626_309_579,
-                    148_872_967_607_295_528_830_315_866_466_318_446_379) == 254_765_928_331_839_140_628_748_569_208_536_440_801);
+                    148_872_967_607_295_528_830_315_866_466_318_446_379) == 0);
             }
         }"##,
     );
@@ -538,7 +510,7 @@ fn addmod() {
                 assert(addmod(
                     109802613191917590715814365746623394364442484359636492253827647701845853490667,
                     49050800785888222684575674817707208319566972397745729319314900174750088808217,
-                    233) == 681774308917621516739871418731032629545104964623958032502757716208566275960);
+                    233) == 204);
             }
         }"##,
     );
@@ -552,7 +524,7 @@ fn addmod() {
                 assert(addmod(
                     109802613191917590715814365746623394364442484359636492253827647701845853490667,
                     109802613191917590715814365746623394364442484359636492253827647701845853490667,
-                    2) == 109802613191917590715814365746623394364442484359636492253827647701845853490667);
+                    2) == 0);
             }
         }"##,
     );
@@ -567,7 +539,7 @@ fn mulmod() {
         r##"
         contract x {
             function test() public {
-                assert(mulmod(500, 100, 5) == 10000);
+                assert(mulmod(500, 100, 5) == 0);
             }
         }"##,
     );
@@ -579,19 +551,19 @@ fn mulmod() {
         r##"
         contract x {
             function test() public {
-                assert(mulmod(500, 100, 0) == 200);
+                assert(mulmod(500, 100, 0) == 0);
             }
         }"##,
     );
 
-    runtime.function_expect_failure("test", Vec::new());
+    runtime.function("test", Vec::new());
 
     // bigger numbers
     let mut runtime = build_solidity(
         r##"
         contract x {
             function test() public {
-                assert(mulmod(50000, 10000, 5) == 10000_0000);
+                assert(mulmod(50000, 10000, 5) == 0);
             }
         }"##,
     );
@@ -602,7 +574,7 @@ fn mulmod() {
         r##"
         contract x {
             function test() public {
-                assert(mulmod(18446744073709551616, 18446744073709550403, 1024) == 332306998946228946374486373068439552);
+                assert(mulmod(18446744073709551616, 18446744073709550403, 1024) == 0);
             }
         }"##,
     );
@@ -614,7 +586,7 @@ fn mulmod() {
         r##"
         contract x {
             function test() public {
-                assert(mulmod(170141183460469231731687303715884105728, 170141183460469231731687303715884105728, 170141183460469231731687303715884105728) == 170141183460469231731687303715884105728);
+                assert(mulmod(170141183460469231731687303715884105728, 170141183460469231731687303715884105728, 170141183460469231731687303715884105728) == 0);
             }
         }"##,
     );
@@ -626,7 +598,7 @@ fn mulmod() {
         r##"
         contract x {
             function test() public {
-                assert(mulmod(340282366920938463463374607431768211456, 340282366920938463463374607431768211456, 340282366920938463463374607431768211456) == 340282366920938463463374607431768211456);
+                assert(mulmod(340282366920938463463374607431768211456, 340282366920938463463374607431768211456, 340282366920938463463374607431768211456) == 0);
             }
         }"##,
     );
@@ -641,7 +613,7 @@ fn mulmod() {
                 assert(mulmod(1766847064778384329583297500742918515827483896875618958121606201292619776,
                     1766847064778384329583297500742918515827483896875618958121606201292619776,
                     1766847064778384329583297500742918515827483896875618958121606201292619776)
-                    == 1766847064778384329583297500742918515827483896875618958121606201292619776);
+                    == 0);
             }
         }"##,
     );
@@ -656,7 +628,7 @@ fn mulmod() {
                 assert(mulmod(824364134751099588297822369420176791913922347811791536817152126684405253,
                     824364134751099588297822369420176791913922347811791536817152126684405253,
                     824364134751099588297822369420176791913922347811791536817152126684405253)
-                    == 824364134751099588297822369420176791913922347811791536817152126684405253);
+                    == 0);
             }
         }"##,
     );
@@ -671,7 +643,21 @@ fn mulmod() {
                 assert(mulmod(113477814626329405513123655892059150026234290706112418221315641434319827527851,
                     113477814626329405513123655892059150026234290706112418221315641434319827527851,
                     113477814626329405513123655892059150026234290706112418221315641434319827527851)
-                    == 113477814626329405513123655892059150026234290706112418221315641434319827527851);
+                    == 0);
+            }
+        }"##,
+    );
+
+    runtime.function("test", Vec::new());
+
+    let mut runtime = build_solidity(
+        r##"
+        contract x {
+            function test() public {
+                assert(mulmod(113477814626329405513123655892059150026234290706112418221315641434319827527851,
+                    113477814626329405513123655892059150026234290706112418221315641434319827527841,
+                    233)
+                    == 12);
             }
         }"##,
     );
@@ -718,4 +704,43 @@ fn my_token() {
         TokenTest(<[u8; 32]>::try_from(&runtime.vm.caller[..]).unwrap(), false).encode(),
     );
     assert_eq!(&runtime.vm.caller[..], &runtime.vm.output[..]);
+}
+
+#[test]
+fn hash() {
+    let mut runtime = build_solidity(
+        r##"
+        import "substrate";
+
+        contract Foo {
+            Hash current;
+            bytes32 current2;
+
+            function set(Hash h) public returns (bytes32) {
+                current = h;
+                current2 = Hash.unwrap(h);
+                return current2;
+            }
+
+            function get() public view returns (Hash) {
+                return Hash.wrap(current2);
+            }
+        }
+        "##,
+    );
+
+    #[derive(Encode)]
+    struct Hash([u8; 32]);
+
+    let h = Hash([
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+        0x16, 0x17, 0x18, 0x19, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x30,
+        0x31, 0x32,
+    ]);
+
+    runtime.function("set", h.encode());
+    assert_eq!(&runtime.vm.output[..], &h.0[..]);
+
+    runtime.function("get", vec![]);
+    assert_eq!(&runtime.vm.output[..], &h.0[..]);
 }

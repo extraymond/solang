@@ -98,7 +98,7 @@ pub fn find(cfg: &mut ControlFlowGraph) {
 fn instr_transfers(block_no: usize, block: &BasicBlock) -> Vec<Vec<Transfer>> {
     let mut transfers = Vec::new();
 
-    for (instr_no, instr) in block.instr.iter().enumerate() {
+    for (instr_no, (_, instr)) in block.instr.iter().enumerate() {
         let set_var = |var_nos: &[usize]| {
             let mut transfer = Vec::new();
 
@@ -223,12 +223,13 @@ pub fn apply_transfers(transfers: &[Transfer], vars: &mut IndexMap<usize, IndexM
     }
 }
 
-pub fn block_edges(block: &BasicBlock) -> Vec<usize> {
+/// Fetch the blocks that can be executed after the block passed as argument
+pub(super) fn block_edges(block: &BasicBlock) -> Vec<usize> {
     let mut out = Vec::new();
 
     // out cfg has edge as the last instruction in a block; EXCEPT
     // Instr::AbiDecode() which has an edge when decoding fails
-    for instr in &block.instr {
+    for (_, instr) in &block.instr {
         match instr {
             Instr::Branch { block } => {
                 out.push(*block);
@@ -246,6 +247,12 @@ pub fn block_edges(block: &BasicBlock) -> Vec<usize> {
                 ..
             } => {
                 out.push(*block);
+            }
+            Instr::Switch { default, cases, .. } => {
+                out.push(*default);
+                for (_, goto) in cases {
+                    out.push(*goto);
+                }
             }
             _ => (),
         }

@@ -21,52 +21,28 @@ not. ``indexed`` fields are stored as topics, so there can only be a limited num
 fields are stored in the data section of the event. The event name does not need to be unique; just like
 functions, they can be overloaded as long as the fields are of different types, or the event has
 a different number of arguments.
+
+.. warning::
+    On Solana, the ``indexed`` event field attribute has no effect. All event attributes will be encoded as data to
+    be passed for Solana's ``sol_log_data`` system call, regardless if the ``indexed`` keyword is present or not.
+    This behavior follows what Solana's Anchor framework does.
+
 In Parity Substrate, the topic fields are always the hash of the value of the field. Ethereum only hashes fields
 which do not fit in the 32 bytes. Since a cryptographic hash is used, it is only possible to compare the topic against a
 known value.
 
 An event can be declared in a contract, or outside.
 
-.. code-block:: solidity
-
-    event CounterpartySigned (
-        address indexed party,
-        address counter_party,
-        uint contract_no
-    );
-
-    contract Signer {
-        funtion sign(address counter_party, uint contract_no) internal {
-            emit CounterpartySigned(address(this), counter_party, contract_no);
-        }
-    }
+.. include:: ../examples/events.sol
+  :code: solidity
 
 Like function calls, the emit statement can have the fields specified by position, or by field name. Using
 field names rather than position may be useful in case the event name is overloaded, since the field names
 make it clearer which exact event is being emitted.
 
 
-.. code-block:: solidity
-
-    event UserModified(
-        address user,
-        string name
-    ) anonymous;
-
-    event UserModified(
-        address user,
-        uint64 groupid
-    );
-
-    contract user {
-        function set_name(string name) public {
-            emit UserModified({ user: msg.sender, name: name });
-        }
-
-        function set_groupid(uint64 id) public {
-            emit UserModified({ user: msg.sender, groupid: id });
-        }
-    }
+.. include:: ../examples/event_positional_fields.sol
+  :code: solidity
 
 In the transaction log, the first topic of an event is the keccak256 hash of the signature of the
 event. The signature is the event name, followed by the fields types in a comma separated list in parentheses. So

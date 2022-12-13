@@ -9,6 +9,9 @@ use super::{
     cfg::{ControlFlowGraph, Instr},
     vartable::Vartable,
 };
+use crate::codegen::constructor::call_constructor;
+use crate::codegen::encoding::create_encoder;
+use crate::codegen::events::new_event_emitter;
 use crate::codegen::unused_variable::{
     should_remove_assignment, should_remove_variable, SideEffectsCheckParameters,
 };
@@ -24,7 +27,6 @@ use crate::sema::Recurse;
 use num_traits::Zero;
 use solang_parser::pt;
 use solang_parser::pt::CodeLocation;
-use tiny_keccak::{Hasher, Keccak};
 
 /// Resolve a statement, which might be a block of statements or an entire body of a function
 pub(crate) fn statement(
@@ -74,7 +76,7 @@ pub(crate) fn statement(
             let mut expression = expression(init, cfg, contract_no, Some(func), ns, vartab, opt);
 
             // Let's check if the declaration is a declaration of a dynamic array
-            if let Expression::AllocDynamicArray(
+            if let Expression::AllocDynamicBytes(
                 loc_dyn_arr,
                 ty_dyn_arr @ Type::Array(..),
                 size,
@@ -92,7 +94,7 @@ pub(crate) fn statement(
                     },
                 );
                 // If expression is an AllocDynamic array, replace the expression with AllocDynamicArray(_,_,tempvar,_) to avoid inserting size twice in the cfg
-                expression = Expression::AllocDynamicArray(
+                expression = Expression::AllocDynamicBytes(
                     loc_dyn_arr,
                     ty_dyn_arr,
                     Box::new(Expression::Variable(*loc, Type::Uint(32), temp_res)),
@@ -572,101 +574,14 @@ pub(crate) fn statement(
             return_override,
             opt,
         ),
-        Statement::Emit { event_no, args, .. } => {
-            let event = &ns.events[*event_no];
-            let mut data = Vec::new();
-            let mut data_tys = Vec::new();
-            let mut topics = Vec::new();
-            let mut topic_tys = Vec::new();
-
-            if !event.anonymous && !ns.target.is_substrate() {
-                let mut hasher = Keccak::v256();
-                hasher.update(event.signature.as_bytes());
-                let mut hash = [0u8; 32];
-                hasher.finalize(&mut hash);
-
-                topic_tys.push(Type::Bytes(32));
-                topics.push(Expression::BytesLiteral(
-                    pt::Loc::Codegen,
-                    Type::Bytes(32),
-                    hash.to_vec(),
-                ));
-            }
-
-            for (i, arg) in args.iter().enumerate() {
-                if event.fields[i].indexed {
-                    let ty = arg.ty();
-
-                    match ty {
-                        Type::String | Type::DynamicBytes => {
-                            let e = expression(
-                                &ast::Expression::Builtin(
-                                    pt::Loc::Codegen,
-                                    vec![Type::Bytes(32)],
-                                    ast::Builtin::Keccak256,
-                                    vec![arg.clone()],
-                                ),
-                                cfg,
-                                contract_no,
-                                Some(func),
-                                ns,
-                                vartab,
-                                opt,
-                            );
-
-                            topics.push(e);
-                            topic_tys.push(Type::Bytes(32));
-                        }
-                        Type::Struct(_) | Type::Array(..) => {
-                            // We should have an AbiEncodePackedPad
-                            let e = expression(
-                                &ast::Expression::Builtin(
-                                    pt::Loc::Codegen,
-                                    vec![Type::Bytes(32)],
-                                    ast::Builtin::Keccak256,
-                                    vec![ast::Expression::Builtin(
-                                        pt::Loc::Codegen,
-                                        vec![Type::DynamicBytes],
-                                        ast::Builtin::AbiEncodePacked,
-                                        vec![arg.clone()],
-                                    )],
-                                ),
-                                cfg,
-                                contract_no,
-                                Some(func),
-                                ns,
-                                vartab,
-                                opt,
-                            );
-
-                            topics.push(e);
-                            topic_tys.push(Type::Bytes(32));
-                        }
-                        _ => {
-                            let e = expression(arg, cfg, contract_no, Some(func), ns, vartab, opt);
-
-                            topics.push(e);
-                            topic_tys.push(ty);
-                        }
-                    }
-                } else {
-                    let e = expression(arg, cfg, contract_no, Some(func), ns, vartab, opt);
-
-                    data.push(e);
-                    data_tys.push(arg.ty());
-                }
-            }
-
-            cfg.add(
-                vartab,
-                Instr::EmitEvent {
-                    event_no: *event_no,
-                    data,
-                    data_tys,
-                    topics,
-                    topic_tys,
-                },
-            );
+        Statement::Emit {
+            loc,
+            event_no,
+            args,
+            ..
+        } => {
+            let emitter = new_event_emitter(loc, *event_no, args, ns);
+            emitter.emit(contract_no, func, cfg, vartab, opt);
         }
         Statement::Underscore(_) => {
             // ensure we get phi nodes for the return values
@@ -847,9 +762,9 @@ fn returns(
 ) {
     // Can only be another function call without returns
     let uncast_values = match expr {
-        // Explicitly recurse for ternary expressions.
+        // Explicitly recurse for conditinal operator expressions.
         // `return a ? b : c` is transformed into pseudo code `a ? return b : return c`
-        ast::Expression::Ternary(_, _, cond, left, right) => {
+        ast::Expression::ConditionalOperator(_, _, cond, left, right) => {
             let cond = expression(cond, cfg, contract_no, Some(func), ns, vartab, opt);
 
             let left_block = cfg.new_basic_block("left".to_string());
@@ -921,7 +836,7 @@ fn destructure(
     vartab: &mut Vartable,
     opt: &Options,
 ) {
-    if let ast::Expression::Ternary(_, _, cond, left, right) = expr {
+    if let ast::Expression::ConditionalOperator(_, _, cond, left, right) = expr {
         let cond = expression(cond, cfg, contract_no, Some(func), ns, vartab, opt);
 
         let left_block = cfg.new_basic_block("left".to_string());
@@ -1117,25 +1032,18 @@ fn try_catch(
                     opt,
                 );
 
-                let mut tys: Vec<Type> = args.iter().map(|a| a.ty()).collect();
-
-                tys.insert(0, Type::Bytes(4));
-
-                let args = args
+                let mut args = args
                     .iter()
                     .map(|a| expression(a, cfg, callee_contract_no, Some(func), ns, vartab, opt))
-                    .collect();
+                    .collect::<Vec<Expression>>();
 
                 let selector = function.external_function_selector();
 
                 let address = function.external_function_address();
 
-                let payload = Expression::AbiEncode {
-                    loc: *loc,
-                    tys,
-                    packed: vec![selector],
-                    args,
-                };
+                args.insert(0, selector);
+                let mut encoder = create_encoder(ns, false);
+                let (payload, _) = encoder.abi_encode(loc, args, ns, vartab, cfg);
 
                 cfg.add(
                     vartab,
@@ -1193,6 +1101,7 @@ fn try_catch(
                             exception_block: None,
                             tys,
                             data: Expression::ReturnData(pt::Loc::Codegen),
+                            data_len: None,
                         },
                     );
                 }
@@ -1202,6 +1111,7 @@ fn try_catch(
             }
         }
         ast::Expression::Constructor {
+            loc,
             contract_no,
             constructor_no,
             args,
@@ -1213,41 +1123,20 @@ fn try_catch(
                 _ => vartab.temp_anonymous(&Type::Contract(*contract_no)),
             };
 
-            let value = call_args.value.as_ref().map(|value| {
-                expression(value, cfg, callee_contract_no, Some(func), ns, vartab, opt)
-            });
-
-            let gas = if let Some(gas) = &call_args.gas {
-                expression(gas, cfg, callee_contract_no, Some(func), ns, vartab, opt)
-            } else {
-                default_gas(ns)
-            };
-            let salt = call_args
-                .salt
-                .as_ref()
-                .map(|salt| expression(salt, cfg, callee_contract_no, Some(func), ns, vartab, opt));
-            let space = call_args.space.as_ref().map(|space| {
-                expression(space, cfg, callee_contract_no, Some(func), ns, vartab, opt)
-            });
-
-            let args = args
-                .iter()
-                .map(|a| expression(a, cfg, callee_contract_no, Some(func), ns, vartab, opt))
-                .collect();
-
-            cfg.add(
+            call_constructor(
+                loc,
+                contract_no,
+                callee_contract_no,
+                constructor_no,
+                args,
+                call_args,
+                address_res,
+                Some(success),
+                Some(func),
+                ns,
                 vartab,
-                Instr::Constructor {
-                    success: Some(success),
-                    res: address_res,
-                    contract_no: *contract_no,
-                    constructor_no: *constructor_no,
-                    args,
-                    value,
-                    gas,
-                    salt,
-                    space,
-                },
+                cfg,
+                opt,
             );
 
             cfg.add(
@@ -1312,6 +1201,7 @@ fn try_catch(
                 res: vec![error_var],
                 tys: vec![error_param.clone()],
                 data: Expression::ReturnData(pt::Loc::Codegen),
+                data_len: None,
             },
         );
 
@@ -1473,7 +1363,7 @@ impl Type {
                 ))
             }
             Type::StorageRef(..) => None,
-            Type::String | Type::DynamicBytes => Some(Expression::AllocDynamicArray(
+            Type::String | Type::DynamicBytes => Some(Expression::AllocDynamicBytes(
                 pt::Loc::Codegen,
                 self.clone(),
                 Box::new(Expression::NumberLiteral(
@@ -1490,7 +1380,7 @@ impl Type {
                 ty.default(ns)?;
 
                 if dims.last() == Some(&ArrayLength::Dynamic) {
-                    Some(Expression::AllocDynamicArray(
+                    Some(Expression::AllocDynamicBytes(
                         pt::Loc::Codegen,
                         self.clone(),
                         Box::new(Expression::NumberLiteral(

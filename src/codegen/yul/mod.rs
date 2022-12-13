@@ -113,12 +113,9 @@ fn yul_function_cfg(
     if yul_func.body.is_empty()
         || (!yul_func.body.is_empty() && yul_func.body.last().unwrap().is_reachable())
     {
-        cfg.add(&mut vartab, returns);
+        cfg.add_yul(&mut vartab, returns);
     }
 
-    let (vars, next_id) = vartab.drain();
-    cfg.vars = vars;
-    ns.next_id = next_id;
-
+    vartab.finalize(ns, &mut cfg);
     cfg
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
+    annotions_not_allowed,
     ast::{
         Diagnostic, Expression, Function, Namespace, Parameter, Statement, StructType, Symbol,
         Type, Variable,
@@ -11,9 +12,12 @@ use super::{
     symtable::Symtable,
     symtable::{VariableInitializer, VariableUsage},
     tags::resolve_tags,
+    ContractDefinition,
 };
+use crate::sema::eval::check_term_for_constant_overflow;
+use crate::sema::Recurse;
 use solang_parser::{
-    doccomment::{parse_doccomments, DocComment},
+    doccomment::DocComment,
     pt::{self, CodeLocation, OptionalCodeLocation},
 };
 
@@ -24,50 +28,36 @@ pub struct DelayedResolveInitializer<'a> {
 }
 
 pub fn contract_variables<'a>(
-    def: &'a pt::ContractDefinition,
-    comments: &[pt::Comment],
+    def: &'a ContractDefinition,
     file_no: usize,
-    contract_no: usize,
     ns: &mut Namespace,
 ) -> Vec<DelayedResolveInitializer<'a>> {
     let mut symtable = Symtable::new();
     let mut delayed = Vec::new();
-    let mut doc_comment_start = def.loc.start();
 
     for part in &def.parts {
-        match part {
-            pt::ContractPart::VariableDefinition(ref s) => {
-                let tags = parse_doccomments(comments, doc_comment_start, s.loc.start());
+        if let pt::ContractPart::VariableDefinition(ref s) = &part.part {
+            annotions_not_allowed(&part.annotations, "variable", ns);
 
-                if let Some(delay) = variable_decl(
-                    Some(def),
-                    s,
-                    file_no,
-                    &tags,
-                    Some(contract_no),
-                    ns,
-                    &mut symtable,
-                ) {
-                    delayed.push(delay);
-                }
+            if let Some(delay) = variable_decl(
+                Some(def),
+                s,
+                file_no,
+                &part.doccomments,
+                Some(def.contract_no),
+                ns,
+                &mut symtable,
+            ) {
+                delayed.push(delay);
             }
-            pt::ContractPart::FunctionDefinition(f) => {
-                if let Some(pt::Statement::Block { loc, .. }) = &f.body {
-                    doc_comment_start = loc.end();
-                    continue;
-                }
-            }
-            _ => (),
         }
-
-        doc_comment_start = part.loc().end();
     }
 
     delayed
 }
 
 pub fn variable_decl<'a>(
-    contract: Option<&pt::ContractDefinition>,
+    contract: Option<&ContractDefinition>,
     def: &'a pt::VariableDefinition,
     file_no: usize,
     tags: &[DocComment],
@@ -269,11 +259,16 @@ pub fn variable_decl<'a>(
         if matches!(contract.ty, pt::ContractTy::Interface(_))
             || (matches!(contract.ty, pt::ContractTy::Library(_)) && !constant)
         {
+            if contract.name.is_none() || def.name.is_none() {
+                return None;
+            }
             ns.diagnostics.push(Diagnostic::error(
                 def.loc,
                 format!(
                     "{} '{}' is not allowed to have contract variable '{}'",
-                    contract.ty, contract.name.name, def.name.name
+                    contract.ty,
+                    contract.name.as_ref().unwrap().name,
+                    def.name.as_ref().unwrap().name
                 ),
             ));
             return None;
@@ -344,7 +339,10 @@ pub fn variable_decl<'a>(
                 Ok(res) => {
                     // implicitly conversion to correct ty
                     match res.cast(&def.loc, &ty, true, ns, &mut diagnostics) {
-                        Ok(res) => Some(res),
+                        Ok(res) => {
+                            res.recurse(ns, check_term_for_constant_overflow);
+                            Some(res)
+                        }
                         Err(_) => {
                             ns.diagnostics.extend(diagnostics);
                             None
@@ -379,7 +377,7 @@ pub fn variable_decl<'a>(
     };
 
     let tags = resolve_tags(
-        def.name.loc.file_no(),
+        def.name.as_ref().unwrap().loc.file_no(),
         if contract_no.is_none() {
             "global variable"
         } else {
@@ -393,7 +391,7 @@ pub fn variable_decl<'a>(
     );
 
     let sdecl = Variable {
-        name: def.name.name.to_string(),
+        name: def.name.as_ref().unwrap().name.to_string(),
         loc: def.loc,
         tags,
         visibility: visibility.clone(),
@@ -432,7 +430,7 @@ pub fn variable_decl<'a>(
     let success = ns.add_symbol(
         file_no,
         contract_no,
-        &def.name,
+        def.name.as_ref().unwrap(),
         Symbol::Variable(def.loc, contract_no, var_no),
     );
 
@@ -471,18 +469,18 @@ pub fn variable_decl<'a>(
             }
 
             let mut func = Function::new(
-                def.name.loc,
-                def.name.name.to_owned(),
+                def.name.as_ref().unwrap().loc,
+                def.name.as_ref().unwrap().name.to_owned(),
                 Some(contract_no),
                 Vec::new(),
                 pt::FunctionTy::Function,
                 // accessors for constant variables have view mutability
-                Some(pt::Mutability::View(def.name.loc)),
+                Some(pt::Mutability::View(def.name.as_ref().unwrap().loc)),
                 visibility,
                 params,
                 vec![Parameter {
                     id: None,
-                    loc: def.name.loc,
+                    loc: def.name.as_ref().unwrap().loc,
                     ty: ty.clone(),
                     ty_loc: Some(def.ty.loc()),
                     indexed: false,
@@ -520,7 +518,7 @@ pub fn variable_decl<'a>(
                 (
                     def.loc.file_no(),
                     Some(contract_no),
-                    def.name.name.to_owned(),
+                    def.name.as_ref().unwrap().name.to_owned(),
                 ),
                 symbol,
             );
@@ -672,6 +670,7 @@ pub fn resolve_initializers(
             ResolveTo::Type(&ty),
         ) {
             if let Ok(res) = res.cast(&initializer.loc(), &ty, true, ns, &mut diagnostics) {
+                res.recurse(ns, check_term_for_constant_overflow);
                 ns.contracts[*contract_no].variables[*var_no].initializer = Some(res);
             }
         }

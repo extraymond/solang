@@ -9,7 +9,7 @@ use super::{
     diagnostics::Diagnostics,
     expression::{expression, ExprContext, ResolveTo},
     tags::resolve_tags,
-    Symtable,
+    ContractDefinition, Symtable,
 };
 use crate::Target;
 use solang_parser::{
@@ -20,14 +20,14 @@ use solang_parser::{
 
 /// Resolve function declaration in a contract
 pub fn contract_function(
-    contract: &pt::ContractDefinition,
+    contract: &ContractDefinition,
     func: &pt::FunctionDefinition,
     tags: &[DocComment],
     file_no: usize,
-    contract_no: usize,
     ns: &mut Namespace,
 ) -> Option<usize> {
     let mut success = true;
+    let contract_no = contract.contract_no;
 
     // The parser allows constructors to have return values. This is so that we can give a
     // nicer error message than "returns unexpected"
@@ -58,7 +58,8 @@ pub fn contract_function(
                 ));
                 return None;
             }
-            if func.name.is_some() {
+            // Allow setting a name in Substrate to be used during metadata generation.
+            if func.name.is_some() && !ns.target.is_substrate() {
                 ns.diagnostics.push(Diagnostic::error(
                     func.loc,
                     "constructor cannot have a name".to_string(),
@@ -250,6 +251,7 @@ pub fn contract_function(
                     ));
                 }
             }
+            pt::FunctionAttribute::Error(_) => unreachable!(),
         }
     }
 
@@ -362,8 +364,7 @@ pub fn contract_function(
                 ResolveTo::Unknown,
             ) {
                 Ok(Expression::BytesLiteral(_, _, v)) => {
-                    // TODO: Solana uses different length discriminators
-                    if v.len() != 4 {
+                    if ns.target != Target::Solana && v.len() != 4 {
                         ns.diagnostics.push(Diagnostic::error(
                             selector.loc(),
                             format!("selector is {} bytes, 4 bytes expected", v.len()),
@@ -512,10 +513,18 @@ pub fn contract_function(
         return None;
     }
 
-    let name = match &func.name {
-        Some(s) => s.name.to_owned(),
-        None => "".to_owned(),
-    };
+    let name = func
+        .name
+        .as_ref()
+        .map(|s| s.name.as_str())
+        .unwrap_or_else(|| {
+            if ns.target.is_substrate() && func.ty == pt::FunctionTy::Constructor {
+                "new"
+            } else {
+                ""
+            }
+        })
+        .to_owned();
 
     let bases: Vec<String> = contract
         .base
@@ -523,9 +532,9 @@ pub fn contract_function(
         .map(|base| format!("{}", base.name))
         .collect();
 
-    let doc = resolve_tags(
+    let tags = resolve_tags(
         func.loc.file_no(),
-        "function",
+        &func.ty.to_string(),
         tags,
         Some(&params),
         Some(&returns),
@@ -537,7 +546,7 @@ pub fn contract_function(
         func.loc,
         name,
         Some(contract_no),
-        doc,
+        tags,
         func.ty,
         mutability,
         visibility,
@@ -552,7 +561,7 @@ pub fn contract_function(
     fdecl.selector = selector;
 
     if func.ty == pt::FunctionTy::Constructor {
-        // In the eth solidity, only one constructor is allowed
+        // In the eth solidity only one constructor is allowed
         if ns.target == Target::EVM {
             if let Some(prev_func_no) = ns.contracts[contract_no]
                 .functions
@@ -814,6 +823,9 @@ pub fn function(
                     *loc,
                     format!("attribute '{}' not supported", name.name),
                 ));
+                success = false;
+            }
+            pt::FunctionAttribute::Error(_) => {
                 success = false;
             }
         }

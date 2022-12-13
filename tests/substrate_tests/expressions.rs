@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{build_solidity, build_solidity_with_overflow_check};
+use crate::{build_solidity, build_solidity_with_options};
 use num_bigint::{BigInt, BigUint, RandBigInt, Sign};
 use parity_scale_codec::{Decode, Encode};
 use rand::seq::SliceRandom;
@@ -950,13 +950,13 @@ fn test_power_overflow_boundaries() {
     for width in (8..=256).step_by(8) {
         let src = r#"
         contract test {
-            function pow(uintN a, uintN b) public returns (uintN) { 
+            function pow(uintN a, uintN b) public returns (uintN) {
                 return a ** b;
             }
         }"#
         .replace("intN", &format!("int{}", width));
 
-        let mut contract = build_solidity_with_overflow_check(&src, true);
+        let mut contract = build_solidity_with_options(&src, true, false);
 
         let base = BigUint::from(2_u32);
         let mut base_data = base.to_bytes_le();
@@ -964,10 +964,10 @@ fn test_power_overflow_boundaries() {
         let exp = BigUint::from(width - 1);
         let mut exp_data = exp.to_bytes_le();
 
-        let width_rounded = (width as usize / 8).next_power_of_two();
+        let width_rounded = (width / 8usize).next_power_of_two();
 
-        base_data.resize((width_rounded) as usize, 0);
-        exp_data.resize((width_rounded) as usize, 0);
+        base_data.resize(width_rounded, 0);
+        exp_data.resize(width_rounded, 0);
 
         contract.function(
             "pow",
@@ -981,13 +981,13 @@ fn test_power_overflow_boundaries() {
         let res = BigUint::from(2_usize).pow((width - 1).try_into().unwrap());
         let mut res_data = res.to_bytes_le();
         res_data.resize(width / 8, 0);
-        contract.vm.output.truncate((width / 8) as usize);
+        contract.vm.output.truncate(width / 8);
 
         assert_eq!(contract.vm.output, res_data);
 
         let exp = exp.add(1_usize);
         let mut exp_data = exp.to_bytes_le();
-        exp_data.resize((width_rounded) as usize, 0);
+        exp_data.resize(width_rounded, 0);
 
         contract.function_expect_failure(
             "pow",
@@ -1080,25 +1080,25 @@ fn test_mul_within_range_signed() {
         let mut a_data = a.to_signed_bytes_le();
 
         let side = vec![-1, 0, 1];
-        let b = BigInt::from(*side.choose(&mut rng).unwrap() as i32);
+        let b = BigInt::from(*side.choose(&mut rng).unwrap());
         let b_sign = b.sign();
         let mut b_data = b.to_signed_bytes_le();
 
-        a_data.resize((width_rounded) as usize, sign_extend(a_sign));
-        b_data.resize((width_rounded) as usize, sign_extend(b_sign));
+        a_data.resize(width_rounded, sign_extend(a_sign));
+        b_data.resize(width_rounded, sign_extend(b_sign));
 
         runtime.function(
             "mul",
             a_data.into_iter().chain(b_data.into_iter()).collect(),
         );
 
-        runtime.vm.output.truncate((width / 8) as usize);
+        runtime.vm.output.truncate(width / 8);
 
         let value = a * b;
         let value_sign = value.sign();
 
         let mut value_data = value.to_signed_bytes_le();
-        value_data.resize((width / 8) as usize, sign_extend(value_sign));
+        value_data.resize(width / 8, sign_extend(value_sign));
 
         assert_eq!(value_data, runtime.vm.output);
     }
@@ -1119,16 +1119,16 @@ fn test_mul_within_range() {
         let width_rounded = (width as usize / 8).next_power_of_two();
         let mut runtime = build_solidity(&src);
 
-        // The range of values that can be held in signed N bits is [-2^(N-1), 2^(N-1)-1]. Here we generate a random number within this range and multiply it by 1
-        let a = rng.gen_biguint((width).try_into().unwrap()).sub(1_u32);
+        // The range of values that can be held in unsigned N bits is [0, 2^N-1]. Here we generate a random number within this range and multiply it by 1
+        let a = rng.gen_biguint((width).try_into().unwrap());
 
         let mut a_data = a.to_bytes_le();
 
         let b = BigUint::from(1_u32);
 
         let mut b_data = b.to_bytes_le();
-        a_data.resize((width_rounded) as usize, 0);
-        b_data.resize((width_rounded) as usize, 0);
+        a_data.resize(width_rounded, 0);
+        b_data.resize(width_rounded, 0);
 
         runtime.function(
             "mul",
@@ -1156,7 +1156,7 @@ fn test_overflow_boundaries() {
             }
         }"#
         .replace("intN", &format!("int{}", width));
-        let mut contract = build_solidity_with_overflow_check(&src, true);
+        let mut contract = build_solidity_with_options(&src, true, false);
 
         // The range of values that can be held in signed N bits is [-2^(N-1), 2^(N-1)-1]. We generate these boundaries:
         let upper_boundary = BigInt::from(2_u32).pow(width - 1).sub(1_u32);
@@ -1170,9 +1170,9 @@ fn test_overflow_boundaries() {
 
         let width_rounded = (width as usize / 8).next_power_of_two();
 
-        up_data.resize((width_rounded) as usize, 0);
-        low_data.resize((width_rounded) as usize, 255);
-        sec_data.resize((width_rounded) as usize, 0);
+        up_data.resize(width_rounded, 0);
+        low_data.resize(width_rounded, 255);
+        sec_data.resize(width_rounded, 0);
 
         // Multiply the boundaries by 1.
         contract.function(
@@ -1220,9 +1220,9 @@ fn test_overflow_boundaries() {
 
         let mut two_data = BigInt::from(2_u32).to_signed_bytes_le();
 
-        upper_second_op_data.resize((width_rounded) as usize, 0);
-        two_data.resize((width_rounded) as usize, 0);
-        lower_second_op_data.resize((width_rounded) as usize, 255);
+        upper_second_op_data.resize(width_rounded, 0);
+        two_data.resize(width_rounded, 0);
+        lower_second_op_data.resize(width_rounded, 255);
 
         // This will generate a value more than the upper boundary.
         contract.function_expect_failure(
@@ -1287,7 +1287,7 @@ fn test_overflow_detect_signed() {
             }
         }"#
         .replace("intN", &format!("int{}", width));
-        let mut contract = build_solidity_with_overflow_check(&src, true);
+        let mut contract = build_solidity_with_options(&src, true, false);
 
         // The range of values that can be held in signed N bits is [-2^(N-1), 2^(N-1)-1] .Generate a value that will overflow this range:
         let limit = BigInt::from(2_u32).pow(width - 1).sub(1_u32);
@@ -1300,14 +1300,14 @@ fn test_overflow_detect_signed() {
         let mut first_op_data = first_operand_rand.to_signed_bytes_le();
 
         let width_rounded = (width as usize / 8).next_power_of_two();
-        first_op_data.resize((width_rounded) as usize, sign_extend(first_op_sign));
+        first_op_data.resize(width_rounded, sign_extend(first_op_sign));
 
         // Calculate a number that when multiplied by first_operand_rand, the result will overflow N bits
         let second_operand_rand = rng.gen_bigint_range(&BigInt::from(2usize), &limit);
 
         let second_op_sign = second_operand_rand.sign();
         let mut second_op_data = second_operand_rand.to_signed_bytes_le();
-        second_op_data.resize((width_rounded) as usize, sign_extend(second_op_sign));
+        second_op_data.resize(width_rounded, sign_extend(second_op_sign));
 
         contract.function_expect_failure(
             "mul",
@@ -1326,7 +1326,7 @@ fn test_overflow_detect_signed() {
 
         let first_op_sign = first_operand_rand.sign();
         let mut first_op_data = first_operand_rand.to_signed_bytes_le();
-        first_op_data.resize((width_rounded) as usize, sign_extend(first_op_sign));
+        first_op_data.resize(width_rounded, sign_extend(first_op_sign));
 
         contract.function_expect_failure(
             "mul",
@@ -1349,7 +1349,7 @@ fn test_overflow_detect_unsigned() {
             }
         }"#
         .replace("intN", &format!("int{}", width));
-        let mut contract = build_solidity_with_overflow_check(&src, true);
+        let mut contract = build_solidity_with_options(&src, true, false);
 
         // The range of values that can be held in signed N bits is [-2^(N-1), 2^(N-1)-1].
         let limit = BigUint::from(2_u32).pow(width).sub(1_u32);
@@ -1361,13 +1361,13 @@ fn test_overflow_detect_unsigned() {
         let mut first_op_data = first_operand_rand.to_bytes_le();
 
         let width_rounded = (width as usize / 8).next_power_of_two();
-        first_op_data.resize((width_rounded) as usize, 0);
+        first_op_data.resize(width_rounded, 0);
 
         // Calculate a number that when multiplied by first_operand_rand, the result will overflow N bits
         let second_operand_rand = rng.gen_biguint_range(&BigUint::from(2usize), &limit);
 
         let mut second_op_data = second_operand_rand.to_bytes_le();
-        second_op_data.resize((width_rounded) as usize, 0);
+        second_op_data.resize(width_rounded, 0);
 
         contract.function_expect_failure(
             "mul",
@@ -1694,7 +1694,7 @@ fn destructure() {
 #[test]
 #[should_panic]
 fn addition_overflow() {
-    let mut runtime = build_solidity_with_overflow_check(
+    let mut runtime = build_solidity_with_options(
         r#"
         contract overflow {
             function foo(uint8 x) internal returns (uint8) {
@@ -1708,6 +1708,7 @@ fn addition_overflow() {
         }
         "#,
         true,
+        false,
     );
 
     runtime.function("bar", Vec::new());
@@ -1715,7 +1716,7 @@ fn addition_overflow() {
 
 #[test]
 fn unchecked_addition_overflow() {
-    let mut runtime = build_solidity_with_overflow_check(
+    let mut runtime = build_solidity_with_options(
         r#"
         contract overflow {
             function foo(uint8 x) internal returns (uint8) {
@@ -1731,6 +1732,7 @@ fn unchecked_addition_overflow() {
         }
         "#,
         true,
+        false,
     );
 
     runtime.function("bar", Vec::new());
@@ -1739,7 +1741,7 @@ fn unchecked_addition_overflow() {
 #[test]
 #[should_panic]
 fn subtraction_underflow() {
-    let mut runtime = build_solidity_with_overflow_check(
+    let mut runtime = build_solidity_with_options(
         r#"
         contract underflow {
             function foo(uint64 x) internal returns (uint64) {
@@ -1753,6 +1755,7 @@ fn subtraction_underflow() {
         }
         "#,
         true,
+        false,
     );
 
     runtime.function("bar", Vec::new());
@@ -1760,7 +1763,7 @@ fn subtraction_underflow() {
 
 #[test]
 fn unchecked_subtraction_underflow() {
-    let mut runtime = build_solidity_with_overflow_check(
+    let mut runtime = build_solidity_with_options(
         r#"
         contract underflow {
             function foo(uint64 x) internal returns (uint64) {
@@ -1776,6 +1779,7 @@ fn unchecked_subtraction_underflow() {
         }
         "#,
         true,
+        false,
     );
 
     runtime.function("bar", Vec::new());
@@ -1784,7 +1788,7 @@ fn unchecked_subtraction_underflow() {
 #[test]
 #[should_panic]
 fn multiplication_overflow() {
-    let mut runtime = build_solidity_with_overflow_check(
+    let mut runtime = build_solidity_with_options(
         r#"
         contract overflow {
             function foo(int8 x) internal returns (int8) {
@@ -1798,6 +1802,7 @@ fn multiplication_overflow() {
         }
         "#,
         true,
+        false,
     );
 
     runtime.function("bar", Vec::new());
@@ -1805,7 +1810,7 @@ fn multiplication_overflow() {
 
 #[test]
 fn unchecked_multiplication_overflow() {
-    let mut runtime = build_solidity_with_overflow_check(
+    let mut runtime = build_solidity_with_options(
         r#"
         contract overflow {
             function foo(int8 x) internal returns (int8) {
@@ -1821,6 +1826,7 @@ fn unchecked_multiplication_overflow() {
         }
         "#,
         true,
+        false,
     );
 
     runtime.function("bar", Vec::new());

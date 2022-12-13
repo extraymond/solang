@@ -118,6 +118,7 @@ pub fn compile(
     opt_level: inkwell::OptimizationLevel,
     target: Target,
     math_overflow_check: bool,
+    log_api_return_codes: bool,
 ) -> (Vec<(Vec<u8>, String)>, sema::ast::Namespace) {
     let mut ns = parse_and_resolve(filename, resolver, target);
 
@@ -130,6 +131,7 @@ pub fn compile(
         &mut ns,
         &codegen::Options {
             math_overflow_check,
+            log_api_return_codes,
             opt_level: opt_level.into(),
             ..Default::default()
         },
@@ -149,26 +151,6 @@ pub fn compile(
         .collect();
 
     (results, ns)
-}
-
-/// Build a single binary out of multiple contracts. This is only possible on Solana
-#[cfg(feature = "llvm")]
-pub fn compile_many<'a>(
-    context: &'a inkwell::context::Context,
-    namespaces: &'a [&sema::ast::Namespace],
-    filename: &str,
-    opt: inkwell::OptimizationLevel,
-    math_overflow_check: bool,
-    generate_debug_info: bool,
-) -> emit::binary::Binary<'a> {
-    emit::binary::Binary::build_bundle(
-        context,
-        namespaces,
-        filename,
-        opt,
-        math_overflow_check,
-        generate_debug_info,
-    )
 }
 
 /// Parse and resolve the Solidity source code provided in src, for the target chain as specified in target.

@@ -110,13 +110,6 @@ pub(crate) fn resolve_yul_statement(
                 ns,
             )?;
             resolved_statements.push(resolved_switch.0);
-            ns.diagnostics.push(
-                Diagnostic::error(
-                    switch_statement.loc,
-                    "switch statements have no implementation in code generation yet. Please, file a GitHub issue \
-                    if there is urgent need for such a feature".to_string()
-                )
-            );
             Ok(resolved_switch.1)
         }
 
@@ -171,6 +164,7 @@ pub(crate) fn resolve_yul_statement(
             resolved_statements.push(resolved_for.0);
             Ok(resolved_for.1)
         }
+        pt::YulStatement::Error(..) => Err(()),
     }
 }
 

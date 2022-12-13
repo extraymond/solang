@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::cfg::{BasicBlock, ControlFlowGraph, Instr};
+use crate::codegen::reaching_definitions::block_edges;
 use crate::codegen::Expression;
 use crate::sema::ast::{Namespace, RetrieveType, Type};
 use solang_parser::pt::Loc;
@@ -180,7 +181,7 @@ fn reaching_definitions(cfg: &mut ControlFlowGraph) -> (Vec<Vec<Vec<Transfer>>>,
 fn instr_transfers(block_no: usize, block: &BasicBlock) -> Vec<Vec<Transfer>> {
     let mut transfers = Vec::new();
 
-    for (instr_no, instr) in block.instr.iter().enumerate() {
+    for (instr_no, (_, instr)) in block.instr.iter().enumerate() {
         let def = Definition::Instr {
             block_no,
             instr_no,
@@ -332,7 +333,7 @@ fn apply_transfers(
 
     debug_assert_eq!(transfers.len(), cfg.blocks[block_no].instr.len());
 
-    // this is done in two paseses. The first pass just deals with variables.
+    // this is done in two passes. The first pass just deals with variables.
     // The second pass deals with storage stores
 
     // for each instruction
@@ -472,37 +473,6 @@ fn apply_transfers(
     block_vars.insert(block_no, res);
 }
 
-fn block_edges(block: &BasicBlock) -> Vec<usize> {
-    let mut out = Vec::new();
-
-    // out cfg has edge as the last instruction in a block; EXCEPT
-    // Instr::AbiDecode() which has an edge when decoding fails
-    for instr in &block.instr {
-        match instr {
-            Instr::Branch { block } => {
-                out.push(*block);
-            }
-            Instr::BranchCond {
-                true_block,
-                false_block,
-                ..
-            } => {
-                out.push(*true_block);
-                out.push(*false_block);
-            }
-            Instr::AbiDecode {
-                exception_block: Some(block),
-                ..
-            } => {
-                out.push(*block);
-            }
-            _ => (),
-        }
-    }
-
-    out
-}
-
 /// Eliminate dead storage load/store.
 pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
     // first calculate reaching definitions. We use a special case reaching definitions, which we track
@@ -520,7 +490,7 @@ pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
 
             let vars = &block_vars[&block_no][instr_no];
 
-            match &cfg.blocks[block_no].instr[instr_no] {
+            match &cfg.blocks[block_no].instr[instr_no].1 {
                 Instr::LoadStorage { res, ty, storage } => {
                     // is there a definition which has the same storage expression
                     let mut found = None;
@@ -553,7 +523,7 @@ pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
                     }
 
                     if let Some(var_no) = found {
-                        cfg.blocks[block_no].instr[instr_no] = Instr::Set {
+                        cfg.blocks[block_no].instr[instr_no].1 = Instr::Set {
                             loc: Loc::Codegen,
                             res: *res,
                             expr: Expression::Variable(Loc::Codegen, ty.clone(), *var_no),
@@ -624,10 +594,10 @@ pub fn dead_storage(cfg: &mut ControlFlowGraph, _ns: &mut Namespace) {
                 // Function calls should never be eliminated from the CFG, as they might have side effects
                 // In addition, AbiDecode might fail and halt the execution.
                 if !matches!(
-                    cfg.blocks[*block_no].instr[*instr_no],
+                    cfg.blocks[*block_no].instr[*instr_no].1,
                     Instr::Call { .. } | Instr::AbiDecode { .. }
                 ) {
-                    cfg.blocks[*block_no].instr[*instr_no] = Instr::Nop;
+                    cfg.blocks[*block_no].instr[*instr_no].1 = Instr::Nop;
                 }
             }
         }
@@ -648,7 +618,7 @@ fn get_storage_definition<'a>(
         block_no, instr_no, ..
     } = def
     {
-        match &cfg.blocks[*block_no].instr[*instr_no] {
+        match &cfg.blocks[*block_no].instr[*instr_no].1 {
             Instr::LoadStorage {
                 storage, res, ty, ..
             } => Some(StorageDef {
@@ -671,7 +641,7 @@ fn get_definition<'a>(
         block_no, instr_no, ..
     } = def
     {
-        match &cfg.blocks[*block_no].instr[*instr_no] {
+        match &cfg.blocks[*block_no].instr[*instr_no].1 {
             Instr::LoadStorage { storage, ty, .. } => Some((storage, ty.clone())),
             Instr::Set { expr, .. } => Some((expr, expr.ty())),
             _ => None,

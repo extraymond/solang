@@ -2,6 +2,7 @@
 
 use handlebars::Handlebars;
 use serde::Serialize;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
@@ -153,7 +154,9 @@ fn get_tag_no<'a>(name: &str, no: usize, tags: &'a [ast::Tag]) -> Option<&'a str
         .map(|e| &e.value as &str)
 }
 
-pub fn generate_docs(outdir: &str, files: &[ast::Namespace], verbose: bool) {
+/// Generate documentation from the doccomments. This may be replaced with force-doc
+/// one day (once it exists)
+pub fn generate_docs(outdir: &OsString, files: &[ast::Namespace], verbose: bool) {
     let mut top = Top {
         contracts: Vec::new(),
         events: Vec::new(),
@@ -233,8 +236,8 @@ pub fn generate_docs(outdir: &str, files: &[ast::Namespace], verbose: bool) {
 
             let mut field: Vec<&str> = Vec::new();
             field.resize(enum_decl.values.len(), "");
-            for (value, (_, pos)) in &enum_decl.values {
-                field[*pos] = value;
+            for (idx, (value, _)) in enum_decl.values.iter().enumerate() {
+                field[idx] = value;
             }
 
             top.enums.push(EnumDecl {

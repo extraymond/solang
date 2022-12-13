@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::codegen::expression::assert_failure;
 use crate::codegen::{
     cfg::{ControlFlowGraph, Instr},
     vartable::Vartable,
@@ -74,30 +75,14 @@ pub(crate) fn process_builtin(
         | YulBuiltInFunction::Shl
         | YulBuiltInFunction::Shr
         | YulBuiltInFunction::Sar
-        | YulBuiltInFunction::Exp => {
-            process_binary_arithmetic(loc, builtin_ty, args, contract_no, ns, vartab, cfg, opt)
+        | YulBuiltInFunction::Exp
+        | YulBuiltInFunction::AddMod
+        | YulBuiltInFunction::MulMod => {
+            process_arithmetic(loc, builtin_ty, args, contract_no, ns, vartab, cfg, opt)
         }
 
         YulBuiltInFunction::Byte => {
             byte_builtin(loc, args, contract_no, ns, cfg, vartab, opt)
-        }
-
-        YulBuiltInFunction::AddMod
-        | YulBuiltInFunction::MulMod => {
-            let left = expression(&args[0], contract_no, ns, vartab, cfg, opt);
-            let right = expression(&args[1], contract_no, ns, vartab, cfg, opt);
-            let (left, right) = equalize_types(left, right, ns);
-
-            let main_expr = if matches!(builtin_ty, YulBuiltInFunction::AddMod) {
-                Expression::Add(*loc, left.ty(), false, Box::new(left), Box::new(right))
-            } else {
-                Expression::Multiply(*loc, left.ty(), false, Box::new(left), Box::new(right))
-            };
-
-            let mod_arg = expression(&args[2], contract_no, ns, vartab, cfg, opt);
-            let (mod_left, mod_right) = equalize_types(main_expr, mod_arg, ns);
-            let codegen_expr = Expression::UnsignedModulo(*loc, mod_left.ty(), Box::new(mod_left), Box::new(mod_right.clone()));
-            branch_if_zero(mod_right, codegen_expr, cfg, vartab)
         }
 
         YulBuiltInFunction::SignExtend
@@ -178,12 +163,12 @@ pub(crate) fn process_builtin(
 
         YulBuiltInFunction::SelfDestruct => {
             let recipient = expression(&args[0], contract_no, ns, vartab, cfg, opt).cast(&Type::Address(true), ns);
-            cfg.add(vartab, Instr::SelfDestruct { recipient });
+            cfg.add_yul(vartab, Instr::SelfDestruct { recipient });
             Expression::Poison
         }
 
         YulBuiltInFunction::Invalid => {
-            cfg.add(vartab, Instr::AssertFailure { expr: None });
+            assert_failure(loc, None, ns, cfg, vartab);
             Expression::Poison
         }
 
@@ -223,8 +208,8 @@ pub(crate) fn process_builtin(
     }
 }
 
-/// Process arithmetic operations with two arguments
-fn process_binary_arithmetic(
+/// Process arithmetic operations
+fn process_arithmetic(
     loc: &pt::Loc,
     builtin_ty: &YulBuiltInFunction,
     args: &[ast::YulExpression],
@@ -304,6 +289,23 @@ fn process_binary_arithmetic(
             Expression::ShiftRight(*loc, left.ty(), Box::new(right), Box::new(left), true)
         }
 
+        YulBuiltInFunction::AddMod | YulBuiltInFunction::MulMod => {
+            let modulo_operand = expression(&args[2], contract_no, ns, vartab, cfg, opt);
+            let (_, equalized_modulo) = equalize_types(left.clone(), modulo_operand.clone(), ns);
+            let builtin = if builtin_ty == &YulBuiltInFunction::AddMod {
+                Builtin::AddMod
+            } else {
+                Builtin::MulMod
+            };
+            let codegen_expr = Expression::Builtin(
+                *loc,
+                vec![left.ty()],
+                builtin,
+                vec![right, left, equalized_modulo],
+            );
+            branch_if_zero(modulo_operand, codegen_expr, cfg, vartab)
+        }
+
         _ => panic!("This is not a binary arithmetic operation!"),
     }
 }
@@ -373,7 +375,7 @@ fn branch_if_zero(
     let then = cfg.new_basic_block("then".to_string());
     let else_ = cfg.new_basic_block("else".to_string());
     let endif = cfg.new_basic_block("endif".to_string());
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::BranchCond {
             cond,
@@ -384,7 +386,7 @@ fn branch_if_zero(
 
     cfg.set_basic_block(then);
     vartab.new_dirty_tracker();
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::Set {
             loc: pt::Loc::Codegen,
@@ -392,10 +394,10 @@ fn branch_if_zero(
             expr: Expression::NumberLiteral(pt::Loc::Codegen, Type::Uint(256), BigInt::from(0)),
         },
     );
-    cfg.add(vartab, Instr::Branch { block: endif });
+    cfg.add_yul(vartab, Instr::Branch { block: endif });
 
     cfg.set_basic_block(else_);
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::Set {
             loc: pt::Loc::Codegen,
@@ -403,7 +405,7 @@ fn branch_if_zero(
             expr: codegen_expr,
         },
     );
-    cfg.add(vartab, Instr::Branch { block: endif });
+    cfg.add_yul(vartab, Instr::Branch { block: endif });
     cfg.set_phis(endif, vartab.pop_dirty_tracker());
     cfg.set_basic_block(endif);
 
@@ -437,7 +439,7 @@ fn byte_builtin(
     let else_ = cfg.new_basic_block("else".to_string());
     let endif = cfg.new_basic_block("endif".to_string());
 
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::BranchCond {
             cond,
@@ -448,7 +450,7 @@ fn byte_builtin(
 
     cfg.set_basic_block(then);
     vartab.new_dirty_tracker();
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::Set {
             loc: pt::Loc::Codegen,
@@ -456,7 +458,7 @@ fn byte_builtin(
             expr: Expression::NumberLiteral(pt::Loc::Codegen, Type::Uint(256), BigInt::zero()),
         },
     );
-    cfg.add(vartab, Instr::Branch { block: endif });
+    cfg.add_yul(vartab, Instr::Branch { block: endif });
 
     cfg.set_basic_block(else_);
 
@@ -502,7 +504,7 @@ fn byte_builtin(
         )),
     );
 
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::Set {
             loc: *loc,
@@ -510,7 +512,7 @@ fn byte_builtin(
             expr: masked_result,
         },
     );
-    cfg.add(vartab, Instr::Branch { block: endif });
+    cfg.add_yul(vartab, Instr::Branch { block: endif });
 
     cfg.set_phis(endif, vartab.pop_dirty_tracker());
     cfg.set_basic_block(endif);

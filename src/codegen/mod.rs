@@ -3,11 +3,15 @@
 mod array_boundary;
 pub mod cfg;
 mod constant_folding;
+mod constructor;
 mod dead_storage;
+mod dispatch;
 mod encoding;
+mod events;
 mod expression;
 mod external_functions;
 mod reaching_definitions;
+mod solana_deploy;
 mod statements;
 mod storage;
 mod strength_reduce;
@@ -33,13 +37,14 @@ use crate::{sema::ast, Target};
 use std::cmp::Ordering;
 
 use crate::codegen::cfg::ASTFunction;
+use crate::codegen::dispatch::{constructor_dispatch, function_dispatch};
 use crate::codegen::yul::generate_yul_function_cfg;
 use crate::sema::Recurse;
 use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 use num_traits::{FromPrimitive, Zero};
 use solang_parser::pt;
-use solang_parser::pt::CodeLocation;
+use solang_parser::pt::{CodeLocation, FunctionTy};
 
 // The sizeof(struct account_data_header)
 pub const SOLANA_FIRST_OFFSET: u64 = 16;
@@ -86,6 +91,7 @@ pub struct Options {
     pub common_subexpression_elimination: bool,
     pub generate_debug_information: bool,
     pub opt_level: OptimizationLevel,
+    pub log_api_return_codes: bool,
 }
 
 impl Default for Options {
@@ -99,6 +105,7 @@ impl Default for Options {
             common_subexpression_elimination: true,
             generate_debug_information: false,
             opt_level: OptimizationLevel::Default,
+            log_api_return_codes: false,
         }
     }
 }
@@ -141,8 +148,8 @@ pub fn codegen(ns: &mut Namespace, opt: &Options) {
                 return;
             }
 
-            // Solana creates a single bundle, EVM has no emitter implemented yet
-            if ns.target != Target::Solana && ns.target != Target::EVM {
+            // EVM has no emitter implemented yet
+            if ns.target != Target::EVM {
                 #[cfg(not(feature = "llvm"))]
                 panic!("LLVM feature is not enabled");
                 #[cfg(feature = "llvm")]
@@ -158,6 +165,7 @@ pub fn codegen(ns: &mut Namespace, opt: &Options) {
                         opt.opt_level.into(),
                         opt.math_overflow_check,
                         opt.generate_debug_information,
+                        opt.log_api_return_codes,
                     );
 
                     let code = binary.code(Generate::Linked).expect("llvm build");
@@ -236,6 +244,23 @@ fn contract(contract_no: usize, ns: &mut Namespace, opt: &Options) {
             ns.contracts[contract_no].default_constructor = Some((func, cfg_no));
         }
 
+        // TODO: This is a temporary solution. Once Substrate's dispatch moves to codegen,
+        // we can remove this if-condition.
+        if ns.target == Target::Solana {
+            let dispatch_cfg = function_dispatch(contract_no, &all_cfg, ns);
+            ns.contracts[contract_no].dispatch_no = all_cfg.len();
+            all_cfg.push(dispatch_cfg);
+
+            for cfg_no in 0..all_cfg.len() {
+                if all_cfg[cfg_no].ty == FunctionTy::Constructor && all_cfg[cfg_no].public {
+                    let dispatch_cfg = constructor_dispatch(contract_no, cfg_no, &all_cfg, ns, opt);
+                    ns.contracts[contract_no].constructor_dispatch = Some(all_cfg.len());
+                    all_cfg.push(dispatch_cfg);
+                    break;
+                }
+            }
+        }
+
         ns.contracts[contract_no].cfg = all_cfg;
     }
 }
@@ -276,9 +301,7 @@ fn storage_initializer(contract_no: usize, ns: &mut Namespace, opt: &Options) ->
 
     cfg.add(&mut vartab, Instr::Return { value: Vec::new() });
 
-    let (vars, next_id) = vartab.drain();
-    cfg.vars = vars;
-    ns.next_id = next_id;
+    vartab.finalize(ns, &mut cfg);
 
     optimize_and_check_cfg(&mut cfg, ns, ASTFunction::None, opt);
 
@@ -358,7 +381,7 @@ pub enum Expression {
         args: Vec<Expression>,
     },
     Add(pt::Loc, Type, bool, Box<Expression>, Box<Expression>),
-    AllocDynamicArray(pt::Loc, Type, Box<Expression>, Option<Vec<u8>>),
+    AllocDynamicBytes(pt::Loc, Type, Box<Expression>, Option<Vec<u8>>),
     ArrayLiteral(pt::Loc, Type, Vec<u32>, Vec<Expression>),
     BitwiseAnd(pt::Loc, Type, Box<Expression>, Box<Expression>),
     BitwiseOr(pt::Loc, Type, Box<Expression>, Box<Expression>),
@@ -483,7 +506,7 @@ impl CodeLocation for Expression {
             | Expression::ShiftRight(loc, ..)
             | Expression::ShiftLeft(loc, ..)
             | Expression::RationalNumberLiteral(loc, ..)
-            | Expression::AllocDynamicArray(loc, ..)
+            | Expression::AllocDynamicBytes(loc, ..)
             | Expression::BytesCast(loc, ..)
             | Expression::SignedMore(loc, ..)
             | Expression::UnsignedMore(loc, ..)
@@ -555,7 +578,7 @@ impl Recurse for Expression {
             | Expression::Load(_, _, exp)
             | Expression::StorageArrayLength { array: exp, .. }
             | Expression::StructMember(_, _, exp, _)
-            | Expression::AllocDynamicArray(_, _, exp, _) => {
+            | Expression::AllocDynamicBytes(_, _, exp, _) => {
                 exp.recurse(cx, f);
             }
 
@@ -634,7 +657,7 @@ impl RetrieveType for Expression {
             | Expression::StructMember(_, ty, ..)
             | Expression::StringConcat(_, ty, ..)
             | Expression::FunctionArg(_, ty, ..)
-            | Expression::AllocDynamicArray(_, ty, ..)
+            | Expression::AllocDynamicBytes(_, ty, ..)
             | Expression::BytesCast(_, ty, ..)
             | Expression::RationalNumberLiteral(_, ty, ..)
             | Expression::Subscript(_, ty, ..) => ty.clone(),
@@ -717,7 +740,7 @@ impl Expression {
             }
             (&Expression::BytesLiteral(loc, _, ref init), _, &Type::DynamicBytes)
             | (&Expression::BytesLiteral(loc, _, ref init), _, &Type::String) => {
-                return Expression::AllocDynamicArray(
+                return Expression::AllocDynamicBytes(
                     loc,
                     to.clone(),
                     Box::new(Expression::NumberLiteral(
@@ -1125,8 +1148,8 @@ impl Expression {
                 Expression::StructMember(loc, ty, expr, field) => {
                     Expression::StructMember(*loc, ty.clone(), Box::new(filter(expr, ctx)), *field)
                 }
-                Expression::AllocDynamicArray(loc, ty, expr, initializer) => {
-                    Expression::AllocDynamicArray(
+                Expression::AllocDynamicBytes(loc, ty, expr, initializer) => {
+                    Expression::AllocDynamicBytes(
                         *loc,
                         ty.clone(),
                         Box::new(filter(expr, ctx)),
@@ -1254,7 +1277,6 @@ pub enum Builtin {
     Signature,
     SignatureVerify,
     Timestamp,
-    TombstoneDeposit,
     Value,
     WriteAddress,
     WriteInt8,
@@ -1314,7 +1336,6 @@ impl From<&ast::Builtin> for Builtin {
             ast::Builtin::Signature => Builtin::Signature,
             ast::Builtin::SignatureVerify => Builtin::SignatureVerify,
             ast::Builtin::Timestamp => Builtin::Timestamp,
-            ast::Builtin::TombstoneDeposit => Builtin::TombstoneDeposit,
             ast::Builtin::Value => Builtin::Value,
             ast::Builtin::WriteAddress => Builtin::WriteAddress,
             ast::Builtin::WriteInt8 => Builtin::WriteInt8,

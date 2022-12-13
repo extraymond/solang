@@ -101,7 +101,7 @@ fn block_reduce(
     mut vars: Variables,
     ns: &mut Namespace,
 ) {
-    for instr in &mut cfg.blocks[block_no].instr {
+    for (_, instr) in &mut cfg.blocks[block_no].instr {
         match instr {
             Instr::Set { expr, .. } => {
                 *expr = expression_reduce(expr, &vars, ns);
@@ -122,7 +122,9 @@ fn block_reduce(
                 *dest = expression_reduce(dest, &vars, ns);
                 *data = expression_reduce(data, &vars, ns);
             }
-            Instr::AssertFailure { expr: Some(expr) } => {
+            Instr::AssertFailure {
+                encoded_args: Some(expr),
+            } => {
                 *expr = expression_reduce(expr, &vars, ns);
             }
             Instr::Print { expr } => {
@@ -158,16 +160,15 @@ fn block_reduce(
                 *value = Box::new(expression_reduce(value, &vars, ns));
             }
             Instr::Constructor {
-                args,
+                encoded_args,
+                encoded_args_len,
                 value,
                 gas,
                 salt,
                 ..
             } => {
-                *args = args
-                    .iter()
-                    .map(|e| expression_reduce(e, &vars, ns))
-                    .collect();
+                *encoded_args = expression_reduce(encoded_args, &vars, ns);
+                *encoded_args_len = expression_reduce(encoded_args_len, &vars, ns);
                 if let Some(value) = value {
                     *value = expression_reduce(value, &vars, ns);
                 }
@@ -207,6 +208,9 @@ fn block_reduce(
                     .iter()
                     .map(|e| expression_reduce(e, &vars, ns))
                     .collect();
+            }
+            Instr::WriteBuffer { offset, .. } => {
+                *offset = expression_reduce(offset, &vars, ns);
             }
             _ => (),
         }

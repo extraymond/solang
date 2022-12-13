@@ -8,7 +8,7 @@ use crate::codegen::yul::expression::{expression, process_function_call};
 use crate::codegen::{Expression, Options};
 use crate::sema::ast::{Namespace, RetrieveType, Type};
 use crate::sema::yul::ast;
-use crate::sema::yul::ast::{YulStatement, YulSuffix};
+use crate::sema::yul::ast::{CaseBlock, YulBlock, YulExpression, YulStatement, YulSuffix};
 use num_bigint::BigInt;
 use num_traits::FromPrimitive;
 use solang_parser::pt;
@@ -67,10 +67,23 @@ pub(crate) fn statement(
             opt,
         ),
 
-        YulStatement::Switch { .. } => {
-            // Switch statements should use LLVM switch instruction, which requires changes in emit.
-            unreachable!("Switch statements for yul are not implemented yet");
-        }
+        YulStatement::Switch {
+            condition,
+            cases,
+            default,
+            ..
+        } => switch(
+            condition,
+            cases,
+            default,
+            loops,
+            contract_no,
+            ns,
+            vartab,
+            cfg,
+            early_return,
+            opt,
+        ),
 
         YulStatement::For {
             loc,
@@ -96,14 +109,14 @@ pub(crate) fn statement(
 
         YulStatement::Leave(..) => {
             if let Some(early_leave) = early_return {
-                cfg.add(vartab, early_leave.clone());
+                cfg.add_yul(vartab, early_leave.clone());
             } else {
-                cfg.add(vartab, Instr::Return { value: vec![] });
+                cfg.add_yul(vartab, Instr::Return { value: vec![] });
             }
         }
 
         YulStatement::Break(..) => {
-            cfg.add(
+            cfg.add_yul(
                 vartab,
                 Instr::Branch {
                     block: loops.do_break(),
@@ -112,7 +125,7 @@ pub(crate) fn statement(
         }
 
         YulStatement::Continue(..) => {
-            cfg.add(
+            cfg.add_yul(
                 vartab,
                 Instr::Branch {
                     block: loops.do_continue(),
@@ -149,7 +162,7 @@ fn process_variable_declaration(
     };
 
     for (var_index, item) in vars.iter().enumerate() {
-        cfg.add(
+        cfg.add_yul(
             vartab,
             Instr::Set {
                 loc: *loc,
@@ -203,7 +216,7 @@ fn cfg_single_assigment(
         | ast::YulExpression::SolidityLocalVariable(_, ty, None, var_no) => {
             // Ensure both types are compatible
             let rhs = rhs.cast(ty, ns);
-            cfg.add(
+            cfg.add_yul(
                 vartab,
                 Instr::Set {
                     loc: *loc,
@@ -221,7 +234,7 @@ fn cfg_single_assigment(
         ) => {
             // This is an assignment to a pointer, so we make sure the rhs has a compatible size
             let rhs = rhs.cast(ty, ns);
-            cfg.add(
+            cfg.add_yul(
                 vartab,
                 Instr::Set {
                     loc: *loc,
@@ -241,7 +254,7 @@ fn cfg_single_assigment(
                 ) => match suffix {
                     YulSuffix::Offset => {
                         let rhs = rhs.cast(&lhs.ty(), ns);
-                        cfg.add(
+                        cfg.add_yul(
                             vartab,
                             Instr::Set {
                                 loc: *loc,
@@ -277,7 +290,7 @@ fn cfg_single_assigment(
                         member_no,
                     );
 
-                    cfg.add(
+                    cfg.add_yul(
                         vartab,
                         Instr::Store {
                             dest: ptr,
@@ -295,7 +308,7 @@ fn cfg_single_assigment(
                     // This assignment changes the value of a pointer to storage
                     if matches!(suffix, YulSuffix::Slot) {
                         let rhs = rhs.cast(&lhs.ty(), ns);
-                        cfg.add(
+                        cfg.add_yul(
                             vartab,
                             Instr::Set {
                                 loc: *loc,
@@ -354,7 +367,7 @@ fn process_if_block(
     let then = cfg.new_basic_block("then".to_string());
     let endif = cfg.new_basic_block("endif".to_string());
 
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::BranchCond {
             cond: bool_cond,
@@ -371,7 +384,7 @@ fn process_if_block(
     }
 
     if block.is_next_reachable() {
-        cfg.add(vartab, Instr::Branch { block: endif });
+        cfg.add_yul(vartab, Instr::Branch { block: endif });
     }
 
     cfg.set_phis(endif, vartab.pop_dirty_tracker());
@@ -407,7 +420,7 @@ fn process_for_block(
     let body_block = cfg.new_basic_block("body".to_string());
     let end_block = cfg.new_basic_block("end_for".to_string());
 
-    cfg.add(vartab, Instr::Branch { block: cond_block });
+    cfg.add_yul(vartab, Instr::Branch { block: cond_block });
     cfg.set_basic_block(cond_block);
 
     let cond_expr = expression(condition, contract_no, ns, vartab, cfg, opt);
@@ -426,7 +439,7 @@ fn process_for_block(
         )
     };
 
-    cfg.add(
+    cfg.add_yul(
         vartab,
         Instr::BranchCond {
             cond: cond_expr,
@@ -444,7 +457,7 @@ fn process_for_block(
     }
 
     if execution_block.is_next_reachable() {
-        cfg.add(vartab, Instr::Branch { block: next_block });
+        cfg.add_yul(vartab, Instr::Branch { block: next_block });
     }
 
     loops.leave_scope();
@@ -456,7 +469,7 @@ fn process_for_block(
     }
 
     if post_block.is_next_reachable() {
-        cfg.add(vartab, Instr::Branch { block: cond_block });
+        cfg.add_yul(vartab, Instr::Branch { block: cond_block });
     }
 
     cfg.set_basic_block(end_block);
@@ -464,4 +477,68 @@ fn process_for_block(
     cfg.set_phis(next_block, set.clone());
     cfg.set_phis(end_block, set.clone());
     cfg.set_phis(cond_block, set);
+}
+
+/// Generate CFG code for a switch statement
+fn switch(
+    condition: &YulExpression,
+    cases: &[CaseBlock],
+    default: &Option<YulBlock>,
+    loops: &mut LoopScopes,
+    contract_no: usize,
+    ns: &Namespace,
+    vartab: &mut Vartable,
+    cfg: &mut ControlFlowGraph,
+    early_return: &Option<Instr>,
+    opt: &Options,
+) {
+    let cond = expression(condition, contract_no, ns, vartab, cfg, opt);
+    let end_switch = cfg.new_basic_block("end_switch".to_string());
+
+    let current_block = cfg.current_block();
+
+    vartab.new_dirty_tracker();
+    let mut cases_cfg: Vec<(Expression, usize)> = Vec::with_capacity(cases.len());
+    for (item_no, item) in cases.iter().enumerate() {
+        let case_cond =
+            expression(&item.condition, contract_no, ns, vartab, cfg, opt).cast(&cond.ty(), ns);
+        let case_block = cfg.new_basic_block(format!("case_{}", item_no));
+        cfg.set_basic_block(case_block);
+        for stmt in &item.block.body {
+            statement(stmt, contract_no, loops, ns, cfg, vartab, early_return, opt);
+        }
+        if item.block.is_next_reachable() {
+            cfg.add_yul(vartab, Instr::Branch { block: end_switch });
+        }
+        cases_cfg.push((case_cond, case_block));
+    }
+
+    let default_block = if let Some(default_block) = default {
+        let new_block = cfg.new_basic_block("default".to_string());
+        cfg.set_basic_block(new_block);
+        for stmt in &default_block.body {
+            statement(stmt, contract_no, loops, ns, cfg, vartab, early_return, opt);
+        }
+        if default_block.is_next_reachable() {
+            cfg.add_yul(vartab, Instr::Branch { block: end_switch });
+        }
+        new_block
+    } else {
+        end_switch
+    };
+
+    cfg.set_phis(end_switch, vartab.pop_dirty_tracker());
+
+    cfg.set_basic_block(current_block);
+
+    cfg.add_yul(
+        vartab,
+        Instr::Switch {
+            cond,
+            cases: cases_cfg,
+            default: default_block,
+        },
+    );
+
+    cfg.set_basic_block(end_switch);
 }

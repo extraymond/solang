@@ -8,6 +8,7 @@ use crate::codegen::subexpression_elimination::{AvailableExpression, AvailableEx
 use crate::codegen::Expression;
 use crate::sema::ast::{StringLocation, Type};
 use num_bigint::{BigInt, Sign};
+use num_traits::Zero;
 use solang_parser::pt::Loc;
 
 #[test]
@@ -122,7 +123,7 @@ fn non_commutative() {
     );
 
     let instr = Instr::AssertFailure {
-        expr: Some(sub.clone()),
+        encoded_args: Some(sub.clone()),
     };
 
     let mut ave = AvailableExpression::default();
@@ -206,6 +207,7 @@ fn invalid() {
         exception_block: None,
         tys: vec![],
         data: exp.clone(),
+        data_len: None,
     };
 
     let mut ave = AvailableExpression::default();
@@ -333,12 +335,13 @@ fn string() {
         success: None,
         res: 0,
         contract_no: 0,
-        constructor_no: None,
-        args: vec![concat.clone()],
+        encoded_args: concat.clone(),
+        encoded_args_len: Expression::NumberLiteral(Loc::Codegen, Type::Uint(32), BigInt::zero()),
         value: Some(compare.clone()),
         gas: concat2.clone(),
         salt: Some(compare2.clone()),
-        space: None,
+        address: None,
+        seeds: None,
     };
 
     let mut ave = AvailableExpression::default();

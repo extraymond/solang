@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::sema::ast::{Namespace, Parameter, StructDecl, StructType, Type};
 use once_cell::sync::Lazy;
 use solang_parser::pt;
@@ -194,6 +196,7 @@ impl StructType {
             StructType::AccountInfo => &BUILTIN_STRUCTS[0],
             StructType::AccountMeta => &BUILTIN_STRUCTS[1],
             StructType::ExternalFunction => &BUILTIN_STRUCTS[2],
+            StructType::SolParameters => unreachable!("SolParameters is defined in a solana.c"),
         }
     }
 }

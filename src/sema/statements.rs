@@ -3,6 +3,7 @@
 use super::ast::*;
 use super::contracts::is_base;
 use super::diagnostics::Diagnostics;
+use super::eval::check_term_for_constant_overflow;
 use super::expression::{
     available_functions, call_expr, constructor_named_args, expression, function_call_expr,
     function_call_pos_args, match_constructor_to_args, named_call_expr, named_function_call_expr,
@@ -10,10 +11,12 @@ use super::expression::{
 };
 use super::symtable::{LoopScopes, Symtable};
 use crate::sema::builtin;
+use crate::sema::function_annotation::function_annotations;
 use crate::sema::symtable::{VariableInitializer, VariableUsage};
 use crate::sema::unused_variable::{assigned_variable, check_function_call, used_variable};
 use crate::sema::yul::resolve_inline_assembly;
 use crate::sema::Recurse;
+use crate::Target;
 use solang_parser::pt;
 use solang_parser::pt::CatchClause;
 use solang_parser::pt::CodeLocation;
@@ -23,6 +26,7 @@ use std::sync::Arc;
 
 pub fn resolve_function_body(
     def: &pt::FunctionDefinition,
+    annotations: &[&pt::Annotation],
     file_no: usize,
     contract_no: Option<usize>,
     function_no: usize,
@@ -61,6 +65,8 @@ pub fn resolve_function_body(
             symtable.arguments.push(None);
         }
     }
+
+    function_annotations(function_no, annotations, &mut symtable, &context, ns);
 
     // now that the function arguments have been resolved, we can resolve the bases for
     // constructors.
@@ -331,6 +337,7 @@ fn statement(
                     ResolveTo::Type(&var_ty),
                 )?;
 
+                expr.recurse(ns, check_term_for_constant_overflow);
                 used_variable(ns, &expr, symtable);
 
                 Some(Arc::new(expr.cast(
@@ -345,14 +352,18 @@ fn statement(
             };
 
             if let Some(pos) = symtable.add(
-                &decl.name,
+                decl.name.as_ref().unwrap(),
                 var_ty.clone(),
                 ns,
                 VariableInitializer::Solidity(initializer.clone()),
                 VariableUsage::LocalVariable,
                 decl.storage.clone(),
             ) {
-                ns.check_shadowing(context.file_no, context.contract_no, &decl.name);
+                ns.check_shadowing(
+                    context.file_no,
+                    context.contract_no,
+                    decl.name.as_ref().unwrap(),
+                );
 
                 res.push(Statement::VariableDecl(
                     *loc,
@@ -361,7 +372,7 @@ fn statement(
                         loc: decl.loc,
                         ty: var_ty,
                         ty_loc: Some(ty_loc),
-                        id: Some(decl.name.clone()),
+                        id: Some(decl.name.clone().unwrap()),
                         indexed: false,
                         readonly: false,
                         recursive: false,
@@ -700,6 +711,8 @@ fn statement(
         pt::Statement::Return(loc, Some(returns)) => {
             let expr = return_with_values(returns, loc, context, symtable, ns, diagnostics)?;
 
+            expr.recurse(ns, check_term_for_constant_overflow);
+
             for offset in symtable.returns.iter() {
                 let elem = symtable.vars.get_mut(offset).unwrap();
                 elem.assigned = true;
@@ -750,28 +763,37 @@ fn statement(
                         Err(())
                     };
                 }
-                pt::Expression::FunctionCall(loc, ty, args) => call_expr(
-                    loc,
-                    ty,
-                    args,
-                    true,
-                    context,
-                    ns,
-                    symtable,
-                    diagnostics,
-                    ResolveTo::Discard,
-                )?,
-                pt::Expression::NamedFunctionCall(loc, ty, args) => named_call_expr(
-                    loc,
-                    ty,
-                    args,
-                    true,
-                    context,
-                    ns,
-                    symtable,
-                    diagnostics,
-                    ResolveTo::Discard,
-                )?,
+                pt::Expression::FunctionCall(loc, ty, args) => {
+                    let ret = call_expr(
+                        loc,
+                        ty,
+                        args,
+                        true,
+                        context,
+                        ns,
+                        symtable,
+                        diagnostics,
+                        ResolveTo::Discard,
+                    )?;
+
+                    ret.recurse(ns, check_term_for_constant_overflow);
+                    ret
+                }
+                pt::Expression::NamedFunctionCall(loc, ty, args) => {
+                    let ret = named_call_expr(
+                        loc,
+                        ty,
+                        args,
+                        true,
+                        context,
+                        ns,
+                        symtable,
+                        diagnostics,
+                        ResolveTo::Discard,
+                    )?;
+                    ret.recurse(ns, check_term_for_constant_overflow);
+                    ret
+                }
                 _ => {
                     // is it a destructure statement
                     if let pt::Expression::Assign(_, var, expr) = expr {
@@ -890,6 +912,7 @@ fn statement(
             ));
             Err(())
         }
+        pt::Statement::Error(_) => unimplemented!(),
     }
 }
 
@@ -1355,7 +1378,7 @@ fn destructure_values(
             check_function_call(ns, &res, symtable);
             res
         }
-        pt::Expression::Ternary(loc, cond, left, right) => {
+        pt::Expression::ConditionalOperator(loc, cond, left, right) => {
             let cond = expression(
                 cond,
                 context,
@@ -1389,7 +1412,7 @@ fn destructure_values(
             )?;
             used_variable(ns, &right, symtable);
 
-            return Ok(Expression::Ternary(
+            return Ok(Expression::ConditionalOperator(
                 *loc,
                 Type::Unreachable,
                 Box::new(cond),
@@ -1577,7 +1600,7 @@ fn return_with_values(
             used_variable(ns, &expr, symtable);
             expr
         }
-        pt::Expression::Ternary(loc, cond, left, right) => {
+        pt::Expression::ConditionalOperator(loc, cond, left, right) => {
             let cond = expression(
                 cond,
                 context,
@@ -1595,7 +1618,7 @@ fn return_with_values(
                 return_with_values(right, &right.loc(), context, symtable, ns, diagnostics)?;
             used_variable(ns, &right, symtable);
 
-            return Ok(Expression::Ternary(
+            return Ok(Expression::ConditionalOperator(
                 *loc,
                 Type::Unreachable,
                 Box::new(cond),
@@ -1797,6 +1820,17 @@ fn try_catch(
     ns: &mut Namespace,
     diagnostics: &mut Diagnostics,
 ) -> Result<(Statement, bool), ()> {
+    if ns.target == Target::Solana {
+        diagnostics.push(Diagnostic::error(
+            *loc,
+            "The try-catch statement is not supported on Solana. Please, go to \
+             https://solang.readthedocs.io/en/latest/language/statements.html#try-catch-statement \
+             for more information"
+                .to_string(),
+        ));
+        return Err(());
+    }
+
     let mut expr = expr.remove_parenthesis();
     let mut ok = None;
 

@@ -37,7 +37,7 @@ fn find_writable_vectors(
     writable: &mut HashSet<Def>,
 ) {
     for instr_no in 0..block.instr.len() {
-        match &block.instr[instr_no] {
+        match &block.instr[instr_no].1 {
             Instr::Set {
                 res,
                 expr: Expression::Variable(_, _, var_no),
@@ -99,8 +99,10 @@ fn find_writable_vectors(
             // These instructions are fine with vectors
             Instr::Set { .. }
             | Instr::Nop
+            | Instr::ReturnCode { .. }
             | Instr::Branch { .. }
             | Instr::BranchCond { .. }
+            | Instr::Switch { .. }
             | Instr::PopMemory { .. }
             | Instr::LoadStorage { .. }
             | Instr::SetStorage { .. }
@@ -116,6 +118,7 @@ fn find_writable_vectors(
             | Instr::Unreachable
             | Instr::Print { .. }
             | Instr::AssertFailure { .. }
+            | Instr::ReturnData { .. }
             | Instr::ValueTransfer { .. } => {
                 apply_transfers(&block.transfers[instr_no], vars, writable);
             }
@@ -172,9 +175,9 @@ fn update_vectors_to_slice(
     for block_no in 0..cfg.blocks.len() {
         for instr_no in 0..cfg.blocks[block_no].instr.len() {
             if let Instr::Set {
-                expr: Expression::AllocDynamicArray(..),
+                expr: Expression::AllocDynamicBytes(..),
                 ..
-            } = &cfg.blocks[block_no].instr[instr_no]
+            } = &cfg.blocks[block_no].instr[instr_no].1
             {
                 let cur = Def {
                     block_no,
@@ -212,14 +215,14 @@ fn update_vectors_to_slice(
         if let Instr::Set {
             loc,
             res,
-            expr: Expression::AllocDynamicArray(_, _, len, Some(bs)),
-        } = &cfg.blocks[def.block_no].instr[def.instr_no]
+            expr: Expression::AllocDynamicBytes(_, _, len, Some(bs)),
+        } = &cfg.blocks[def.block_no].instr[def.instr_no].1
         {
             let res = *res;
-            cfg.blocks[def.block_no].instr[def.instr_no] = Instr::Set {
+            cfg.blocks[def.block_no].instr[def.instr_no].1 = Instr::Set {
                 loc: *loc,
                 res,
-                expr: Expression::AllocDynamicArray(
+                expr: Expression::AllocDynamicBytes(
                     *loc,
                     Type::Slice(Box::new(Type::Bytes(1))),
                     len.clone(),

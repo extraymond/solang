@@ -2,11 +2,10 @@
 
 use clap::{
     builder::{ArgAction, ValueParser},
-    value_parser, App, Arg, ArgMatches, Command, ValueSource,
+    parser::ValueSource,
+    value_parser, Arg, ArgMatches, Command,
 };
 use clap_complete::{generate, Shell};
-use itertools::Itertools;
-use num_traits::cast::ToPrimitive;
 use solang::{
     abi,
     codegen::{codegen, OptimizationLevel, Options},
@@ -22,16 +21,19 @@ use std::{
     fs::{create_dir_all, File},
     io::prelude::*,
     path::{Path, PathBuf},
+    process::exit,
 };
 
 mod doc;
+mod idl;
 mod languageserver;
 
 fn main() {
-    let version = format!("version {}", env!("SOLANG_VERSION"));
+    let version: &'static str = concat!("version ", env!("SOLANG_VERSION"));
+
     let app = || {
         Command::new("solang")
-            .version(&*version)
+            .version(version)
             .author(env!("CARGO_PKG_AUTHORS"))
             .about(env!("CARGO_PKG_DESCRIPTION"))
             .subcommand_required(true)
@@ -43,13 +45,13 @@ fn main() {
                             .help("Solidity input files")
                             .required(true)
                             .value_parser(ValueParser::os_string())
-                            .multiple_values(true),
+                            .num_args(1..),
                     )
                     .arg(
                         Arg::new("EMIT")
                             .help("Emit compiler state at early stage")
                             .long("emit")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser([
                                 "ast-dot", "cfg", "llvm-ir", "llvm-bc", "object", "asm",
                             ]),
@@ -58,7 +60,7 @@ fn main() {
                         Arg::new("OPT")
                             .help("Set llvm optimizer level")
                             .short('O')
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(["none", "less", "default", "aggressive"])
                             .default_value("default"),
                     )
@@ -66,7 +68,7 @@ fn main() {
                         Arg::new("TARGET")
                             .help("Target to build for [possible values: solana, substrate]")
                             .long("target")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(["solana", "substrate", "evm"])
                             .hide_possible_values(true)
                             .required(true),
@@ -75,7 +77,7 @@ fn main() {
                         Arg::new("ADDRESS_LENGTH")
                             .help("Address length on Substrate")
                             .long("address-length")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(value_parser!(u64).range(4..1024))
                             .default_value("32"),
                     )
@@ -84,19 +86,20 @@ fn main() {
                             .help("Value length on Substrate")
                             .long("value-length")
                             .value_parser(value_parser!(u64).range(4..1024))
-                            .takes_value(true)
+                            .num_args(1)
                             .default_value("16"),
                     )
                     .arg(
                         Arg::new("STD-JSON")
                             .help("mimic solidity json output on stdout")
-                            .conflicts_with_all(&["VERBOSE", "OUTPUT", "EMIT"])
+                            .conflicts_with_all(["VERBOSE", "OUTPUT", "EMIT"])
                             .long("standard-json"),
                     )
                     .arg(
                         Arg::new("VERBOSE")
                             .help("show debug messages")
                             .short('v')
+                            .action(ArgAction::SetTrue)
                             .long("verbose"),
                     )
                     .arg(
@@ -104,14 +107,15 @@ fn main() {
                             .help("output directory")
                             .short('o')
                             .long("output")
-                            .takes_value(true),
+                            .num_args(1)
+                            .value_parser(ValueParser::os_string()),
                     )
                     .arg(
                         Arg::new("IMPORTPATH")
                             .help("Directory to search for solidity files")
                             .short('I')
                             .long("importpath")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(ValueParser::path_buf())
                             .action(ArgAction::Append),
                     )
@@ -120,7 +124,7 @@ fn main() {
                             .help("Map directory to search for solidity files [format: map=path]")
                             .short('m')
                             .long("importmap")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(ValueParser::new(parse_import_map))
                             .action(ArgAction::Append),
                     )
@@ -166,11 +170,17 @@ fn main() {
                             .display_order(6),
                     )
                     .arg(
+                        Arg::new("LOGAPIRETURNS")
+                            .help("Log the return codes of runtime API calls in the environment")
+                            .long("log-api-return-codes")
+                            .action(ArgAction::SetTrue),
+                    )
+                    .arg(
                         Arg::new("GENERATEDEBUGINFORMATION")
                             .help("Enable generating debug information for LLVM IR")
                             .short('g')
                             .long("generate-debug-info")
-                            .hidden(true),
+                            .hide(true),
                     ),
             )
             .subcommand(
@@ -181,13 +191,13 @@ fn main() {
                             .help("Solidity input files")
                             .required(true)
                             .value_parser(ValueParser::os_string())
-                            .multiple_values(true),
+                            .num_args(1..),
                     )
                     .arg(
                         Arg::new("TARGET")
                             .help("Target to build for")
                             .long("target")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(["solana", "substrate", "evm"])
                             .required(true),
                     )
@@ -195,7 +205,7 @@ fn main() {
                         Arg::new("ADDRESS_LENGTH")
                             .help("Address length on Substrate")
                             .long("address-length")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(value_parser!(u64).range(4..1024))
                             .default_value("32"),
                     )
@@ -204,7 +214,7 @@ fn main() {
                             .help("Value length on Substrate")
                             .long("value-length")
                             .value_parser(value_parser!(u64).range(4..1024))
-                            .takes_value(true)
+                            .num_args(1)
                             .default_value("16"),
                     )
                     .arg(
@@ -212,7 +222,7 @@ fn main() {
                             .help("Directory to search for solidity files")
                             .short('I')
                             .long("importpath")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(ValueParser::path_buf())
                             .action(ArgAction::Append),
                     )
@@ -221,7 +231,7 @@ fn main() {
                             .help("Map directory to search for solidity files [format: map=path]")
                             .short('m')
                             .long("importmap")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(ValueParser::new(parse_import_map))
                             .action(ArgAction::Append),
                     ),
@@ -233,7 +243,7 @@ fn main() {
                         Arg::new("TARGET")
                             .help("Target to build for")
                             .long("target")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(["solana", "substrate", "evm"])
                             .required(true),
                     )
@@ -241,7 +251,7 @@ fn main() {
                         Arg::new("ADDRESS_LENGTH")
                             .help("Address length on Substrate")
                             .long("address-length")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(value_parser!(u64).range(4..1024))
                             .default_value("32"),
                     )
@@ -250,7 +260,7 @@ fn main() {
                             .help("Value length on Substrate")
                             .long("value-length")
                             .value_parser(value_parser!(u64).range(4..1024))
-                            .takes_value(true)
+                            .num_args(1)
                             .default_value("16"),
                     )
                     .arg(
@@ -258,7 +268,7 @@ fn main() {
                             .help("Directory to search for solidity files")
                             .short('I')
                             .long("importpath")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(ValueParser::path_buf())
                             .action(ArgAction::Append),
                     )
@@ -267,9 +277,28 @@ fn main() {
                             .help("Map directory to search for solidity files [format: map=path]")
                             .short('m')
                             .long("importmap")
-                            .takes_value(true)
+                            .num_args(1)
                             .value_parser(ValueParser::new(parse_import_map))
                             .action(ArgAction::Append),
+                    ),
+            )
+            .subcommand(
+                Command::new("idl")
+                    .about("Generate Solidity interface files from Anchor IDL files")
+                    .arg(
+                        Arg::new("INPUT")
+                            .help("Convert IDL files")
+                            .required(true)
+                            .value_parser(ValueParser::os_string())
+                            .num_args(1..),
+                    )
+                    .arg(
+                        Arg::new("OUTPUT")
+                            .help("output file")
+                            .short('o')
+                            .long("output")
+                            .num_args(1)
+                            .value_parser(ValueParser::os_string()),
                     ),
             )
             .subcommand(
@@ -293,6 +322,7 @@ fn main() {
         }
         Some(("compile", matches)) => compile(matches),
         Some(("doc", matches)) => doc(matches),
+        Some(("idl", matches)) => idl::idl(matches),
         Some(("shell-complete", matches)) => shell_complete(app(), matches),
         _ => unreachable!(),
     }
@@ -302,7 +332,7 @@ fn doc(matches: &ArgMatches) {
     let target = target_arg(matches);
     let mut resolver = imports_arg(matches);
 
-    let verbose = matches.contains_id("VERBOSE");
+    let verbose = *matches.get_one::<bool>("VERBOSE").unwrap();
     let mut success = true;
     let mut files = Vec::new();
 
@@ -325,8 +355,8 @@ fn doc(matches: &ArgMatches) {
         // generate docs
         doc::generate_docs(
             matches
-                .get_one::<String>("OUTPUT")
-                .unwrap_or(&String::from(".")),
+                .get_one::<OsString>("OUTPUT")
+                .unwrap_or(&OsString::from(".")),
             &files,
             verbose,
         );
@@ -336,7 +366,7 @@ fn doc(matches: &ArgMatches) {
 fn compile(matches: &ArgMatches) {
     let target = target_arg(matches);
 
-    let verbose = matches.contains_id("VERBOSE");
+    let verbose = *matches.get_one::<bool>("VERBOSE").unwrap();
     let mut json = JsonResult {
         errors: Vec::new(),
         target: target.to_string(),
@@ -351,6 +381,8 @@ fn compile(matches: &ArgMatches) {
     let math_overflow_check = matches.contains_id("MATHOVERFLOW");
 
     let generate_debug_info = matches.contains_id("GENERATEDEBUGINFORMATION");
+
+    let log_api_return_codes = *matches.get_one::<bool>("LOGAPIRETURNS").unwrap();
 
     let mut resolver = imports_arg(matches);
 
@@ -373,6 +405,7 @@ fn compile(matches: &ArgMatches) {
             .get_one::<bool>("COMMONSUBEXPRESSIONELIMINATION")
             .unwrap(),
         opt_level,
+        log_api_return_codes,
     };
 
     let mut namespaces = Vec::new();
@@ -388,95 +421,17 @@ fn compile(matches: &ArgMatches) {
         }
     }
 
-    let namespaces = namespaces.iter().collect::<Vec<_>>();
-
     if let Some("ast-dot") = matches.get_one::<String>("EMIT").map(|v| v.as_str()) {
-        std::process::exit(0);
+        exit(0);
     }
 
     if errors {
         if matches.contains_id("STD-JSON") {
             println!("{}", serde_json::to_string(&json).unwrap());
-            std::process::exit(0);
+            exit(0);
         } else {
             eprintln!("error: not all contracts are valid");
-            std::process::exit(1);
-        }
-    }
-
-    if target == solang::Target::Solana {
-        let context = inkwell::context::Context::create();
-
-        let binary = solang::compile_many(
-            &context,
-            &namespaces,
-            "bundle.sol",
-            opt_level.into(),
-            math_overflow_check,
-            generate_debug_info,
-        );
-
-        if !save_intermediates(&binary, matches) {
-            let bin_filename = output_file(matches, "bundle", target.file_extension());
-
-            if matches.contains_id("VERBOSE") {
-                eprintln!(
-                    "info: Saving binary {} for contracts: {}",
-                    bin_filename.display(),
-                    namespaces
-                        .iter()
-                        .flat_map(|ns| {
-                            ns.contracts.iter().filter_map(|contract| {
-                                if contract.instantiable {
-                                    Some(contract.name.as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .sorted()
-                        .dedup()
-                        .join(", "),
-                );
-            }
-
-            let code = binary
-                .code(Generate::Linked)
-                .expect("llvm code emit should work");
-
-            if matches.contains_id("STD-JSON") {
-                json.program = hex::encode_upper(&code);
-            } else {
-                let mut file = create_file(&bin_filename);
-                file.write_all(&code).unwrap();
-
-                // Write all ABI files
-                for ns in &namespaces {
-                    for contract_no in 0..ns.contracts.len() {
-                        let contract = &ns.contracts[contract_no];
-
-                        if !contract.instantiable {
-                            continue;
-                        }
-
-                        let (abi_bytes, abi_ext) =
-                            abi::generate_abi(contract_no, ns, &code, verbose);
-                        let abi_filename = output_file(matches, &contract.name, abi_ext);
-
-                        if verbose {
-                            eprintln!(
-                                "info: Saving ABI {} for contract {}",
-                                abi_filename.display(),
-                                contract.name
-                            );
-                        }
-
-                        let mut file = create_file(&abi_filename);
-
-                        file.write_all(abi_bytes.as_bytes()).unwrap();
-                    }
-                }
-            }
+            exit(1);
         }
     }
 
@@ -485,7 +440,7 @@ fn compile(matches: &ArgMatches) {
     }
 }
 
-fn shell_complete(mut app: App, matches: &ArgMatches) {
+fn shell_complete(mut app: Command, matches: &ArgMatches) {
     if let Some(generator) = matches.get_one::<Shell>("SHELL").copied() {
         let name = app.get_name().to_string();
         generate(generator, &mut app, name, &mut std::io::stdout());
@@ -497,8 +452,8 @@ fn shell_complete(mut app: App, matches: &ArgMatches) {
 fn output_file(matches: &ArgMatches, stem: &str, ext: &str) -> PathBuf {
     Path::new(
         matches
-            .get_one::<String>("OUTPUT")
-            .unwrap_or(&String::from(".")),
+            .get_one::<OsString>("OUTPUT")
+            .unwrap_or(&OsString::from(".")),
     )
     .join(format!("{}.{}", stem, ext))
 }
@@ -511,7 +466,7 @@ fn process_file(
     json: &mut JsonResult,
     opt: &Options,
 ) -> Result<Namespace, ()> {
-    let verbose = matches.contains_id("VERBOSE");
+    let verbose = *matches.get_one::<bool>("VERBOSE").unwrap();
 
     let mut json_contracts = HashMap::new();
 
@@ -543,7 +498,7 @@ fn process_file(
 
         if let Err(err) = file.write_all(dot.as_bytes()) {
             eprintln!("{}: error: {}", dot_filename.display(), err);
-            std::process::exit(1);
+            exit(1);
         }
 
         return Ok(ns);
@@ -566,29 +521,14 @@ fn process_file(
             continue;
         }
 
-        if target == solang::Target::Solana {
-            if matches.contains_id("STD-JSON") {
-                json_contracts.insert(
-                    resolved_contract.name.to_owned(),
-                    JsonContract {
-                        abi: abi::ethereum::gen_abi(contract_no, &ns),
-                        ewasm: None,
-                        minimum_space: Some(resolved_contract.fixed_layout_size.to_u32().unwrap()),
-                    },
-                );
-            }
-
-            if verbose {
+        if verbose {
+            if target == solang::Target::Solana {
                 eprintln!(
                     "info: contract {} uses at least {} bytes account data",
                     resolved_contract.name, resolved_contract.fixed_layout_size,
                 );
             }
-            // we don't generate llvm here; this is done in one go for all contracts
-            continue;
-        }
 
-        if verbose {
             eprintln!(
                 "info: Generating LLVM IR for contract {} with target {}",
                 resolved_contract.name, ns.target
@@ -605,6 +545,7 @@ fn process_file(
             opt.opt_level.into(),
             opt.math_overflow_check,
             opt.generate_debug_information,
+            opt.log_api_return_codes,
         );
 
         if save_intermediates(&binary, matches) {
@@ -660,7 +601,7 @@ fn process_file(
 }
 
 fn save_intermediates(binary: &solang::emit::binary::Binary, matches: &ArgMatches) -> bool {
-    let verbose = matches.contains_id("VERBOSE");
+    let verbose = *matches.get_one::<bool>("VERBOSE").unwrap();
 
     match matches.get_one::<String>("EMIT").map(|v| v.as_str()) {
         Some("llvm-ir") => {
@@ -700,7 +641,7 @@ fn save_intermediates(binary: &solang::emit::binary::Binary, matches: &ArgMatche
                 Ok(o) => o,
                 Err(s) => {
                     println!("error: {}", s);
-                    std::process::exit(1);
+                    exit(1);
                 }
             };
 
@@ -723,7 +664,7 @@ fn save_intermediates(binary: &solang::emit::binary::Binary, matches: &ArgMatche
                 Ok(o) => o,
                 Err(s) => {
                     println!("error: {}", s);
-                    std::process::exit(1);
+                    exit(1);
                 }
             };
 
@@ -755,7 +696,7 @@ fn create_file(path: &Path) -> File {
                 parent.display(),
                 err
             );
-            std::process::exit(1);
+            exit(1);
         }
     }
 
@@ -763,7 +704,7 @@ fn create_file(path: &Path) -> File {
         Ok(file) => file,
         Err(err) => {
             eprintln!("error: cannot create file '{}': {}", path.display(), err,);
-            std::process::exit(1);
+            exit(1);
         }
     }
 }
@@ -790,7 +731,7 @@ fn target_arg(matches: &ArgMatches) -> Target {
             "error: address length cannot be modified for target '{}'",
             target
         );
-        std::process::exit(1);
+        exit(1);
     }
 
     if !target.is_substrate()
@@ -800,7 +741,7 @@ fn target_arg(matches: &ArgMatches) -> Target {
             "error: value length cannot be modified for target '{}'",
             target
         );
-        std::process::exit(1);
+        exit(1);
     }
 
     target
@@ -817,14 +758,14 @@ fn imports_arg(matches: &ArgMatches) -> FileResolver {
 
     if let Err(e) = resolver.add_import_path(&PathBuf::from(".")) {
         eprintln!("error: cannot add current directory to import path: {}", e);
-        std::process::exit(1);
+        exit(1);
     }
 
     if let Some(paths) = matches.get_many::<PathBuf>("IMPORTPATH") {
         for path in paths {
             if let Err(e) = resolver.add_import_path(path) {
                 eprintln!("error: import path '{}': {}", path.to_string_lossy(), e);
-                std::process::exit(1);
+                exit(1);
             }
         }
     }
@@ -833,7 +774,7 @@ fn imports_arg(matches: &ArgMatches) -> FileResolver {
         for (map, path) in maps {
             if let Err(e) = resolver.add_import_map(OsString::from(map), path.clone()) {
                 eprintln!("error: import path '{}': {}", path.display(), e);
-                std::process::exit(1);
+                exit(1);
             }
         }
     }

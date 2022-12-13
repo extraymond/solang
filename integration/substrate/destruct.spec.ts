@@ -1,5 +1,5 @@
 import expect from 'expect';
-import { gasLimit, createConnection, deploy, transaction, aliceKeypair, daveKeypair } from './index';
+import { weight, createConnection, deploy, transaction, aliceKeypair, daveKeypair, query } from './index';
 import { ContractPromise } from '@polkadot/api-contract';
 import { ApiPromise } from '@polkadot/api';
 
@@ -25,27 +25,24 @@ describe('Deploy destruct contract and test', () => {
 
         let contract = new ContractPromise(conn, deploy_contract.abi, deploy_contract.address);
 
-        let hello = await contract.query.hello(alice.address, {});
+        let hello = await query(conn, alice, contract, "hello");
 
         expect(hello.output?.toJSON()).toBe('Hello');
 
-        // REGRESSION metadata #666
-        // let { data: { free: daveBalBefore } } = await conn.query.system.account(dave.address);
-        // let { data: { free: contractBalBefore } } = await conn.query.system.account(String(deploy_contract.address));
+        let { data: { free: daveBalBefore } } = await conn.query.system.account(dave.address);
+        let { data: { free: contractBalBefore } } = await conn.query.system.account(String(deploy_contract.address));
 
-        // let tx = contract.tx.selfterminate({ gasLimit }, dave.address);
+        let gasLimit = await weight(conn, contract, "selfterminate", [dave.address]);
+        let tx = contract.tx.selfterminate({ gasLimit }, dave.address);
 
-        // await transaction(tx, alice);
+        await transaction(tx, alice);
 
-        // let { data: { free: daveBalAfter } } = await conn.query.system.account(dave.address);
-        // let { data: { free: contractBalAfter } } = await conn.query.system.account(String(deploy_contract.address));
+        let { data: { free: daveBalAfter } } = await conn.query.system.account(dave.address);
+        let { data: { free: contractBalAfter } } = await conn.query.system.account(String(deploy_contract.address));
 
-        // //console.log(`bal ${daveBalBefore} and ${daveBalAfter}`);
-        // //console.log(`bal ${contractBalBefore} and ${contractBalAfter}`);
-
-        // // The contact is gone and has no balance
-        // expect(contractBalAfter.toBigInt()).toBe(0n);
-        // // Dave now has the balance previously held by the contract
-        // expect(daveBalAfter.toBigInt()).toEqual(daveBalBefore.toBigInt() + contractBalBefore.toBigInt());
+        // The contact is gone and has no balance
+        expect(contractBalAfter.toBigInt()).toBe(0n);
+        // Dave now has the balance previously held by the contract
+        expect(daveBalAfter.toBigInt()).toEqual(daveBalBefore.toBigInt() + contractBalBefore.toBigInt());
     });
 });

@@ -130,12 +130,15 @@ fn contract_constant_variable() {
         yul_functions: vec![],
         variables: vec![var],
         creates: vec![],
-        sends_events: vec![],
+        emits_events: vec![],
         initializer: None,
         default_constructor: None,
         cfg: vec![],
         code: vec![],
         instantiable: true,
+        dispatch_no: 0,
+        constructor_dispatch: None,
+        program_id: None,
     };
     ns.contracts.push(contract);
 
@@ -249,12 +252,15 @@ fn slot_suffix() {
         yul_functions: vec![],
         variables: vec![],
         creates: vec![],
-        sends_events: vec![],
+        emits_events: vec![],
         initializer: None,
         default_constructor: None,
         cfg: vec![],
         code: vec![],
         instantiable: true,
+        dispatch_no: 0,
+        constructor_dispatch: None,
+        program_id: None,
     };
     ns.contracts.push(contract);
 

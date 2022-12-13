@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Run repolinter
         run: npx repolinter --rulesetUrl https://raw.githubusercontent.com/hyperledger-labs/hyperledger-community-management-tools/master/repo_structure/repolint.json
 
@@ -26,12 +26,17 @@ jobs:
     container: ghcr.io/hyperledger/solang:ci
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Rust stable
         run: rustup default stable
+      - uses: enarx/spdx@master
+        with:
+          licenses: Apache-2.0 MIT
       - name: Run cargo fmt
+        if: always()
         run: cargo fmt --all -- --check
       - name: Run cargo clippy
+        if: always()
         run: cargo clippy --workspace --tests --bins -- -D warnings -D clippy::inconsistent-struct-constructor
 
   docs:
@@ -40,12 +45,12 @@ jobs:
     container: ubuntu:20.04
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
-      - name: Install Python
+        uses: actions/checkout@v3
+      - name: Install Python and git
         run: |
           apt-get update
-          apt-get install -y python3-pip
-      - name: Install Docs requiremets
+          apt-get install -y python3-pip git
+      - name: Install Docs requirements.txt
         run : |
           pip install -r requirements.txt
       - name: Build docs
@@ -58,13 +63,11 @@ jobs:
     container: ghcr.io/hyperledger/solang:ci
     steps:
     - name: Checkout sources
-      # Make sure "git describe --tags" works for solang --version
-      # checkout@v2 requires git 2.18 or higher, which is not in our image
-      uses: actions/checkout@v1
+      uses: actions/checkout@v3
       with:
         submodules: recursive
     - name: Rust stable
-      run: rustup default 1.59.0
+      run: rustup default 1.63.0
     - name: Build
       run: cargo build --verbose
     - name: Run tests
@@ -82,13 +85,11 @@ jobs:
     container: ghcr.io/hyperledger/solang:ci
     steps:
     - name: Checkout sources
-      # Make sure "git describe --tags" works for solang --version
-      # checkout@v2 requires git 2.18 or higher, which is not in our image
-      uses: actions/checkout@v1
+      uses: actions/checkout@v3
       with:
         submodules: recursive
     - name: Rust stable
-      run: rustup default 1.59.0
+      run: rustup default 1.63.0
     - name: Build
       run: cargo build --verbose
     - name: Run tests
@@ -103,22 +104,17 @@ jobs:
     runs-on: windows-latest
     steps:
     - name: Checkout sources
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
-        # Make sure "git describe --tags" works for solang --version
-        fetch-depth: 0
         submodules: recursive
     - name: Download LLVM
-      run: curl -sSL -o c:\llvm.zip https://github.com/hyperledger/solang/releases/download/v0.1.12/llvm13.0-win.zip
+      run: curl -sSL -o c:\llvm.zip https://github.com/hyperledger/solang/releases/download/v0.2.0/llvm13.0-win.zip
     - name: Extract LLVM
       run: unzip c:\llvm.zip -d c:/
     - name: Add LLVM to Path
       run: echo "c:\llvm13.0\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8
-    - name: Stable with rustfmt and clippy
-      uses: actions-rs/toolchain@v1
+    - uses: dtolnay/rust-toolchain@1.63.0
       with:
-        profile: minimal
-        toolchain: stable
         components: clippy
     # We run clippy on Linux in the lint job above, but this does not check #[cfg(windows)] items
     - name: Run cargo clippy
@@ -140,11 +136,10 @@ jobs:
     - name: Checkout sources
       uses: actions/checkout@v3
       with:
-        # Make sure "git describe --tags" works for solang --version
-        fetch-depth: 0
         submodules: recursive
+    - uses: dtolnay/rust-toolchain@1.63.0
     - name: Get LLVM
-      run: curl -L --output llvm13.0-mac-arm.tar.xz https://github.com/hyperledger/solang/releases/download/v0.1.12/llvm13.0-mac-arm.tar.xz
+      run: curl -L --output llvm13.0-mac-arm.tar.xz https://github.com/hyperledger/solang/releases/download/v0.2.0/llvm13.0-mac-arm.tar.xz
     - name: Extract LLVM
       run: tar Jxf llvm13.0-mac-arm.tar.xz
     - name: Add LLVM to Path
@@ -160,16 +155,15 @@ jobs:
 
   mac-intel:
     name: Mac Intel
-    runs-on: macos-latest
+    runs-on: macos-11
     steps:
     - name: Checkout sources
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
-        # Make sure "git describe --tags" works for solang --version
-        fetch-depth: 0
         submodules: recursive
+    - uses: dtolnay/rust-toolchain@1.63.0
     - name: Get LLVM
-      run: wget -q -O llvm13.0-mac-intel.tar.xz https://github.com/hyperledger/solang/releases/download/v0.1.12/llvm13.0-mac-intel.tar.xz
+      run: wget -q -O llvm13.0-mac-intel.tar.xz https://github.com/hyperledger/solang/releases/download/v0.2.0/llvm13.0-mac-intel.tar.xz
     - name: Extract LLVM
       run: tar Jxf llvm13.0-mac-intel.tar.xz
     - name: Add LLVM to Path
@@ -185,7 +179,7 @@ jobs:
 
   mac-universal:
     name: Mac Universal Binary
-    runs-on: macos-latest
+    runs-on: macos-11
     needs: [mac-arm, mac-intel]
     steps:
     - uses: actions/download-artifact@master
@@ -202,17 +196,14 @@ jobs:
         name: solang-mac
         path: solang-mac
 
-  image-multiarch:
+  container-multiarch:
     name: Multiarch Container Image
     runs-on: linux-arm64
     if: ${{ github.repository_owner == 'hyperledger' }}
     steps:
     - name: Checkout sources
       uses: actions/checkout@v3
-      with:
-        # Make sure "git describe --tags" works for solang --version
-        fetch-depth: 0
-    - run: echo "::set-output name=push::--push"
+    - run: echo "push=--push" >> $GITHUB_OUTPUT
       id: push
       if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     - run: |
@@ -223,37 +214,77 @@ jobs:
           --platform linux/arm64,linux/amd64 \
           --label org.opencontainers.image.description="Solidity Compiler for Solana and Substrate version $(git describe --tags)"
 
-  solana:
-    name: Solana Integration test
-    runs-on: ubuntu-20.04
-    container: ubuntu:20.04
+  anchor:
+    name: Anchor Integration test
+    runs-on: ubuntu-latest
+    container: ghcr.io/hyperledger/solang:ci
     needs: linux-x86-64
-    services:
-      solana:
-        image: solanalabs/solana:v1.9.15
-        ports:
-          - 8899
-          - 8900
     steps:
     - name: Checkout sources
-      uses: actions/checkout@v2
-    - uses: actions/setup-node@v1
+      uses: actions/checkout@v3
+    - uses: actions/setup-node@v3
       with:
         node-version: '14'
+    - name: Rust Stable
+      run: rustup default stable
+    - name: Setup yarn
+      run: npm install -g yarn
     - uses: actions/download-artifact@master
       with:
         name: solang-linux-x86-64
         path: bin
-    - run: |
+    - name: Solang Compiler
+      run: |
         chmod 755 ./bin/solang
         echo "$(pwd)/bin" >> $GITHUB_PATH
+    - name: Build Anchor test program
+      run: |
+        yarn install
+        anchor build
+      working-directory: ./integration/anchor
+    - run: nohup solana-test-validator -q &
+    - name: Deploy Anchor program
+      run: |
+        solana -ul airdrop -k id.json 10
+        anchor deploy
+      working-directory: ./integration/anchor
+    - name: Create Solidity interface file for Anchor
+      run: yarn parse-idl
+      working-directory: ./integration/anchor
+    - name: Build Solang contracts
+      run: yarn build
+      working-directory: ./integration/anchor
+    - name: Test Anchor
+      run: anchor test --skip-local-validator
+      working-directory: ./integration/anchor
+
+  solana:
+    name: Solana Integration test
+    runs-on: ubuntu-latest
+    container: ghcr.io/hyperledger/solang:ci
+    needs: linux-x86-64
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v3
+    - uses: actions/setup-node@v3
+      with:
+        node-version: '14'
+    - name: Rust Stable
+      run: rustup default stable
+    - uses: actions/download-artifact@master
+      with:
+        name: solang-linux-x86-64
+        path: bin
+    - name: Solang Compiler
+      run: |
+        chmod 755 ./bin/solang
+        echo "$(pwd)/bin" >> $GITHUB_PATH
+    - run: nohup solana-test-validator -q &
     - run: npm install
       working-directory: ./integration/solana
     - name: Build Solang contracts
       run: npm run build
       working-directory: ./integration/solana
-    - name: Set github env
-      run: echo "RPC_URL=http://solana:8899/" >> $GITHUB_ENV
     - name: Deploy and test contracts
       run: npm run test
       working-directory: ./integration/solana
@@ -264,12 +295,12 @@ jobs:
     needs: linux-x86-64
     steps:
     - name: Checkout sources
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       # We can't run substrate as a github actions service, since it requires
       # command line arguments. See https://github.com/actions/runner/pull/1152
     - name: Start substrate
-      run: docker run -d -p 9944:9944 paritytech/contracts-ci-linux:production substrate-contracts-node --dev --ws-external
-    - uses: actions/setup-node@v1
+      run: docker run -d -p 9944:9944 paritytech/contracts-ci-linux:latest substrate-contracts-node --dev --ws-external
+    - uses: actions/setup-node@v3
       with:
         node-version: '14'
     - uses: actions/download-artifact@master
@@ -280,6 +311,9 @@ jobs:
         chmod 755 ./bin/solang
         echo "$(pwd)/bin" >> $GITHUB_PATH
     - run: npm install
+      working-directory: ./integration/substrate
+    - name: Build ink! contracts
+      run: npm run build-ink
       working-directory: ./integration/substrate
     - name: Build Solang contracts
       run: npm run build
@@ -298,7 +332,7 @@ jobs:
       # We can't run substrate as a github actions service, since it requires
       # command line arguments. See https://github.com/actions/runner/pull/1152
     - name: Start substrate
-      run: docker run -d -p 9944:9944 paritytech/contracts-ci-linux:production substrate-contracts-node --dev --ws-external
+      run: docker run -d -p 9944:9944 paritytech/contracts-ci-linux substrate-contracts-node --dev --ws-external
     - uses: actions/download-artifact@master
       with:
         name: solang-linux-x86-64
@@ -306,15 +340,9 @@ jobs:
     - run: |
         chmod 755 ./bin/solang
         echo "$(pwd)/bin" >> $GITHUB_PATH
-    - name: Install latest rust toolchain
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        default: true
-        override: true   
-    - run: solang compile --target substrate ../substrate/*.sol -o ./contracts/
-      working-directory: ./integration/subxt-tests
-    - run: solang compile --target substrate ../substrate/test/*.sol -o ./contracts/
+    - name: Install rust toolchain
+      uses: dtolnay/rust-toolchain@1.63.0
+    - run: "parallel solang compile --target substrate -o ./contracts ::: ../substrate/*.sol ../substrate/test/*.sol"
       working-directory: ./integration/subxt-tests
     - name: Deploy and test contracts
       run: cargo test -- --test-threads=1
@@ -326,7 +354,7 @@ jobs:
     needs: linux-x86-64
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
     - uses: actions/download-artifact@master
       with:
         name: solang-linux-x86-64
@@ -335,7 +363,7 @@ jobs:
         chmod 755 ./bin/solang
         echo "$(pwd)/bin" >> $GITHUB_PATH
     - name: Install Node.js
-      uses: actions/setup-node@v1
+      uses: actions/setup-node@v3
       with:
         node-version: '14'
     - run: npm install
@@ -343,10 +371,8 @@ jobs:
     - run: npm run compile
       working-directory: ./vscode
     - name: Run headless test
-      uses: GabrielBB/xvfb-action@v1
-      with:
-        working-directory: ./vscode
-        run: npm test
+      run: xvfb-run npm test
+      working-directory: ./vscode
     - run: npm install -g vsce
       working-directory: ./vscode
     - run: vsce package

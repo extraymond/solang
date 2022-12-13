@@ -23,7 +23,7 @@ use tokio::time::timeout;
 mod cases;
 
 // metadata file obtained from the latest substrate-contracts-node
-#[subxt::subxt(runtime_metadata_path = "./metadata.scale")]
+#[subxt::subxt(runtime_metadata_url = "wss://localhost:9944")]
 pub mod node {}
 
 pub type API = OnlineClient<PolkadotConfig>;

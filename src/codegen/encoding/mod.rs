@@ -2,9 +2,11 @@
 
 mod borsh_encoding;
 mod buffer_validator;
+mod scale_encoding;
 
 use crate::codegen::cfg::{ControlFlowGraph, Instr};
 use crate::codegen::encoding::borsh_encoding::BorshEncoding;
+use crate::codegen::encoding::scale_encoding::ScaleEncoding;
 use crate::codegen::expression::load_storage;
 use crate::codegen::vartable::Vartable;
 use crate::codegen::{Builtin, Expression};
@@ -19,15 +21,15 @@ use std::ops::{AddAssign, MulAssign, Sub};
 /// This trait should be implemented by all encoding methods (ethabi, Scale and Borsh), so that
 /// we have the same interface for creating encode and decode functions.
 pub(super) trait AbiEncoding {
-    /// Receive the arguments and returns the variable containing a byte array
+    /// Receive the arguments and returns the variable containing a byte array and its size
     fn abi_encode(
         &mut self,
         loc: &Loc,
-        args: &[Expression],
+        args: Vec<Expression>,
         ns: &Namespace,
         vartab: &mut Vartable,
         cfg: &mut ControlFlowGraph,
-    ) -> Expression;
+    ) -> (Expression, Expression);
 
     fn abi_decode(
         &self,
@@ -37,6 +39,7 @@ pub(super) trait AbiEncoding {
         ns: &Namespace,
         vartab: &mut Vartable,
         cfg: &mut ControlFlowGraph,
+        buffer_size: Option<Expression>,
     ) -> Vec<Expression>;
 
     /// Cache items loaded from storage to reuse them later, so we avoid the expensive operation
@@ -50,13 +53,21 @@ pub(super) trait AbiEncoding {
 
     /// Some types have sizes that are specific to each encoding scheme, so there is no way to generalize.
     fn get_encoding_size(&self, expr: &Expression, ty: &Type, ns: &Namespace) -> Expression;
+
+    /// Returns if the we are packed encoding
+    fn is_packed(&self) -> bool;
 }
 
 /// This function should return the correct encoder, given the target
-pub(super) fn create_encoder(ns: &Namespace) -> impl AbiEncoding {
+pub(super) fn create_encoder(ns: &Namespace, packed: bool) -> Box<dyn AbiEncoding> {
     match &ns.target {
-        Target::Solana => BorshEncoding::new(),
-        _ => unreachable!("Other types of encoding have not been implemented yet"),
+        Target::Solana => Box::new(BorshEncoding::new(packed)),
+        // Solana utilizes Borsh encoding and Substrate, Scale encoding.
+        // All other targets are using the Scale encoding, because we have tests for a
+        // fake Ethereum target that checks the presence of Instr::AbiDecode and
+        // Expression::AbiEncode.
+        // If a new target is added, this piece of code needs to change.
+        _ => Box::new(ScaleEncoding::new(packed)),
     }
 }
 
@@ -262,7 +273,7 @@ fn calculate_array_size<T: AbiEncoding>(
     // Each dynamic dimension size occupies 4 bytes in the buffer
     let dyn_dims = dims.iter().filter(|d| **d == ArrayLength::Dynamic).count();
 
-    if dyn_dims > 0 {
+    if dyn_dims > 0 && !encoder.is_packed() {
         cfg.add(
             vartab,
             Instr::Set {
@@ -562,14 +573,9 @@ fn finish_array_loop(for_loop: &ForLoop, vartab: &mut Vartable, cfg: &mut Contro
 
 /// Loads a struct member
 fn load_struct_member(ty: Type, expr: Expression, field: usize) -> Expression {
-    if matches!(ty, Type::Struct(_)) {
-        // We should not dereference a struct.
-        return Expression::StructMember(
-            Loc::Codegen,
-            Type::Ref(Box::new(ty)),
-            Box::new(expr),
-            field,
-        );
+    if ty.is_fixed_reference_type() {
+        // We should not dereference a struct or fixed array
+        return Expression::StructMember(Loc::Codegen, ty, Box::new(expr), field);
     }
 
     Expression::Load(
@@ -715,7 +721,7 @@ fn allocate_array(
         Instr::Set {
             loc: Loc::Codegen,
             res: array_var,
-            expr: Expression::AllocDynamicArray(
+            expr: Expression::AllocDynamicBytes(
                 Loc::Codegen,
                 ty.clone(),
                 Box::new(Expression::Variable(

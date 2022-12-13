@@ -6,6 +6,7 @@ use crate::diagnostics::Diagnostics;
 use crate::sema::yul::ast::{InlineAssembly, YulFunction};
 use crate::sema::Recurse;
 use crate::{codegen, Target};
+use indexmap::IndexMap;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 pub use solang_parser::diagnostics::*;
@@ -120,6 +121,7 @@ pub enum StructType {
     AccountInfo,
     AccountMeta,
     ExternalFunction,
+    SolParameters,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -173,7 +175,7 @@ pub struct EnumDecl {
     pub contract: Option<String>,
     pub loc: pt::Loc,
     pub ty: Type,
-    pub values: HashMap<String, (pt::Loc, usize)>,
+    pub values: IndexMap<String, pt::Loc>,
 }
 
 impl fmt::Display for EnumDecl {
@@ -251,9 +253,9 @@ pub struct Function {
     pub visibility: pt::Visibility,
     pub params: Arc<Vec<Parameter>>,
     pub returns: Arc<Vec<Parameter>>,
-    // constructor arguments for base contracts, only present on constructors
+    /// Constructor arguments for base contracts, only present on constructors
     pub bases: BTreeMap<usize, (pt::Loc, usize, Vec<Expression>)>,
-    // modifiers for functions
+    /// Modifiers for functions
     pub modifiers: Vec<Expression>,
     pub is_virtual: bool,
     /// Is this function an acccesor function created by a public variable
@@ -266,8 +268,30 @@ pub struct Function {
     /// The resolved body (if any)
     pub body: Vec<Statement>,
     pub symtable: Symtable,
-    // What events are emitted by the body of this function
+    /// What events are emitted by the body of this function
     pub emits_events: Vec<usize>,
+    /// For overloaded functions this is the mangled (unique) name.
+    pub mangled_name: String,
+    /// Solana constructors may have seeds specified using @seed tags
+    pub annotations: Vec<ConstructorAnnotation>,
+}
+
+pub enum ConstructorAnnotation {
+    Seed(Expression),
+    Payer(Expression),
+    Space(Expression),
+    Bump(Expression),
+}
+
+impl CodeLocation for ConstructorAnnotation {
+    fn loc(&self) -> pt::Loc {
+        match self {
+            ConstructorAnnotation::Seed(expr) => expr.loc(),
+            ConstructorAnnotation::Payer(expr) => expr.loc(),
+            ConstructorAnnotation::Space(expr) => expr.loc(),
+            ConstructorAnnotation::Bump(expr) => expr.loc(),
+        }
+    }
 }
 
 /// This trait provides a single interface for fetching paramenters, returns and the symbol table
@@ -319,6 +343,14 @@ impl Function {
             Some(pt::Mutability::Constant(loc)) => Mutability::View(loc),
         };
 
+        let mangled_name = signature
+            .replace('(', "_")
+            .replace(')', "")
+            .replace(',', "_")
+            .replace("[]", "Array")
+            .replace('[', "Array")
+            .replace(']', "");
+
         Function {
             tags,
             loc,
@@ -340,6 +372,8 @@ impl Function {
             body: Vec::new(),
             symtable: Symtable::new(),
             emits_events: Vec::new(),
+            mangled_name,
+            annotations: Vec::new(),
         }
     }
 
@@ -589,16 +623,22 @@ pub struct Contract {
     pub virtual_functions: HashMap<String, usize>,
     pub yul_functions: Vec<usize>,
     pub variables: Vec<Variable>,
-    // List of contracts this contract instantiates
+    /// List of contracts this contract instantiates
     pub creates: Vec<usize>,
-    // List of events this contract produces
-    pub sends_events: Vec<usize>,
+    /// List of events this contract may emit
+    pub emits_events: Vec<usize>,
     pub initializer: Option<usize>,
     pub default_constructor: Option<(Function, usize)>,
     pub cfg: Vec<ControlFlowGraph>,
     pub code: Vec<u8>,
-    // Can the contract be instantiated, i.e. not abstract, no errors, etc.
+    /// Can the contract be instantiated, i.e. not abstract, no errors, etc.
     pub instantiable: bool,
+    /// CFG number of this contract's dispatch function
+    pub dispatch_no: usize,
+    /// CFG number of this contract's constructor dispatch
+    pub constructor_dispatch: Option<usize>,
+    /// Account of deployed program code on Solana
+    pub program_id: Option<Vec<u8>>,
 }
 
 impl Contract {
@@ -669,13 +709,37 @@ pub enum Expression {
     Load(pt::Loc, Type, Box<Expression>),
     GetRef(pt::Loc, Type, Box<Expression>),
     StorageLoad(pt::Loc, Type, Box<Expression>),
-    ZeroExt(pt::Loc, Type, Box<Expression>),
-    SignExt(pt::Loc, Type, Box<Expression>),
-    Trunc(pt::Loc, Type, Box<Expression>),
-    CheckingTrunc(pt::Loc, Type, Box<Expression>),
-    Cast(pt::Loc, Type, Box<Expression>),
-    BytesCast(pt::Loc, Type, Type, Box<Expression>),
-
+    ZeroExt {
+        loc: pt::Loc,
+        to: Type,
+        expr: Box<Expression>,
+    },
+    SignExt {
+        loc: pt::Loc,
+        to: Type,
+        expr: Box<Expression>,
+    },
+    Trunc {
+        loc: pt::Loc,
+        to: Type,
+        expr: Box<Expression>,
+    },
+    CheckingTrunc {
+        loc: pt::Loc,
+        to: Type,
+        expr: Box<Expression>,
+    },
+    Cast {
+        loc: pt::Loc,
+        to: Type,
+        expr: Box<Expression>,
+    },
+    BytesCast {
+        loc: pt::Loc,
+        from: Type,
+        to: Type,
+        expr: Box<Expression>,
+    },
     PreIncrement(pt::Loc, Type, bool, Box<Expression>),
     PreDecrement(pt::Loc, Type, bool, Box<Expression>),
     PostIncrement(pt::Loc, Type, bool, Box<Expression>),
@@ -693,7 +757,7 @@ pub enum Expression {
     Complement(pt::Loc, Type, Box<Expression>),
     UnaryMinus(pt::Loc, Type, Box<Expression>),
 
-    Ternary(
+    ConditionalOperator(
         pt::Loc,
         Type,
         Box<Expression>,
@@ -703,7 +767,7 @@ pub enum Expression {
     Subscript(pt::Loc, Type, Type, Box<Expression>, Box<Expression>),
     StructMember(pt::Loc, Type, Box<Expression>, usize),
 
-    AllocDynamicArray(pt::Loc, Type, Box<Expression>, Option<Vec<u8>>),
+    AllocDynamicBytes(pt::Loc, Type, Box<Expression>, Option<Vec<u8>>),
     StorageArrayLength {
         loc: pt::Loc,
         ty: Type,
@@ -774,7 +838,7 @@ pub struct CallArgs {
     pub gas: Option<Box<Expression>>,
     pub salt: Option<Box<Expression>>,
     pub value: Option<Box<Expression>>,
-    pub space: Option<Box<Expression>>,
+    pub address: Option<Box<Expression>>,
     pub accounts: Option<Box<Expression>>,
     pub seeds: Option<Box<Expression>>,
 }
@@ -825,11 +889,11 @@ impl Recurse for Expression {
                 }
                 Expression::Load(_, _, expr)
                 | Expression::StorageLoad(_, _, expr)
-                | Expression::ZeroExt(_, _, expr)
-                | Expression::SignExt(_, _, expr)
-                | Expression::Trunc(_, _, expr)
-                | Expression::Cast(_, _, expr)
-                | Expression::BytesCast(_, _, _, expr)
+                | Expression::ZeroExt { expr, .. }
+                | Expression::SignExt { expr, .. }
+                | Expression::Trunc { expr, .. }
+                | Expression::Cast { expr, .. }
+                | Expression::BytesCast { expr, .. }
                 | Expression::PreIncrement(_, _, _, expr)
                 | Expression::PreDecrement(_, _, _, expr)
                 | Expression::PostIncrement(_, _, _, expr)
@@ -849,7 +913,7 @@ impl Recurse for Expression {
                 | Expression::Complement(_, _, expr)
                 | Expression::UnaryMinus(_, _, expr) => expr.recurse(cx, f),
 
-                Expression::Ternary(_, _, cond, left, right) => {
+                Expression::ConditionalOperator(_, _, cond, left, right) => {
                     cond.recurse(cx, f);
                     left.recurse(cx, f);
                     right.recurse(cx, f);
@@ -860,7 +924,7 @@ impl Recurse for Expression {
                 }
                 Expression::StructMember(_, _, expr, _) => expr.recurse(cx, f),
 
-                Expression::AllocDynamicArray(_, _, expr, _) => expr.recurse(cx, f),
+                Expression::AllocDynamicBytes(_, _, expr, _) => expr.recurse(cx, f),
                 Expression::StorageArrayLength { array, .. } => array.recurse(cx, f),
                 Expression::StringCompare(_, left, right)
                 | Expression::StringConcat(_, _, left, right) => {
@@ -954,12 +1018,12 @@ impl CodeLocation for Expression {
             | Expression::Load(loc, ..)
             | Expression::GetRef(loc, ..)
             | Expression::StorageLoad(loc, ..)
-            | Expression::ZeroExt(loc, ..)
-            | Expression::SignExt(loc, ..)
-            | Expression::Trunc(loc, ..)
-            | Expression::CheckingTrunc(loc, ..)
-            | Expression::Cast(loc, ..)
-            | Expression::BytesCast(loc, ..)
+            | Expression::ZeroExt { loc, .. }
+            | Expression::SignExt { loc, .. }
+            | Expression::Trunc { loc, .. }
+            | Expression::CheckingTrunc { loc, .. }
+            | Expression::Cast { loc, .. }
+            | Expression::BytesCast { loc, .. }
             | Expression::More(loc, ..)
             | Expression::Less(loc, ..)
             | Expression::MoreEqual(loc, ..)
@@ -969,11 +1033,11 @@ impl CodeLocation for Expression {
             | Expression::Not(loc, _)
             | Expression::Complement(loc, ..)
             | Expression::UnaryMinus(loc, ..)
-            | Expression::Ternary(loc, ..)
+            | Expression::ConditionalOperator(loc, ..)
             | Expression::Subscript(loc, ..)
             | Expression::StructMember(loc, ..)
             | Expression::Or(loc, ..)
-            | Expression::AllocDynamicArray(loc, ..)
+            | Expression::AllocDynamicBytes(loc, ..)
             | Expression::StorageArrayLength { loc, .. }
             | Expression::StringCompare(loc, ..)
             | Expression::StringConcat(loc, ..)
@@ -1056,8 +1120,11 @@ impl CodeLocation for Instr {
                 pt::Loc::File(_, _, _) => source.loc(),
                 _ => destination.loc(),
             },
+            Instr::Switch { cond, .. } => cond.loc(),
+            Instr::ReturnData { data, .. } => data.loc(),
             Instr::Branch { .. }
             | Instr::Unreachable
+            | Instr::ReturnCode { .. }
             | Instr::Nop
             | Instr::AssertFailure { .. }
             | Instr::PopMemory { .. } => pt::Loc::Codegen,
@@ -1126,11 +1193,7 @@ pub enum Builtin {
     BlockHash,
     Random,
     MinimumBalance,
-    TombstoneDeposit,
     AbiDecode,
-    // TODO: AbiBorshDecode is temporary and should be removed once Brosh encoding is fully
-    // wired for Solana
-    AbiBorshDecode,
     AbiEncode,
     AbiEncodePacked,
     AbiEncodeWithSelector,
@@ -1352,6 +1415,7 @@ impl Statement {
 
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct Tag {
+    pub loc: pt::Loc,
     pub tag: String,
     pub no: usize,
     pub value: String,

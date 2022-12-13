@@ -1,3 +1,5 @@
+<img src="docs//hl_solang_horizontal-color.svg" alt="Solang Logo" width="75%"/>
+
 # solang - Solidity Compiler for Solana and Substrate
 
 [![Discord](https://img.shields.io/discord/905194001349627914?logo=Hyperledger&style=plastic)](https://discord.gg/jhn4rkqNsT)
@@ -61,7 +63,7 @@ Alternatively if you want to use the solang container, run:
 docker run --rm -it -v $(pwd):/sources ghcr.io/hyperledger/solang compile -v -o /sources --target solana /sources/flipper.sol
 ```
 
-A file called `flipper.abi` and `bundle.so`. Now install `@solana/solidity`:
+A file called `flipper.abi` and `flipper.so`. Now install `@solana/solidity`:
 
 ```
 npm install @solana/solidity
@@ -74,7 +76,7 @@ const { Contract, Program } = require('@solana/solidity');
 const { readFileSync } = require('fs');
 
 const FLIPPER_ABI = JSON.parse(readFileSync('./flipper.abi', 'utf8'));
-const PROGRAM_SO = readFileSync('./bundle.so');
+const PROGRAM_SO = readFileSync('./flipper.so');
 
 (async function () {
     console.log('Connecting to your local Solana node ...');
@@ -114,17 +116,6 @@ node flipper.js
 
 ## Build for Substrate
 
-### Status
-:warning: Solang was developed against Substrate v3.0. It has been a while since the last time the Substrate target was worked on, which introduced a few known regressions. Currently, the following is known to **not** work with recent Substrate versions:
-
-* Function call arguments of type `address`
-* Function return values of type `address`
-* Cross-contract calls
-* Events with indexed fields
-
-Maintenance on the Substrate target has now resumed and we are working on fixing these issues.
-
-### Building
 Run:
 
 ```bash
@@ -134,7 +125,7 @@ solang compile --target substrate flipper.sol
 Alternatively if you want to use the solang container, run:
 
 ```
-docker run --rm -it -v $(pwd):/sources ghcr.io/hyperledger/solang -v -o /sources --target substrate /sources/flipper.sol
+docker run --rm -it -v $(pwd):/sources ghcr.io/hyperledger/solang compile -v -o /sources --target substrate /sources/flipper.sol
 ```
 You will have a file called flipper.contract. You can use this directly in
 the [Contracts UI](https://contracts-ui.substrate.io/),
@@ -154,8 +145,8 @@ Here is a brief description of what we envision for the next versions.
 | Solana SPL tokens compatibility            | Completed   |
 | Parse and resolve inline assembly          | Completed   |
 | Generate code for inline assembly          | Completed   |
-| Support Solana's Program Derived Addresses | In Progress |
-| Support latest Substrate production target | In Progress |
+| Support latest Substrate production target | Completed   |
+| Improve parser resilience                  | Completed   |
 
 
 ### V0.3
@@ -164,10 +155,12 @@ Here is a brief description of what we envision for the next versions.
 |--------------------------------------------|-------------|
 | Call Solana's Rust contracts from Solidity | In progress |
 | Improvements in overflow checking          | In progress |
+| Support Solana's Program Derived Addresses | In Progress |
 | Call Solidity from Solana's Rust contracts | Not started |
-| Improve parser resilience                  | Not started |
 | Improve developer experience for Substrate | Not started |
 | Tooling for calls between ink! <> solidity | Not started |
+| Support chain extensions for Substrate     | Not started |
+| Provide CLI for node interactions          | Not started |
 
 
 ### V0.4

@@ -8,7 +8,7 @@ use super::diagnostics::Diagnostics;
 use super::eval::eval_const_number;
 use super::expression::{expression, ExprContext, ResolveTo};
 use super::symtable::Symtable;
-use crate::sema::ast::RetrieveType;
+use crate::sema::ast::{RetrieveType, Tag, UserTypeDecl};
 use crate::Target;
 use num_bigint::BigInt;
 use num_traits::One;
@@ -31,7 +31,7 @@ pub struct Prototype {
 }
 
 // A list of all Solidity builtins functions
-static BUILTIN_FUNCTIONS: Lazy<[Prototype; 28]> = Lazy::new(|| {
+static BUILTIN_FUNCTIONS: Lazy<[Prototype; 26]> = Lazy::new(|| {
     [
         Prototype {
             builtin: Builtin::Assert,
@@ -188,17 +188,6 @@ static BUILTIN_FUNCTIONS: Lazy<[Prototype; 28]> = Lazy::new(|| {
             constant: false,
         },
         Prototype {
-            builtin: Builtin::Random,
-            namespace: None,
-            method: None,
-            name: "random",
-            params: vec![Type::DynamicBytes],
-            ret: vec![Type::Bytes(32)],
-            target: vec![Target::default_substrate()],
-            doc: "Returns deterministic random bytes",
-            constant: false,
-        },
-        Prototype {
             builtin: Builtin::AbiDecode,
             namespace: Some("abi"),
             method: None,
@@ -207,17 +196,6 @@ static BUILTIN_FUNCTIONS: Lazy<[Prototype; 28]> = Lazy::new(|| {
             ret: vec![],
             target: vec![],
             doc: "Abi decode byte array with the given types",
-            constant: false,
-        },
-        Prototype {
-            builtin: Builtin::AbiBorshDecode,
-            namespace: Some("abi"),
-            method: None,
-            name: "borshDecode",
-            params: vec![Type::DynamicBytes],
-            ret: vec![],
-            target: vec![Target::Solana],
-            doc: "Abi decode byte array with the given types, using Borsh decoder",
             constant: false,
         },
         Prototype {
@@ -352,7 +330,7 @@ static BUILTIN_FUNCTIONS: Lazy<[Prototype; 28]> = Lazy::new(|| {
 });
 
 // A list of all Solidity builtins variables
-static BUILTIN_VARIABLE: Lazy<[Prototype; 16]> = Lazy::new(|| {
+static BUILTIN_VARIABLE: Lazy<[Prototype; 15]> = Lazy::new(|| {
     [
         Prototype {
             builtin: Builtin::BlockCoinbase,
@@ -429,17 +407,6 @@ static BUILTIN_VARIABLE: Lazy<[Prototype; 16]> = Lazy::new(|| {
             ret: vec![Type::Uint(64)],
             target: vec![],
             doc: "Current timestamp in unix epoch (seconds since 1970)",
-            constant: false,
-        },
-        Prototype {
-            builtin: Builtin::TombstoneDeposit,
-            namespace: Some("block"),
-            method: None,
-            name: "tombstone_deposit",
-            params: vec![],
-            ret: vec![Type::Value],
-            target: vec![Target::default_substrate()],
-            doc: "Deposit required for a tombstone",
             constant: false,
         },
         Prototype {
@@ -1068,7 +1035,6 @@ pub fn resolve_namespace_call(
     let builtin = match name {
         "decode" => Builtin::AbiDecode,
         "encode" => Builtin::AbiEncode,
-        "borshDecode" => Builtin::AbiBorshDecode,
         "encodePacked" => Builtin::AbiEncodePacked,
         "encodeWithSelector" => Builtin::AbiEncodeWithSelector,
         "encodeWithSignature" => Builtin::AbiEncodeWithSignature,
@@ -1076,7 +1042,7 @@ pub fn resolve_namespace_call(
         _ => unreachable!(),
     };
 
-    if matches!(builtin, Builtin::AbiDecode | Builtin::AbiBorshDecode) {
+    if builtin == Builtin::AbiDecode {
         if args.len() != 2 {
             diagnostics.push(Diagnostic::error(
                 *loc,
@@ -1162,23 +1128,6 @@ pub fn resolve_namespace_call(
                 }
 
                 tys.push(ty);
-            }
-        }
-
-        if builtin == Builtin::AbiBorshDecode {
-            // TODO: This is temporary and must be removed once Borsh encoding is fully wired up
-            // for Solana.
-            if ns.target != Target::Solana {
-                diagnostics.push(Diagnostic::error(
-                    *loc,
-                    "'abi.borshDecode' is only available for Solana".to_string(),
-                ));
-            } else {
-                ns.diagnostics.push(Diagnostic::warning(
-                    *loc,
-                    "'abi.borshDecode' is experimental and is not yet fully compatible with Solana"
-                        .to_string(),
-                ));
             }
         }
 
@@ -1637,5 +1586,36 @@ impl Namespace {
             &id,
             Symbol::Function(vec![(pt::Loc::Builtin, func_no)])
         ));
+    }
+
+    pub fn add_substrate_builtins(&mut self) {
+        let file_no = self.files.len();
+        self.files.push(File {
+            path: PathBuf::from("substrate"),
+            line_starts: Vec::new(),
+            cache_no: None,
+        });
+
+        // The Hash type from ink primitives.
+        let type_no = self.user_types.len();
+        self.user_types.push(UserTypeDecl {
+            tags: vec![Tag {
+                loc: pt::Loc::Builtin,
+                tag: "notice".into(),
+                no: 0,
+                value: "The Hash type from ink primitives".into(),
+            }],
+            loc: pt::Loc::Builtin,
+            name: "Hash".into(),
+            ty: Type::Bytes(32),
+            contract: None,
+        });
+
+        let id = pt::Identifier {
+            loc: pt::Loc::Builtin,
+            name: "Hash".into(),
+        };
+        let symbol = Symbol::UserType(pt::Loc::Builtin, type_no);
+        assert!(self.add_symbol(file_no, None, &id, symbol));
     }
 }

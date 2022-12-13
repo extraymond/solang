@@ -9,9 +9,12 @@ Solana has the following differences to Ethereum Solidity:
 - An address literal has to be specified using the ``address"36VtvSbE6jVGGQytYWSaDPG7uZphaxEjpJHUUpuUbq4D"`` syntax
 - There is no ``ecrecover()`` builtin function, but there is a ``signatureVerify()`` function which can check ed25519
   signatures.
-- Solana has no concept of gas, so there is no gas functions
+- There is no concept of gas, so there is no gas functions
 - Solana balance is stored in a ``uint64``, so *address* ``.balance``, ``.transfer()`` and ``.send()``
   all use ``uint64`` rather than ``uint256``.
+- Solana uses different accounts for the program code, and the contract data.
+- Programs are upgradable. There is no need to implement upgrades in Solidity.
+- Solana provides different builtins, e.g. ``tx.program_id`` and ``tx.accounts``.
 
 This is how to build your Solidity for Solana:
 
@@ -19,9 +22,9 @@ This is how to build your Solidity for Solana:
 
   solang compile --target solana flipper.sol -v
 
-This will produce two files called `flipper.abi` and `bundle.so`. The first is an ethereum style abi file and the latter being
-the ELF BPF shared object which can be deployed on Solana. For each contract, an abi file will be created; a single `bundle.so`
-is created which contains the code all the contracts provided on the command line.
+This will produce two files called `flipper.abi` and `flipper.so`. The former is an ethereum style abi file and the latter is
+the ELF BPF shared object which can be deployed on Solana. For each contract, Solang will create an ABI file and a binary file
+`contract-name.so`, which contains the code.
 
 .. code-block:: bash
 
@@ -36,7 +39,7 @@ Now run the following javascript by saving it to `flipper.js` and running it wit
     const { readFileSync } = require('fs');
 
     const FLIPPER_ABI = JSON.parse(readFileSync('./flipper.abi', 'utf8'));
-    const PROGRAM_SO = readFileSync('./bundle.so');
+    const PROGRAM_SO = readFileSync('./flipper.so');
 
     (async function () {
         console.log('Connecting to your local Solana node ...');
@@ -73,6 +76,83 @@ package has `documentation <https://solana-labs.github.io/solana-solidity.js/>`_
 are `some examples <https://solana-labs.github.io/solana-solidity.js/>`_. There is also
 `solang's integration tests <https://github.com/hyperledger/solang/tree/main/integration/solana>`_.
 
+.. _call_anchor:
+
+Calling Anchor Programs from Solidity
+_____________________________________
+
+It is possible to call `Anchor Programs <https://github.com/coral-xyz/anchor>`_
+from Solidity. You first have to generate a Solidity interface file from the IDL file using
+the :ref:`idl_command`. Then, import the Solidity file in your Solidity using the
+``import "...";`` syntax. Say you have an anchor program called `bobcat` with a
+function `pounce`, you can call it like so:
+
+.. include:: ../examples/solana/call_anchor.sol
+  :code: solidity
+
+Setting the program_id for a contract
+_____________________________________
+
+When developing contracts for Solana, programs are usually deployed to a well
+known account. The account can be specified in the source code using an annotation
+``@program_id``. If you want to instantiate a contract using the
+``new ContractName()`` syntax, then the contract must have a program_id annotation.
+
+.. include:: ../examples/solana/program_id.sol
+  :code: solidity
+
+.. note::
+
+    The program_id `Foo5mMfYo5RhRcWa4NZ2bwFn4Kdhe8rNK5jchxsKrivA` was generated using
+    the command line:
+
+    .. code-block:: bash
+
+        solana-keygen grind --starts-with Foo:1
+
+Setting the payer, seeds, bump, and space for a contract
+_________________________________________________________
+
+When a contract is instantiated, there are two accounts required: the program account to hold
+the executable code and the data account to save the state variables of the contract. The
+program account is deployed once and can be reused for updating the contract. When each
+Solidity contract is instantiated (also known as deployed), the data account has to be
+created. This can be done by the client-side code, and then the created blank account
+is passed to the transaction that runs the constructor code.
+
+Alternatively, the data account can be created by the constructor, on chain. When
+this method is used, some parameters must be specified for the account
+using annotations. Those are placed before the constructor. If there is no
+constructor present, then an empty constructor can be added. The constructor
+arguments can be used in the annotations.
+
+.. include:: ../examples/solana/constructor_annotations.sol
+  :code: solidity
+
+Creating an account needs a payer, so at a minimum the ``@payer`` annotation must be
+specified. If it is missing, then the data account must be created client-side.
+The ``@payer`` requires an address. This can be a constructor argument or
+an address literal.
+
+The size of the data account can be specified with ``@space``. This is a
+``uint64`` expression which can either be a constant or use one of the constructor
+arguments. The ``@space`` should at least be the size given when you run ``solang -v``:
+
+.. code-block:: bash
+
+    $ solang compile --target solana -v examples/flipper.sol
+    ...
+    info: contract flipper uses at least 17 bytes account data
+    ...
+
+If the data account is going to be a
+`program derived address <https://docs.solana.com/developing/programming-model/calling-between-programs#program-derived-addresses>`_,
+then the seeds and bump have to be provided. There can be multiple seeds, and an optional
+single bump. If the bump is not provided, then the seeds must not create an
+account that falls on the curve. The ``@seed`` can be a string literal,
+or a hex string with the format ``hex"4142"``, or a constructor argument of type
+``bytes``. The ``@bump`` must a single byte of type ``bytes1``.
+
 .. _value_transfer:
 
 Transfering native value with a function call
@@ -88,7 +168,7 @@ Solana Cross Program Invocation (CPI) does not support this. This means that:
 
 .. note::
 
-    Hypothetically, this could be implemented like so: the caller could transfer
+    A naive way to implement this is to let the caller transfer
     native balance and then inform the callee about the amount transferred by
     specifying this in the instruction data. However, it would be trivial to
     forge such an operation.
@@ -107,7 +187,7 @@ Builtin Imports
 ________________
 
 Some builtin functionality is only available after importing. The following structs
-can be imported via the special import file ``solana``.
+can be imported via the special builtin import file ``solana``.
 
 .. code-block:: solidity
 
@@ -186,17 +266,8 @@ This function returns the program derived address for a program address and
 the provided seeds. See the Solana documentation on
 `program derived adddresses <https://edge.docs.solana.com/developing/programming-model/calling-between-programs#program-derived-addresses>`_.
 
-.. code-block:: solidity
-
-    import {create_program_address} from 'solana';
-
-    contract pda {
-        address token = address"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-
-        function create_pda(bytes seed2) public returns (address) {
-            return create_program_address(["kabang", seed2], token);
-        }
-    }
+.. include:: ../examples/solana/builtin_create_program_address.sol
+  :code: solidity
 
 Builtin try_find_program_address
 ++++++++++++++++++++++++++++++++
@@ -205,25 +276,14 @@ This function returns the program derived address for a program address and
 the provided seeds, along with a seed bump. See the Solana documentation on
 `program derived adddresses <https://edge.docs.solana.com/developing/programming-model/calling-between-programs#program-derived-addresses>`_.
 
-.. code-block:: solidity
-
-    import {try_find_program_address} from 'solana';
-
-    contract pda {
-        address token = address"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-
-        function create_pda(bytes seed2) public returns (address, bytes1) {
-            return try_find_program_address(["kabang", seed2], token);
-        }
-    }
-
-
+.. include:: ../examples/solana/builtin_try_find_program_address.sol
+  :code: solidity
 
 Solana Library
 ______________
 
 In Solang's Github repository, there is a directory called ``solana-library``. It contains libraries for Solidity contracts
-to interact with Solana specific instructions. Currently, there are two libraries there: one for SPL tokens and another
+to interact with Solana specific instructions. We provide two libraries: one for SPL tokens and another
 for Solana's system instructions. In order to use those functionalities, copy the correspondent library
 file to your project and import it.
 

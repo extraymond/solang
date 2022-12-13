@@ -56,8 +56,10 @@ impl Namespace {
             hover_overrides: HashMap::new(),
         };
 
-        if target == Target::Solana {
-            ns.add_solana_builtins();
+        match target {
+            Target::Solana => ns.add_solana_builtins(),
+            Target::Substrate { .. } => ns.add_substrate_builtins(),
+            _ => {}
         }
 
         ns
@@ -758,10 +760,10 @@ impl Namespace {
         id: &pt::Expression,
         diagnostics: &mut Diagnostics,
     ) -> Result<Type, ()> {
-        fn resolve_dimensions(
-            ast_dimensions: &[Option<(pt::Loc, BigInt)>],
-            diagnostics: &mut Diagnostics,
-        ) -> Result<Vec<ArrayLength>, ()> {
+        let is_substrate = self.target.is_substrate();
+
+        let resolve_dimensions = |ast_dimensions: &[Option<(pt::Loc, BigInt)>],
+                                  diagnostics: &mut Diagnostics| {
             let mut dimensions = Vec::new();
 
             for d in ast_dimensions.iter().rev() {
@@ -778,6 +780,13 @@ impl Namespace {
                             "negative size of array declared".to_string(),
                         ));
                         return Err(());
+                    } else if is_substrate && n > &u32::MAX.into() {
+                        let msg = format!(
+                            "array dimension of {} exceeds the maximum of 4294967295 on Substrate",
+                            n
+                        );
+                        diagnostics.push(Diagnostic::decl_error(*loc, msg));
+                        return Err(());
                     }
                     dimensions.push(ArrayLength::Fixed(n.clone()));
                 } else {
@@ -786,7 +795,7 @@ impl Namespace {
             }
 
             Ok(dimensions)
-        }
+        };
 
         let (namespace, id, dimensions) =
             self.expr_to_type(file_no, contract_no, id, diagnostics)?;

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import {loadContract} from "./setup";
-import {Keypair, LAMPORTS_PER_SOL, PublicKey} from "@solana/web3.js";
-import {publicKeyToHex} from "@solana/solidity";
-import {TOKEN_PROGRAM_ID} from "@solana/spl-token";
+import { loadContract } from "./setup";
+import { Keypair, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 
-describe('Test system instructions', function() {
+describe('Test system instructions', function () {
     this.timeout(500000);
     const system_account = new PublicKey('11111111111111111111111111111111');
     const recent_block_hashes = new PublicKey('SysvarRecentB1ockHashes11111111111111111111');
@@ -14,15 +13,15 @@ describe('Test system instructions', function() {
     const seed = 'my_seed_is_tea';
 
     it('create account', async function create_account() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const to_key_pair = Keypair.generate();
 
         await contract.functions.create_account(
-            publicKeyToHex(payer.publicKey),
-            publicKeyToHex(to_key_pair.publicKey),
+            payer.publicKey.toBytes(),
+            to_key_pair.publicKey.toBytes(),
             100000000,
             5,
-            publicKeyToHex(TOKEN_PROGRAM_ID),
+            TOKEN_PROGRAM_ID.toBytes(),
             {
                 accounts: [system_account, TOKEN_PROGRAM_ID],
                 writableAccounts: [payer.publicKey, to_key_pair.publicKey],
@@ -32,18 +31,18 @@ describe('Test system instructions', function() {
     });
 
     it('create account with seed', async function create_account_with_seed() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const base_keypair = Keypair.generate();
         const to_key_pair = await PublicKey.createWithSeed(base_keypair.publicKey, seed, TOKEN_PROGRAM_ID);
 
         await contract.functions.create_account_with_seed(
-            publicKeyToHex(payer.publicKey),
-            publicKeyToHex(to_key_pair),
-            publicKeyToHex(base_keypair.publicKey),
+            payer.publicKey.toBytes(),
+            to_key_pair.toBytes(),
+            base_keypair.publicKey.toBytes(),
             seed,
             100000000,
             5,
-            publicKeyToHex(TOKEN_PROGRAM_ID),
+            TOKEN_PROGRAM_ID.toBytes(),
             {
                 accounts: [system_account, TOKEN_PROGRAM_ID],
                 writableAccounts: [payer.publicKey, to_key_pair],
@@ -53,13 +52,13 @@ describe('Test system instructions', function() {
     });
 
     it('assign', async function assign() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const to_key_pair = Keypair.generate();
 
         const assign_account = new PublicKey('AddressLookupTab1e1111111111111111111111111');
         await contract.functions.assign(
-            publicKeyToHex(to_key_pair.publicKey),
-            publicKeyToHex(assign_account),
+            to_key_pair.publicKey.toBytes(),
+            assign_account.toBytes(),
             {
                 accounts: [system_account, payer.publicKey],
                 writable_accounts: [to_key_pair.publicKey],
@@ -69,16 +68,16 @@ describe('Test system instructions', function() {
     });
 
     it('assign with seed', async function assign_with_with_seed() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
 
         const assign_account = new PublicKey('AddressLookupTab1e1111111111111111111111111');
         const to_key_pair = await PublicKey.createWithSeed(payer.publicKey, seed, assign_account);
 
         await contract.functions.assign_with_seed(
-            publicKeyToHex(to_key_pair),
-            publicKeyToHex(payer.publicKey),
+            to_key_pair.toBytes(),
+            payer.publicKey.toBytes(),
             seed,
-            publicKeyToHex(assign_account),
+            assign_account.toBytes(),
             {
                 accounts: [system_account, assign_account],
                 writableAccounts: [to_key_pair],
@@ -88,12 +87,12 @@ describe('Test system instructions', function() {
     });
 
     it('transfer', async function transfer() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const dest = new Keypair();
 
         await contract.functions.transfer(
-            publicKeyToHex(payer.publicKey),
-            publicKeyToHex(dest.publicKey),
+            payer.publicKey.toBytes(),
+            dest.publicKey.toBytes(),
             100000000,
             {
                 accounts: [system_account],
@@ -104,7 +103,7 @@ describe('Test system instructions', function() {
     });
 
     it('transfer with seed', async function transfer_with_seed() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const dest = new Keypair();
         const assign_account = new PublicKey('AddressLookupTab1e1111111111111111111111111');
         const derived_payer = await PublicKey.createWithSeed(payer.publicKey, seed, assign_account);
@@ -113,11 +112,11 @@ describe('Test system instructions', function() {
         await connection.confirmTransaction(signature, 'confirmed');
 
         await contract.functions.transfer_with_seed(
-            publicKeyToHex(derived_payer),
-            publicKeyToHex(payer.publicKey),
+            derived_payer.toBytes(),
+            payer.publicKey.toBytes(),
             seed,
-            publicKeyToHex(assign_account),
-            publicKeyToHex(dest.publicKey),
+            assign_account.toBytes(),
+            dest.publicKey.toBytes(),
             100000000,
             {
                 accounts: [system_account, assign_account],
@@ -128,11 +127,11 @@ describe('Test system instructions', function() {
     });
 
     it('allocate', async function allocate() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const account = Keypair.generate();
 
         await contract.functions.allocate(
-            publicKeyToHex(account.publicKey),
+            account.publicKey.toBytes(),
             2,
             {
                 accounts: [system_account],
@@ -143,17 +142,17 @@ describe('Test system instructions', function() {
     });
 
     it('allocate with seed', async function allocate_with_seed() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const account = Keypair.generate();
         const owner = new PublicKey('Stake11111111111111111111111111111111111111');
         const derived_key = await PublicKey.createWithSeed(account.publicKey, seed, owner);
 
         await contract.functions.allocate_with_seed(
-            publicKeyToHex(derived_key),
-            publicKeyToHex(account.publicKey),
+            derived_key.toBytes(),
+            account.publicKey.toBytes(),
             seed,
             200,
-            publicKeyToHex(owner),
+            owner.toBytes(),
             {
                 accounts: [system_account, owner],
                 writableAccounts: [derived_key],
@@ -163,17 +162,17 @@ describe('Test system instructions', function() {
     });
 
     it('create nonce account with seed', async function create_nonce_account_with_seed() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const base_address = Keypair.generate();
         const derived_account = await PublicKey.createWithSeed(base_address.publicKey, seed, system_account);
         const authority = Keypair.generate();
 
         await contract.functions.create_nonce_account_with_seed(
-            publicKeyToHex(payer.publicKey),
-            publicKeyToHex(derived_account),
-            publicKeyToHex(base_address.publicKey),
+            payer.publicKey.toBytes(),
+            derived_account.toBytes(),
+            base_address.publicKey.toBytes(),
             seed,
-            publicKeyToHex(authority.publicKey),
+            authority.publicKey.toBytes(),
             100000000,
             {
                 accounts: [system_account, recent_block_hashes, rentAddress],
@@ -184,14 +183,14 @@ describe('Test system instructions', function() {
     });
 
     it('nonce accounts', async function nonce_accounts() {
-        const { contract, connection, payer, program } = await loadContract('TestingInstruction', 'TestingInstruction.abi');
+        const { contract, connection, payer, program } = await loadContract('TestingInstruction');
         const nonce = Keypair.generate();
         const authority = Keypair.generate();
 
         await contract.functions.create_nonce_account(
-            publicKeyToHex(payer.publicKey),
-            publicKeyToHex(nonce.publicKey),
-            publicKeyToHex(authority.publicKey),
+            payer.publicKey.toBytes(),
+            nonce.publicKey.toBytes(),
+            authority.publicKey.toBytes(),
             100000000,
             {
                 accounts: [system_account, recent_block_hashes, rentAddress],
@@ -201,8 +200,8 @@ describe('Test system instructions', function() {
         );
 
         await contract.functions.advance_nonce_account(
-            publicKeyToHex(nonce.publicKey),
-            publicKeyToHex(authority.publicKey),
+            nonce.publicKey.toBytes(),
+            authority.publicKey.toBytes(),
             {
                 accounts: [system_account, recent_block_hashes],
                 writableAccounts: [nonce.publicKey],
@@ -211,9 +210,9 @@ describe('Test system instructions', function() {
         );
 
         await contract.functions.withdraw_nonce_account(
-            publicKeyToHex(nonce.publicKey),
-            publicKeyToHex(authority.publicKey),
-            publicKeyToHex(payer.publicKey),
+            nonce.publicKey.toBytes(),
+            authority.publicKey.toBytes(),
+            payer.publicKey.toBytes(),
             1000,
             {
                 accounts: [system_account, recent_block_hashes, rentAddress],
@@ -224,9 +223,9 @@ describe('Test system instructions', function() {
 
         const new_authority = Keypair.generate();
         await contract.functions.authorize_nonce_account(
-            publicKeyToHex(nonce.publicKey),
-            publicKeyToHex(authority.publicKey),
-            publicKeyToHex(new_authority.publicKey),
+            nonce.publicKey.toBytes(),
+            authority.publicKey.toBytes(),
+            new_authority.publicKey.toBytes(),
             {
                 accounts: [system_account],
                 writableAccounts: [nonce.publicKey],

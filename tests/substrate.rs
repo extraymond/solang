@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use ink_metadata::InkProject;
+use contract_metadata::ContractMetadata;
+use ink::metadata::InkProject;
 // Create WASM virtual machine like substrate
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
@@ -11,7 +12,6 @@ use tiny_keccak::{Hasher, Keccak};
 use wasmi::memory_units::Pages;
 use wasmi::*;
 
-use solang::abi;
 use solang::file_resolver::FileResolver;
 use solang::{compile, Target};
 
@@ -19,6 +19,9 @@ mod substrate_tests;
 
 type StorageKey = [u8; 32];
 type Account = [u8; 32];
+
+/// In `ink!`, u32::MAX (which is -1 in 2s complement) represents a `None` value
+const NONE_SENTINEL: RuntimeValue = RuntimeValue::I32(-1);
 
 fn account_new() -> Account {
     let mut rng = rand::thread_rng();
@@ -78,7 +81,6 @@ enum SubstrateExternal {
     seal_weight_to_fee,
     seal_gas_left,
     seal_caller,
-    seal_tombstone_deposit,
     seal_deposit_event,
     seal_transfer,
 }
@@ -191,12 +193,14 @@ impl Externals for MockSubstrate {
                 Ok(None)
             }
             Some(SubstrateExternal::seal_get_storage) => {
-                assert_eq!(args.len(), 3);
+                assert_eq!(args.len(), 4);
 
                 let key_ptr: u32 = args.nth_checked(0)?;
-                let dest_ptr: u32 = args.nth_checked(1)?;
-                let len_ptr: u32 = args.nth_checked(2)?;
+                let key_len: u32 = args.nth_checked(1)?;
+                let dest_ptr: u32 = args.nth_checked(2)?;
+                let len_ptr: u32 = args.nth_checked(3)?;
 
+                assert_eq!(key_len, 32);
                 let mut key: StorageKey = [0; 32];
 
                 if let Err(e) = self.vm.memory.get_into(key_ptr, &mut key) {
@@ -234,7 +238,9 @@ impl Externals for MockSubstrate {
             }
             Some(SubstrateExternal::seal_clear_storage) => {
                 let key_ptr: u32 = args.nth_checked(0)?;
+                let key_len: u32 = args.nth_checked(1)?;
 
+                assert_eq!(key_len, 32);
                 let mut key: StorageKey = [0; 32];
 
                 if let Err(e) = self.vm.memory.get_into(key_ptr, &mut key) {
@@ -242,20 +248,26 @@ impl Externals for MockSubstrate {
                 }
 
                 println!("seal_clear_storage: {:?}", key);
-                self.store.remove(&(self.vm.account, key));
+                let pre_existing_len = self
+                    .store
+                    .remove(&(self.vm.account, key))
+                    .map(|e| RuntimeValue::I32(e.len() as i32))
+                    .or(Some(NONE_SENTINEL));
 
-                Ok(None)
+                Ok(pre_existing_len)
             }
             Some(SubstrateExternal::seal_set_storage) => {
-                assert_eq!(args.len(), 3);
+                assert_eq!(args.len(), 4);
 
                 let key_ptr: u32 = args.nth_checked(0)?;
-                let data_ptr: u32 = args.nth_checked(1)?;
-                let len: u32 = args.nth_checked(2)?;
+                let key_len: u32 = args.nth_checked(1)?;
+                let data_ptr: u32 = args.nth_checked(2)?;
+                let len: u32 = args.nth_checked(3)?;
 
+                assert_eq!(key_len, 32);
                 let mut key: StorageKey = [0; 32];
 
-                if let Err(e) = self.vm.memory.get_into(key_ptr, &mut key) {
+                if let Err(e) = self.vm.memory.get_into(key_ptr, &mut key[..]) {
                     panic!("seal_set_storage: {}", e);
                 }
 
@@ -267,9 +279,13 @@ impl Externals for MockSubstrate {
                 }
                 println!("seal_set_storage: {:?} = {:?}", key, data);
 
-                self.store.insert((self.vm.account, key), data);
+                let pre_existing_len = self
+                    .store
+                    .insert((self.vm.account, key), data)
+                    .map(|e| RuntimeValue::I32(e.len() as i32))
+                    .or(Some(NONE_SENTINEL));
 
-                Ok(None)
+                Ok(pre_existing_len)
             }
             Some(SubstrateExternal::seal_hash_keccak_256) => {
                 let data_ptr: u32 = args.nth_checked(0)?;
@@ -436,7 +452,7 @@ impl Externals for MockSubstrate {
 
                 hash.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &buf).as_bytes());
 
-                println!("seal_random: {} {}", hex::encode(buf), hex::encode(&hash));
+                println!("seal_random: {} {}", hex::encode(buf), hex::encode(hash));
 
                 let len = self
                     .vm
@@ -461,27 +477,23 @@ impl Externals for MockSubstrate {
                 Ok(None)
             }
             Some(SubstrateExternal::seal_call) => {
-                let account_ptr: u32 = args.nth_checked(0)?;
-                let account_len: u32 = args.nth_checked(1)?;
-                //let gas: u64 = args.nth_checked(2)?;
+                let flags: u32 = args.nth_checked(0)?;
+                let account_ptr: u32 = args.nth_checked(1)?;
+                // Gas usage is ignored in the mock VM
                 let value_ptr: u32 = args.nth_checked(3)?;
-                let value_len: u32 = args.nth_checked(4)?;
-                let input_ptr: u32 = args.nth_checked(5)?;
-                let input_len: u32 = args.nth_checked(6)?;
-                let output_ptr: u32 = args.nth_checked(7)?;
-                let output_len_ptr: u32 = args.nth_checked(8)?;
+                let input_ptr: u32 = args.nth_checked(4)?;
+                let input_len: u32 = args.nth_checked(5)?;
+                let output_ptr: u32 = args.nth_checked(6)?;
+                let output_len_ptr: u32 = args.nth_checked(7)?;
 
+                assert_eq!(flags, 0); //TODO: Call flags are not yet implemented
                 let mut account = [0u8; 32];
-
-                assert!(account_len == 32, "seal_call: len = {}", account_len);
 
                 if let Err(e) = self.vm.memory.get_into(account_ptr, &mut account) {
                     panic!("seal_call: {}", e);
                 }
 
                 let mut value = [0u8; 16];
-
-                assert!(value_len == 16, "seal_call: len = {}", value_len);
 
                 if let Err(e) = self.vm.memory.get_into(value_ptr, &mut value) {
                     panic!("seal_call: {}", e);
@@ -587,34 +599,24 @@ impl Externals for MockSubstrate {
             }
             Some(SubstrateExternal::seal_instantiate) => {
                 let codehash_ptr: u32 = args.nth_checked(0)?;
-                let codehash_len: u32 = args.nth_checked(1)?;
-                //let gas: u64 = args.nth_checked(2)?;
-                let value_ptr: u32 = args.nth_checked(3)?;
-                let value_len: u32 = args.nth_checked(4)?;
-                let input_ptr: u32 = args.nth_checked(5)?;
-                let input_len: u32 = args.nth_checked(6)?;
-                let account_ptr: u32 = args.nth_checked(7)?;
-                let account_len_ptr: u32 = args.nth_checked(8)?;
-                let output_ptr: u32 = args.nth_checked(9)?;
-                let output_len_ptr: u32 = args.nth_checked(10)?;
-                let salt_ptr: u32 = args.nth_checked(11)?;
-                let salt_len: u32 = args.nth_checked(12)?;
+                // Gas usage is ignored in the mock VM
+                let value_ptr: u32 = args.nth_checked(2)?;
+                let input_ptr: u32 = args.nth_checked(3)?;
+                let input_len: u32 = args.nth_checked(4)?;
+                let account_ptr: u32 = args.nth_checked(5)?;
+                let account_len_ptr: u32 = args.nth_checked(6)?;
+                let output_ptr: u32 = args.nth_checked(7)?;
+                let output_len_ptr: u32 = args.nth_checked(8)?;
+                let salt_ptr: u32 = args.nth_checked(9)?;
+                let salt_len: u32 = args.nth_checked(10)?;
 
                 let mut codehash = [0u8; 32];
-
-                assert!(
-                    codehash_len == 32,
-                    "seal_instantiate: len = {}",
-                    codehash_len
-                );
 
                 if let Err(e) = self.vm.memory.get_into(codehash_ptr, &mut codehash) {
                     panic!("seal_instantiate: {}", e);
                 }
 
                 let mut value = [0u8; 16];
-
-                assert!(value_len == 16, "seal_instantiate: len = {}", value_len);
 
                 if let Err(e) = self.vm.memory.get_into(value_ptr, &mut value) {
                     panic!("seal_instantiate: {}", e);
@@ -813,23 +815,10 @@ impl Externals for MockSubstrate {
 
                 Ok(None)
             }
-            Some(SubstrateExternal::seal_tombstone_deposit) => {
-                let dest_ptr: u32 = args.nth_checked(0)?;
-                let len_ptr: u32 = args.nth_checked(1)?;
-
-                let scratch = 93_603_701_976_053u128.to_le_bytes();
-
-                set_seal_value!("seal_tombstone_deposit", dest_ptr, len_ptr, &scratch);
-
-                Ok(None)
-            }
             Some(SubstrateExternal::seal_terminate) => {
                 let account_ptr: u32 = args.nth_checked(0)?;
-                let account_len: u32 = args.nth_checked(1)?;
 
                 let mut account = [0u8; 32];
-
-                assert!(account_len == 32, "seal_terminate: len = {}", account_len);
 
                 if let Err(e) = self.vm.memory.get_into(account_ptr, &mut account) {
                     panic!("seal_terminate: {}", e);
@@ -839,7 +828,7 @@ impl Externals for MockSubstrate {
 
                 self.accounts.get_mut(&account).unwrap().1 += remaining;
 
-                println!("seal_terminate: {} {}", hex::encode(&account), remaining);
+                println!("seal_terminate: {} {}", hex::encode(account), remaining);
 
                 self.accounts.remove(&self.vm.account);
 
@@ -889,7 +878,7 @@ impl Externals for MockSubstrate {
                     "seal_deposit_event: topic: {} data: {}",
                     topics
                         .iter()
-                        .map(|t| hex::encode(&t))
+                        .map(hex::encode)
                         .collect::<Vec<String>>()
                         .join(" "),
                     hex::encode(&data)
@@ -930,7 +919,6 @@ impl ModuleImportResolver for MockSubstrate {
             "seal_weight_to_fee" => SubstrateExternal::seal_weight_to_fee,
             "seal_gas_left" => SubstrateExternal::seal_gas_left,
             "seal_caller" => SubstrateExternal::seal_caller,
-            "seal_tombstone_deposit" => SubstrateExternal::seal_tombstone_deposit,
             "seal_deposit_event" => SubstrateExternal::seal_deposit_event,
             "seal_transfer" => SubstrateExternal::seal_transfer,
             _ => {
@@ -952,13 +940,15 @@ impl ModuleImportResolver for MockSubstrate {
 
 impl MockSubstrate {
     fn create_module(&self, code: &[u8]) -> ModuleRef {
-        let module = Module::from_buffer(&code).expect("parse wasm should work");
+        let module = Module::from_buffer(code).expect("parse wasm should work");
 
         ModuleInstance::new(
             &module,
             &ImportsBuilder::new()
                 .with_resolver("env", self)
-                .with_resolver("seal0", self),
+                .with_resolver("seal0", self)
+                .with_resolver("seal1", self)
+                .with_resolver("seal2", self),
         )
         .expect("Failed to instantiate module")
         .run_start(&mut NopExternals)
@@ -1169,7 +1159,7 @@ impl MockSubstrate {
     }
 
     pub fn heap_verify(&self) {
-        let memsize = self.vm.memory.current_size().0 as usize * 0x10000;
+        let memsize = self.vm.memory.current_size().0 * 0x10000;
         println!("memory size:{}", memsize);
         let mut buf = Vec::new();
         buf.resize(memsize, 0);
@@ -1234,9 +1224,14 @@ impl MockSubstrate {
 }
 
 pub fn build_solidity(src: &str) -> MockSubstrate {
-    build_solidity_with_overflow_check(src, false)
+    build_solidity_with_options(src, false, false)
 }
-pub fn build_solidity_with_overflow_check(src: &str, math_overflow_flag: bool) -> MockSubstrate {
+
+pub fn build_solidity_with_options(
+    src: &str,
+    math_overflow_flag: bool,
+    log_api_return_codes: bool,
+) -> MockSubstrate {
     let mut cache = FileResolver::new();
 
     cache.set_file_contents("test.sol", src.to_string());
@@ -1247,6 +1242,7 @@ pub fn build_solidity_with_overflow_check(src: &str, math_overflow_flag: bool) -
         inkwell::OptimizationLevel::Default,
         Target::default_substrate(),
         math_overflow_flag,
+        log_api_return_codes,
     );
 
     ns.print_diagnostics_in_plain(&cache, false);
@@ -1257,7 +1253,7 @@ pub fn build_solidity_with_overflow_check(src: &str, math_overflow_flag: bool) -
         .iter()
         .map(|res| Program {
             code: res.0.clone(),
-            abi: abi::substrate::load(&res.1),
+            abi: load_abi(&res.1),
         })
         .collect();
 
@@ -1278,4 +1274,9 @@ pub fn build_solidity_with_overflow_check(src: &str, math_overflow_flag: bool) -
         current_program: 0,
         events: Vec::new(),
     }
+}
+
+fn load_abi(s: &str) -> InkProject {
+    let bundle = serde_json::from_str::<ContractMetadata>(s).unwrap();
+    serde_json::from_value::<InkProject>(serde_json::to_value(bundle.abi).unwrap()).unwrap()
 }

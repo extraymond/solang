@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::build_solidity;
-use ethabi::Token;
+use crate::{build_solidity, BorshToken};
 
 #[test]
 fn constants_hash_tests() {
@@ -17,7 +16,7 @@ fn constants_hash_tests() {
     );
 
     runtime.constructor("tester", &[]);
-    runtime.function("test", &[], &[], None);
+    runtime.function("test", &[], None);
 
     let mut runtime = build_solidity(
         r##"
@@ -31,7 +30,7 @@ fn constants_hash_tests() {
     );
 
     runtime.constructor("tester", &[]);
-    runtime.function("test", &[], &[], None);
+    runtime.function("test", &[], None);
 
     let mut runtime = build_solidity(
         r##"
@@ -45,7 +44,7 @@ fn constants_hash_tests() {
     );
 
     runtime.constructor("tester", &[]);
-    runtime.function("test", &[], &[], None);
+    runtime.function("test", &[], None);
 }
 
 #[test]
@@ -64,14 +63,13 @@ fn hash_tests() {
     runtime.constructor("tester", &[]);
     let hash = runtime.function(
         "test",
-        &[Token::Bytes(b"Hello, World!".to_vec())],
-        &[],
+        &[BorshToken::Bytes(b"Hello, World!".to_vec())],
         None,
     );
 
     assert_eq!(
         hash,
-        vec![Token::FixedBytes(
+        vec![BorshToken::FixedBytes(
             hex::decode("527a6a4b9a6da75607546842e0e00105350b1aaf").unwrap()
         )]
     );
@@ -90,14 +88,13 @@ fn hash_tests() {
     runtime.constructor("tester", &[]);
     let hash = runtime.function(
         "test",
-        &[Token::Bytes(b"Hello, World!".to_vec())],
-        &[],
+        &[BorshToken::Bytes(b"Hello, World!".to_vec())],
         None,
     );
 
     assert_eq!(
         hash,
-        vec![Token::FixedBytes(
+        vec![BorshToken::FixedBytes(
             hex::decode("dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f")
                 .unwrap()
         )]
@@ -117,14 +114,13 @@ fn hash_tests() {
     runtime.constructor("tester", &[]);
     let hash = runtime.function(
         "test",
-        &[Token::Bytes(b"Hello, World!".to_vec())],
-        &[],
+        &[BorshToken::Bytes(b"Hello, World!".to_vec())],
         None,
     );
 
     assert_eq!(
         hash,
-        vec![Token::FixedBytes(
+        vec![BorshToken::FixedBytes(
             hex::decode("acaf3289d7b601cbd114fb36c4d29c85bbfd5e133f14cb355c3fd8d99367964f")
                 .unwrap()
         )]

@@ -18,13 +18,24 @@ Differences:
 
 - libraries are always statically linked into the contract code
 - Solang generates WebAssembly or BPF rather than EVM.
+- Packed encoded uses little endian encoding, as WASM and BPF are little endian
+  virtual machines.
 
 Unique features to Solang:
 
 - Solang can target different blockchains and some features depending on the target.
   For example, Parity Substrate uses a different ABI encoding and allows constructors
-  to be overloaded.
+  to be named.
 - Events can be declared outside of contracts
 - Base contracts can be declared in any order
 - There is a ``print()`` function for debugging
 - Strings can be formatted with python style format string, which is useful for debugging: ``print("x = {}".format(x));``
+- Ethereum style address literals like ``0xE0f5206BBD039e7b0592d8918820024e2a7437b9`` are
+  not supported on Substrate or Solana, but are supported for EVM.
+- On Substrate and Solana, base58 style encoded address literals like
+  ``address"5GBWmgdFAMqm8ZgAHGobqDqX6tjLxJhv53ygjNtaaAn3sjeZ"`` are supported, but
+  not with EVM.
+- On Solana, there is special builtin import file called ``'solana'`` available.
+- On Substrate, there is special builtin import file called ``'substrate'`` available.
+- Different blockchains offer different builtins. See the :ref:`builtins documentation <builtins>`.
+- There are many more differences, which are noted throughout the documentation.

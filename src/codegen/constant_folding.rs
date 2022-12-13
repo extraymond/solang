@@ -22,7 +22,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
         let mut vars = cfg.blocks[block_no].defs.clone();
 
         for instr_no in 0..cfg.blocks[block_no].instr.len() {
-            match &cfg.blocks[block_no].instr[instr_no] {
+            match &cfg.blocks[block_no].instr[instr_no].1 {
                 Instr::Set { loc, res, expr, .. } => {
                     let (expr, expr_constant) = expression(expr, Some(&vars), cfg, ns);
 
@@ -30,7 +30,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                         ns.var_constants.insert(*loc, expr.clone());
                     }
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::Set {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::Set {
                         loc: *loc,
                         res: *res,
                         expr,
@@ -47,7 +47,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                         .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::Call {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::Call {
                         res: res.clone(),
                         call: call.clone(),
                         args,
@@ -60,7 +60,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                         .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::Return { value };
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::Return { value };
                 }
                 Instr::BranchCond {
                     cond,
@@ -70,11 +70,11 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     let (cond, _) = expression(cond, Some(&vars), cfg, ns);
 
                     if let Expression::BoolLiteral(_, cond) = cond {
-                        cfg.blocks[block_no].instr[instr_no] = Instr::Branch {
+                        cfg.blocks[block_no].instr[instr_no].1 = Instr::Branch {
                             block: if cond { *true_block } else { *false_block },
                         };
                     } else {
-                        cfg.blocks[block_no].instr[instr_no] = Instr::BranchCond {
+                        cfg.blocks[block_no].instr[instr_no].1 = Instr::BranchCond {
                             cond,
                             true_block: *true_block,
                             false_block: *false_block,
@@ -85,23 +85,26 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     let (dest, _) = expression(dest, Some(&vars), cfg, ns);
                     let (data, _) = expression(data, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::Store { dest, data };
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::Store { dest, data };
                 }
-                Instr::AssertFailure { expr: Some(expr) } => {
-                    let (expr, _) = expression(expr, Some(&vars), cfg, ns);
+                Instr::AssertFailure {
+                    encoded_args: Some(expr),
+                } => {
+                    let (buf, _) = expression(expr, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] =
-                        Instr::AssertFailure { expr: Some(expr) };
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::AssertFailure {
+                        encoded_args: Some(buf),
+                    };
                 }
                 Instr::Print { expr } => {
                     let (expr, _) = expression(expr, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::Print { expr };
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::Print { expr };
                 }
                 Instr::ClearStorage { ty, storage } => {
                     let (storage, _) = expression(storage, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::ClearStorage {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::ClearStorage {
                         ty: ty.clone(),
                         storage,
                     };
@@ -110,7 +113,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     let (storage, _) = expression(storage, Some(&vars), cfg, ns);
                     let (value, _) = expression(value, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::SetStorage {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::SetStorage {
                         ty: ty.clone(),
                         storage,
                         value,
@@ -119,7 +122,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                 Instr::LoadStorage { ty, storage, res } => {
                     let (storage, _) = expression(storage, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::LoadStorage {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::LoadStorage {
                         ty: ty.clone(),
                         storage,
                         res: *res,
@@ -134,7 +137,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     let (value, _) = expression(value, Some(&vars), cfg, ns);
                     let (offset, _) = expression(offset, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::SetStorageBytes {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::SetStorageBytes {
                         storage,
                         value,
                         offset,
@@ -151,7 +154,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                         .as_ref()
                         .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::PushStorage {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::PushStorage {
                         res: *res,
                         ty: ty.clone(),
                         storage,
@@ -161,7 +164,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                 Instr::PopStorage { res, ty, storage } => {
                     let (storage, _) = expression(storage, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::PopStorage {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::PopStorage {
                         res: *res,
                         ty: ty.clone(),
                         storage,
@@ -175,7 +178,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                 } => {
                     let (value, _) = expression(value, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::PushMemory {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::PushMemory {
                         res: *res,
                         ty: ty.clone(),
                         array: *array,
@@ -186,17 +189,16 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     success,
                     res,
                     contract_no,
-                    constructor_no,
-                    args,
+                    encoded_args,
+                    encoded_args_len,
                     value,
                     gas,
                     salt,
-                    space,
+                    address,
+                    seeds,
                 } => {
-                    let args = args
-                        .iter()
-                        .map(|e| expression(e, Some(&vars), cfg, ns).0)
-                        .collect();
+                    let encoded_args = expression(encoded_args, Some(&vars), cfg, ns).0;
+                    let encoded_args_len = expression(encoded_args_len, Some(&vars), cfg, ns).0;
                     let value = value
                         .as_ref()
                         .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
@@ -204,20 +206,24 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     let salt = salt
                         .as_ref()
                         .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
-                    let space = space
+                    let address = address
+                        .as_ref()
+                        .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
+                    let seeds = seeds
                         .as_ref()
                         .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::Constructor {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::Constructor {
                         success: *success,
                         res: *res,
                         contract_no: *contract_no,
-                        constructor_no: *constructor_no,
-                        args,
+                        encoded_args,
+                        encoded_args_len,
                         value,
                         gas,
                         salt,
-                        space,
+                        address,
+                        seeds,
                     };
                 }
                 Instr::ExternalCall {
@@ -227,8 +233,8 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     value,
                     gas,
                     accounts,
-                    seeds,
                     callty,
+                    seeds,
                 } => {
                     let value = expression(value, Some(&vars), cfg, ns).0;
                     let gas = expression(gas, Some(&vars), cfg, ns).0;
@@ -243,7 +249,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                         .as_ref()
                         .map(|expr| expression(expr, Some(&vars), cfg, ns).0);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::ExternalCall {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::ExternalCall {
                         success: *success,
                         address,
                         accounts,
@@ -260,21 +266,26 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     exception_block,
                     tys,
                     data,
+                    data_len,
                 } => {
                     let (data, _) = expression(data, Some(&vars), cfg, ns);
+                    let data_len = data_len
+                        .as_ref()
+                        .map(|e| expression(e, Some(&vars), cfg, ns).0);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::AbiDecode {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::AbiDecode {
                         res: res.clone(),
                         selector: *selector,
                         exception_block: *exception_block,
                         tys: tys.clone(),
                         data,
+                        data_len,
                     }
                 }
                 Instr::SelfDestruct { recipient } => {
                     let (recipient, _) = expression(recipient, Some(&vars), cfg, ns);
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::SelfDestruct { recipient };
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::SelfDestruct { recipient };
                 }
                 Instr::EmitEvent {
                     event_no,
@@ -293,7 +304,7 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                         .map(|e| expression(e, Some(&vars), cfg, ns).0)
                         .collect();
 
-                    cfg.blocks[block_no].instr[instr_no] = Instr::EmitEvent {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::EmitEvent {
                         event_no: *event_no,
                         data,
                         data_tys: data_tys.clone(),
@@ -309,11 +320,42 @@ pub fn constant_folding(cfg: &mut ControlFlowGraph, ns: &mut Namespace) {
                     let bytes = expression(bytes, Some(&vars), cfg, ns);
                     let source = expression(source, Some(&vars), cfg, ns);
                     let destination = expression(destination, Some(&vars), cfg, ns);
-                    cfg.blocks[block_no].instr[instr_no] = Instr::MemCopy {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::MemCopy {
                         source: source.0,
                         destination: destination.0,
                         bytes: bytes.0,
                     };
+                }
+                Instr::Switch {
+                    cond,
+                    cases,
+                    default,
+                } => {
+                    let cond = expression(cond, Some(&vars), cfg, ns);
+                    let cases = cases
+                        .iter()
+                        .map(|(exp, goto)| (expression(exp, Some(&vars), cfg, ns).0, *goto))
+                        .collect::<Vec<(Expression, usize)>>();
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::Switch {
+                        cond: cond.0,
+                        cases,
+                        default: *default,
+                    };
+                }
+                Instr::ReturnData { data, data_len } => {
+                    let data = expression(data, Some(&vars), cfg, ns);
+                    let data_len = expression(data_len, Some(&vars), cfg, ns);
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::ReturnData {
+                        data: data.0,
+                        data_len: data_len.0,
+                    };
+                }
+                Instr::WriteBuffer { buf, offset, value } => {
+                    cfg.blocks[block_no].instr[instr_no].1 = Instr::WriteBuffer {
+                        buf: buf.clone(),
+                        offset: expression(offset, Some(&vars), cfg, ns).0,
+                        value: expression(value, Some(&vars), cfg, ns).0,
+                    }
                 }
                 _ => (),
             }
@@ -703,7 +745,7 @@ fn expression(
         Expression::Builtin(loc, tys, Builtin::Keccak256, args) => {
             let arg = expression(&args[0], vars, cfg, ns);
 
-            if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
+            if let Expression::AllocDynamicBytes(_, _, _, Some(bs)) = arg.0 {
                 let mut hasher = Keccak::v256();
                 hasher.update(&bs);
                 let mut hash = [0u8; 32];
@@ -723,7 +765,7 @@ fn expression(
         Expression::Builtin(loc, tys, Builtin::Ripemd160, args) => {
             let arg = expression(&args[0], vars, cfg, ns);
 
-            if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
+            if let Expression::AllocDynamicBytes(_, _, _, Some(bs)) = arg.0 {
                 let mut hasher = Ripemd160::new();
                 hasher.update(&bs);
                 let result = hasher.finalize();
@@ -742,7 +784,7 @@ fn expression(
         Expression::Builtin(loc, tys, Builtin::Blake2_256, args) => {
             let arg = expression(&args[0], vars, cfg, ns);
 
-            if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
+            if let Expression::AllocDynamicBytes(_, _, _, Some(bs)) = arg.0 {
                 let hash = blake2_rfc::blake2b::blake2b(32, &[], &bs);
 
                 (
@@ -759,7 +801,7 @@ fn expression(
         Expression::Builtin(loc, tys, Builtin::Blake2_128, args) => {
             let arg = expression(&args[0], vars, cfg, ns);
 
-            if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
+            if let Expression::AllocDynamicBytes(_, _, _, Some(bs)) = arg.0 {
                 let hash = blake2_rfc::blake2b::blake2b(16, &[], &bs);
 
                 (
@@ -776,7 +818,7 @@ fn expression(
         Expression::Builtin(loc, tys, Builtin::Sha256, args) => {
             let arg = expression(&args[0], vars, cfg, ns);
 
-            if let Expression::AllocDynamicArray(_, _, _, Some(bs)) = arg.0 {
+            if let Expression::AllocDynamicBytes(_, _, _, Some(bs)) = arg.0 {
                 let mut hasher = Sha256::new();
 
                 // write input message
@@ -807,7 +849,7 @@ fn expression(
 
                     if all_constant {
                         match &expr {
-                            Expression::AllocDynamicArray(_, _, _, Some(bs))
+                            Expression::AllocDynamicBytes(_, _, _, Some(bs))
                             | Expression::BytesLiteral(_, _, bs) => {
                                 hasher.update(bs);
                             }
@@ -1109,14 +1151,25 @@ fn expression(
                 false,
             )
         }
+
+        Expression::AllocDynamicBytes(loc, ty, len, init) => (
+            Expression::AllocDynamicBytes(
+                *loc,
+                ty.clone(),
+                Box::new(expression(len, vars, cfg, ns).0),
+                init.clone(),
+            ),
+            false,
+        ),
+
         Expression::NumberLiteral(..)
         | Expression::RationalNumberLiteral(..)
         | Expression::BoolLiteral(..)
         | Expression::BytesLiteral(..)
         | Expression::CodeLiteral(..)
         | Expression::FunctionArg(..) => (expr.clone(), true),
-        Expression::AllocDynamicArray(..)
-        | Expression::ReturnData(_)
+
+        Expression::ReturnData(_)
         | Expression::Undefined(_)
         | Expression::FormatString { .. }
         | Expression::GetRef(..)
@@ -1159,7 +1212,7 @@ fn get_definition<'a>(
     def: &reaching_definitions::Def,
     cfg: &'a ControlFlowGraph,
 ) -> Option<&'a Expression> {
-    if let Instr::Set { expr, .. } = &cfg.blocks[def.block_no].instr[def.instr_no] {
+    if let Instr::Set { expr, .. } = &cfg.blocks[def.block_no].instr[def.instr_no].1 {
         Some(expr)
     } else {
         None
@@ -1174,9 +1227,9 @@ fn constants_equal(left: &Expression, right: &Expression) -> bool {
             _ => false,
         },
         Expression::BytesLiteral(_, _, left)
-        | Expression::AllocDynamicArray(_, _, _, Some(left)) => match right {
+        | Expression::AllocDynamicBytes(_, _, _, Some(left)) => match right {
             Expression::BytesLiteral(_, _, right)
-            | Expression::AllocDynamicArray(_, _, _, Some(right)) => left == right,
+            | Expression::AllocDynamicBytes(_, _, _, Some(right)) => left == right,
             _ => false,
         },
         _ => false,

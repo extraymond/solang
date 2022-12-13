@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { Contract, publicKeyToHex } from '@solana/solidity';
 import { Keypair } from '@solana/web3.js';
 import expect from 'expect';
@@ -11,7 +13,7 @@ describe('Signature Check', function () {
     let payer: Keypair;
 
     before(async function () {
-        ({ contract, payer } = await loadContract('verify_sig', 'verify_sig.abi'));
+        ({ contract, payer } = await loadContract('verify_sig'));
     });
 
     it('check valid signature', async function () {
@@ -19,7 +21,7 @@ describe('Signature Check', function () {
         const signature = nacl.sign.detached(message, payer.secretKey);
 
         const { result } = await contract.functions.verify(
-            publicKeyToHex(payer.publicKey), message, signature,
+            payer.publicKey.toBytes(), message, signature,
             {
                 ed25519sigs: [{ publicKey: payer.publicKey, message, signature }],
             }
@@ -37,7 +39,7 @@ describe('Signature Check', function () {
         broken_signature[1] ^= 1;
 
         const { result } = await contract.functions.verify(
-            publicKeyToHex(payer.publicKey), message, broken_signature,
+            payer.publicKey.toBytes(), message, broken_signature,
             {
                 ed25519sigs: [{ publicKey: payer.publicKey, message, signature }],
             }

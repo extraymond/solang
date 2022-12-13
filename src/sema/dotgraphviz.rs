@@ -115,7 +115,7 @@ impl Dot {
         if !tags.is_empty() {
             let labels = tags
                 .iter()
-                .map(|tag| format!("{}: {}", tag.tag, tag.value.replace('\n', " ")))
+                .map(|tag| format!("{}: {}", tag.tag, tag.value.to_string().escape_debug()))
                 .collect();
 
             self.add_node(
@@ -205,6 +205,32 @@ impl Dot {
                 Some(func_node),
                 Some(String::from("returns")),
             );
+        }
+
+        // Annotations
+        if !func.annotations.is_empty() {
+            let node = self.add_node(
+                Node::new("annotations", vec!["annotations".into()]),
+                Some(func_node),
+                Some(String::from("annotations")),
+            );
+
+            for note in &func.annotations {
+                match note {
+                    ConstructorAnnotation::Seed(expr) => {
+                        self.add_expression(expr, Some(func), ns, node, "seed".into());
+                    }
+                    ConstructorAnnotation::Space(expr) => {
+                        self.add_expression(expr, Some(func), ns, node, "space".into());
+                    }
+                    ConstructorAnnotation::Bump(expr) => {
+                        self.add_expression(expr, Some(func), ns, node, "bump".into());
+                    }
+                    ConstructorAnnotation::Payer(expr) => {
+                        self.add_expression(expr, Some(func), ns, node, "payer".into());
+                    }
+                };
+            }
         }
 
         // bases
@@ -569,12 +595,12 @@ impl Dot {
 
                 self.add_expression(expr, func, ns, node, String::from("expr"));
             }
-            Expression::ZeroExt(loc, ty, expr) => {
+            Expression::ZeroExt { loc, to, expr } => {
                 let node = self.add_node(
                     Node::new(
                         "zero_ext",
                         vec![
-                            format!("zero extend {}", ty.to_string(ns)),
+                            format!("zero extend {}", to.to_string(ns)),
                             ns.loc_to_string(loc),
                         ],
                     ),
@@ -584,12 +610,12 @@ impl Dot {
 
                 self.add_expression(expr, func, ns, node, String::from("expr"));
             }
-            Expression::SignExt(loc, ty, expr) => {
+            Expression::SignExt { loc, to, expr } => {
                 let node = self.add_node(
                     Node::new(
                         "sign_ext",
                         vec![
-                            format!("sign extend {}", ty.to_string(ns)),
+                            format!("sign extend {}", to.to_string(ns)),
                             ns.loc_to_string(loc),
                         ],
                     ),
@@ -599,12 +625,12 @@ impl Dot {
 
                 self.add_expression(expr, func, ns, node, String::from("expr"));
             }
-            Expression::Trunc(loc, ty, expr) => {
+            Expression::Trunc { loc, to, expr } => {
                 let node = self.add_node(
                     Node::new(
                         "trunc",
                         vec![
-                            format!("truncate {}", ty.to_string(ns)),
+                            format!("truncate {}", to.to_string(ns)),
                             ns.loc_to_string(loc),
                         ],
                     ),
@@ -614,12 +640,12 @@ impl Dot {
 
                 self.add_expression(expr, func, ns, node, String::from("expr"));
             }
-            Expression::CheckingTrunc(loc, ty, expr) => {
+            Expression::CheckingTrunc { loc, to, expr } => {
                 let node = self.add_node(
                     Node::new(
                         "trunc",
                         vec![
-                            format!("checking truncate {}", ty.to_string(ns)),
+                            format!("checking truncate {}", to.to_string(ns)),
                             ns.loc_to_string(loc),
                         ],
                     ),
@@ -629,11 +655,11 @@ impl Dot {
 
                 self.add_expression(expr, func, ns, node, String::from("expr"));
             }
-            Expression::Cast(loc, ty, expr) => {
+            Expression::Cast { loc, to, expr } => {
                 let node = self.add_node(
                     Node::new(
                         "cast",
-                        vec![format!("cast {}", ty.to_string(ns)), ns.loc_to_string(loc)],
+                        vec![format!("cast {}", to.to_string(ns)), ns.loc_to_string(loc)],
                     ),
                     Some(parent),
                     Some(parent_rel),
@@ -641,7 +667,12 @@ impl Dot {
 
                 self.add_expression(expr, func, ns, node, String::from("expr"));
             }
-            Expression::BytesCast(loc, from, to, expr) => {
+            Expression::BytesCast {
+                loc,
+                to,
+                from,
+                expr,
+            } => {
                 let node = self.add_node(
                     Node::new(
                         "bytes_cast",
@@ -837,12 +868,12 @@ impl Dot {
                 self.add_expression(expr, func, ns, node, String::from("expr"));
             }
 
-            Expression::Ternary(loc, ty, cond, left, right) => {
+            Expression::ConditionalOperator(loc, ty, cond, left, right) => {
                 let node = self.add_node(
                     Node::new(
                         "conditional",
                         vec![
-                            format!("conditiona {}", ty.to_string(ns)),
+                            format!("conditional operator {}", ty.to_string(ns)),
                             ns.loc_to_string(loc),
                         ],
                     ),
@@ -886,7 +917,7 @@ impl Dot {
                 self.add_expression(var, func, ns, node, String::from("var"));
             }
 
-            Expression::AllocDynamicArray(loc, ty, length, initializer) => {
+            Expression::AllocDynamicBytes(loc, ty, length, initializer) => {
                 let mut labels = vec![
                     format!("alloc array {}", ty.to_string(ns)),
                     ns.loc_to_string(loc),
@@ -1192,8 +1223,8 @@ impl Dot {
         if let Some(salt) = &call_args.salt {
             self.add_expression(salt, func, ns, node, String::from("salt"));
         }
-        if let Some(space) = &call_args.space {
-            self.add_expression(space, func, ns, node, String::from("space"));
+        if let Some(address) = &call_args.address {
+            self.add_expression(address, func, ns, node, String::from("address"));
         }
         if let Some(accounts) = &call_args.accounts {
             self.add_expression(accounts, func, ns, node, String::from("accounts"));
@@ -2070,11 +2101,11 @@ impl Namespace {
             let enums = dot.add_node(Node::new("enums", Vec::new()), None, None);
 
             for decl in &self.enums {
-                let mut labels = vec![String::new(); decl.values.len()];
-
-                for (name, (_, pos)) in &decl.values {
-                    labels[*pos] = format!("value: {}", name);
-                }
+                let mut labels = decl
+                    .values
+                    .iter()
+                    .map(|(name, _)| format!("value: {}", name))
+                    .collect::<Vec<String>>();
 
                 labels.insert(0, self.loc_to_string(&decl.loc));
                 if let Some(contract) = &decl.contract {
@@ -2153,10 +2184,10 @@ impl Namespace {
         }
 
         // user types
-        if !self.user_types.is_empty() {
+        if self.user_types.iter().any(|t| t.loc != pt::Loc::Builtin) {
             let types = dot.add_node(Node::new("types", Vec::new()), None, None);
 
-            for decl in &self.user_types {
+            for decl in self.user_types.iter().filter(|t| t.loc != pt::Loc::Builtin) {
                 let mut labels = vec![
                     format!("name:{} ty:{}", decl.name, decl.ty.to_string(self)),
                     self.loc_to_string(&decl.loc),
@@ -2290,7 +2321,10 @@ impl Namespace {
             let diagnostics = dot.add_node(Node::new("diagnostics", Vec::new()), None, None);
 
             for diag in self.diagnostics.iter() {
-                let mut labels = vec![diag.message.to_string(), format!("level {:?}", diag.level)];
+                let mut labels = vec![
+                    diag.message.to_string().replace('"', "\\\""),
+                    format!("level {:?}", diag.level),
+                ];
 
                 labels.push(self.loc_to_string(&diag.loc));
 

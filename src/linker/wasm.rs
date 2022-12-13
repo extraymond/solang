@@ -11,8 +11,8 @@ use tempfile::tempdir;
 pub fn link(input: &[u8], name: &str) -> Vec<u8> {
     let dir = tempdir().expect("failed to create temp directory for linking");
 
-    let object_filename = dir.path().join(&format!("{}.o", name));
-    let res_filename = dir.path().join(&format!("{}.wasm", name));
+    let object_filename = dir.path().join(format!("{}.o", name));
+    let res_filename = dir.path().join(format!("{}.wasm", name));
 
     let mut objectfile =
         File::create(object_filename.clone()).expect("failed to create object file");
@@ -69,7 +69,18 @@ pub fn link(input: &[u8], name: &str) -> Vec<u8> {
 
         while ind < imports.len() {
             if imports[ind].field().starts_with("seal") {
-                *imports[ind].module_mut() = "seal0".to_owned();
+                let module_name = match imports[ind].field() {
+                    "seal_set_storage" => "seal2",
+                    "seal_clear_storage"
+                    | "seal_contains_storage"
+                    | "seal_get_storage"
+                    | "seal_instantiate"
+                    | "seal_terminate"
+                    | "seal_random"
+                    | "seal_call" => "seal1",
+                    _ => "seal0",
+                };
+                *imports[ind].module_mut() = module_name.to_owned();
             }
 
             ind += 1;

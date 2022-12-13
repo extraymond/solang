@@ -29,9 +29,9 @@ pub fn assigned_variable(ns: &mut Namespace, exp: &Expression, symtable: &mut Sy
 
         Expression::StorageLoad(_, _, expr)
         | Expression::Load(_, _, expr)
-        | Expression::Trunc(_, _, expr)
-        | Expression::Cast(_, _, expr)
-        | Expression::BytesCast(_, _, _, expr) => {
+        | Expression::Trunc { expr, .. }
+        | Expression::Cast { expr, .. }
+        | Expression::BytesCast { expr, .. } => {
             assigned_variable(ns, expr, symtable);
         }
 
@@ -91,11 +91,11 @@ pub fn used_variable(ns: &mut Namespace, exp: &Expression, symtable: &mut Symtab
 
         Expression::StorageLoad(_, _, expr)
         | Expression::Load(_, _, expr)
-        | Expression::SignExt(_, _, expr)
-        | Expression::ZeroExt(_, _, expr)
-        | Expression::Trunc(_, _, expr)
-        | Expression::Cast(_, _, expr)
-        | Expression::BytesCast(_, _, _, expr) => {
+        | Expression::SignExt { expr, .. }
+        | Expression::ZeroExt { expr, .. }
+        | Expression::Trunc { expr, .. }
+        | Expression::Cast { expr, .. }
+        | Expression::BytesCast { expr, .. } => {
             used_variable(ns, expr, symtable);
         }
 
@@ -206,11 +206,14 @@ fn check_call_args(ns: &mut Namespace, call_args: &CallArgs, symtable: &mut Symt
     if let Some(value) = &call_args.value {
         used_variable(ns, value.as_ref(), symtable);
     }
-    if let Some(space) = &call_args.space {
-        used_variable(ns, space.as_ref(), symtable);
+    if let Some(address) = &call_args.address {
+        used_variable(ns, address.as_ref(), symtable);
     }
     if let Some(accounts) = &call_args.accounts {
         used_variable(ns, accounts.as_ref(), symtable);
+    }
+    if let Some(seeds) = &call_args.seeds {
+        used_variable(ns, seeds.as_ref(), symtable);
     }
 }
 

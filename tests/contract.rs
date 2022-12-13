@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use path_slash::PathExt;
+use rayon::prelude::*;
 use solang::{codegen, file_resolver::FileResolver, parse_and_resolve, Target};
 use std::{
     ffi::OsStr,
@@ -33,6 +34,8 @@ fn contract_tests(file_path: &str, target: Target) -> io::Result<()> {
 }
 
 fn recurse_directory(path: PathBuf, target: Target) -> io::Result<()> {
+    let mut entries = Vec::new();
+
     for entry in read_dir(path)? {
         let path = entry?.path();
 
@@ -40,10 +43,14 @@ fn recurse_directory(path: PathBuf, target: Target) -> io::Result<()> {
             recurse_directory(path, target)?;
         } else if let Some(ext) = path.extension() {
             if ext.to_string_lossy() == "sol" {
-                parse_file(path, target)?;
+                entries.push(path);
             }
         }
     }
+
+    entries.into_par_iter().for_each(|entry| {
+        parse_file(entry, target).unwrap();
+    });
 
     Ok(())
 }
@@ -76,22 +83,12 @@ fn parse_file(path: PathBuf, target: Target) -> io::Result<()> {
     }
 
     if !ns.diagnostics.any_errors() {
-        let context = inkwell::context::Context::create();
-
         // let's try and emit
         match ns.target {
-            Target::Solana => {
-                solang::emit::binary::Binary::build_bundle(
-                    &context,
-                    &[&ns],
-                    &filename,
-                    Default::default(),
-                    false,
-                    false,
-                );
-            }
-            Target::Substrate { .. } => {
+            Target::Solana | Target::Substrate { .. } => {
                 for contract in &ns.contracts {
+                    let context = inkwell::context::Context::create();
+
                     if contract.instantiable {
                         solang::emit::binary::Binary::build(
                             &context,
@@ -99,6 +96,7 @@ fn parse_file(path: PathBuf, target: Target) -> io::Result<()> {
                             &ns,
                             &filename,
                             Default::default(),
+                            false,
                             false,
                             false,
                         );
@@ -137,7 +135,7 @@ fn parse_file(path: PathBuf, target: Target) -> io::Result<()> {
 }
 
 fn add_file(cache: &mut FileResolver, path: &Path, target: Target) -> io::Result<String> {
-    let mut file = File::open(&path)?;
+    let mut file = File::open(path)?;
 
     let mut source = String::new();
 

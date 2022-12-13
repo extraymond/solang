@@ -10,8 +10,9 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
 
+use crate::codegen::cfg::ReturnCode;
 use crate::emit::substrate;
-use crate::emit::{solana, BinaryOp, Generate, ReturnCode};
+use crate::emit::{solana, BinaryOp, Generate};
 use crate::linker::link;
 use crate::Target;
 use inkwell::builder::Builder;
@@ -42,6 +43,7 @@ pub struct Binary<'a> {
     pub(crate) constructor_abort_value_transfers: bool,
     pub(crate) math_overflow_check: bool,
     pub(crate) generate_debug_info: bool,
+    pub(crate) log_api_return_codes: bool,
     pub builder: Builder<'a>,
     pub dibuilder: DebugInfoBuilder<'a>,
     pub compile_unit: DICompileUnit<'a>,
@@ -67,6 +69,7 @@ impl<'a> Binary<'a> {
         opt: OptimizationLevel,
         math_overflow_check: bool,
         generate_debug_info: bool,
+        log_api_return_codes: bool,
     ) -> Self {
         let std_lib = load_stdlib(context, &ns.target);
         match ns.target {
@@ -79,6 +82,7 @@ impl<'a> Binary<'a> {
                 opt,
                 math_overflow_check,
                 generate_debug_info,
+                log_api_return_codes,
             ),
             Target::Solana => solana::SolanaTarget::build(
                 context,
@@ -89,32 +93,10 @@ impl<'a> Binary<'a> {
                 opt,
                 math_overflow_check,
                 generate_debug_info,
+                log_api_return_codes,
             ),
             Target::EVM => unimplemented!(),
         }
-    }
-
-    /// Build the LLVM IR for a set of contracts in a single namespace
-    pub fn build_bundle(
-        context: &'a Context,
-        namespaces: &'a [&Namespace],
-        filename: &str,
-        opt: OptimizationLevel,
-        math_overflow_check: bool,
-        generate_debug_info: bool,
-    ) -> Self {
-        assert!(namespaces.iter().all(|ns| ns.target == Target::Solana));
-
-        let std_lib = load_stdlib(context, &Target::Solana);
-        solana::SolanaTarget::build_bundle(
-            context,
-            &std_lib,
-            namespaces,
-            filename,
-            opt,
-            math_overflow_check,
-            generate_debug_info,
-        )
     }
 
     /// Compile the bin and return the code as bytes. The result is
@@ -236,6 +218,7 @@ impl<'a> Binary<'a> {
         std_lib: &Module<'a>,
         runtime: Option<Box<Binary<'a>>>,
         generate_debug_info: bool,
+        log_api_return_codes: bool,
     ) -> Self {
         LLVM_INIT.get_or_init(|| {
             inkwell::targets::Target::initialize_webassembly(&Default::default());
@@ -309,6 +292,7 @@ impl<'a> Binary<'a> {
             constructor_abort_value_transfers: false,
             math_overflow_check,
             generate_debug_info,
+            log_api_return_codes,
             builder,
             dibuilder,
             compile_unit,
@@ -832,6 +816,11 @@ impl<'a> Binary<'a> {
 
                     BasicTypeEnum::ArrayType(aty)
                 }
+                Type::Struct(StructType::SolParameters) => self
+                    .module
+                    .get_struct_type("struct.SolParameters")
+                    .unwrap()
+                    .as_basic_type_enum(),
                 Type::Struct(str_ty) => self
                     .context
                     .struct_type(
@@ -881,6 +870,11 @@ impl<'a> Binary<'a> {
                     ),
                 ),
                 Type::UserType(no) => self.llvm_type(&ns.user_types[*no].ty, ns),
+                Type::BufferPointer => self
+                    .context
+                    .i8_type()
+                    .ptr_type(AddressSpace::Generic)
+                    .as_basic_type_enum(),
                 _ => unreachable!(),
             }
         }
